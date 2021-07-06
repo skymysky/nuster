@@ -13,11 +13,13 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include <common/base64.h>
-#include <common/config.h>
-#include <common/uri_auth.h>
+#include <haproxy/api.h>
+#include <haproxy/base64.h>
+#include <haproxy/errors.h>
+#include <haproxy/list.h>
+#include <haproxy/stats-t.h>
+#include <haproxy/uri_auth.h>
 
-#include <proto/log.h>
 
 /*
  * Initializes a basic uri_auth structure header and returns a pointer to it.
@@ -108,7 +110,7 @@ struct uri_auth *stats_set_realm(struct uri_auth **root, char *realm)
 }
 
 /*
- * Returns a default uri_auth with ST_SHNODE flag enabled and
+ * Returns a default uri_auth with STAT_SHNODE flag enabled and
  * <node> set as the name if it is not empty.
  * Uses the pointer provided if not NULL and not initialized.
  */
@@ -126,7 +128,7 @@ struct uri_auth *stats_set_node(struct uri_auth **root, char *name)
 	if ((u = stats_check_init_uri_auth(root)) == NULL)
 		goto out_u;
 
-	if (!stats_set_flag(root, ST_SHNODE))
+	if (!stats_set_flag(root, STAT_SHNODE))
 		goto out_u;
 
 	if (node_copy) {	
@@ -143,7 +145,7 @@ struct uri_auth *stats_set_node(struct uri_auth **root, char *name)
 }
 
 /*
- * Returns a default uri_auth with ST_SHDESC flag enabled and
+ * Returns a default uri_auth with STAT_SHDESC flag enabled and
  * <description> set as the desc if it is not empty.
  * Uses the pointer provided if not NULL and not initialized.
  */
@@ -161,7 +163,7 @@ struct uri_auth *stats_set_desc(struct uri_auth **root, char *desc)
 	if ((u = stats_check_init_uri_auth(root)) == NULL)
 		goto out_u;
 
-	if (!stats_set_flag(root, ST_SHDESC))
+	if (!stats_set_flag(root, STAT_SHDESC))
 		goto out_u;
 
 	if (desc_copy) {
@@ -224,7 +226,7 @@ struct uri_auth *stats_add_auth(struct uri_auth **root, char *user)
 		return NULL;
 
 	if (!u->userlist)
-		u->userlist = calloc(1, sizeof(struct userlist));
+		u->userlist = calloc(1, sizeof(*u->userlist));
 
 	if (!u->userlist)
 		return NULL;
@@ -236,9 +238,9 @@ struct uri_auth *stats_add_auth(struct uri_auth **root, char *user)
 		return NULL;
 
 	for (newuser = u->userlist->users; newuser; newuser = newuser->next)
-		if (!strcmp(newuser->user, user)) {
-			Warning("uri auth: ignoring duplicated user '%s'.\n",
-				user);
+		if (strcmp(newuser->user, user) == 0) {
+			ha_warning("uri auth: ignoring duplicated user '%s'.\n",
+				   user);
 			return u;
 		}
 
@@ -282,7 +284,7 @@ struct uri_auth *stats_add_scope(struct uri_auth **root, char *scope)
 
 	scope_list = &u->scope;
 	while ((old_scope = *scope_list)) {
-		if (!strcmp(old_scope->px_id, scope))
+		if (strcmp(old_scope->px_id, scope) == 0)
 			break;
 		scope_list = &old_scope->next;
 	}

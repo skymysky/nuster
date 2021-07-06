@@ -14,73 +14,324 @@
 #include <unistd.h>
 #include <fcntl.h>
 
-#include <common/cfgparse.h>
-#include <common/config.h>
-#include <common/buffer.h>
-#include <common/debug.h>
-#include <common/memory.h>
+#include <import/ebistree.h>
 
-#include <types/applet.h>
-#include <types/capture.h>
-#include <types/cli.h>
-#include <types/filters.h>
-#include <types/global.h>
-#include <types/stats.h>
+#include <haproxy/acl.h>
+#include <haproxy/action.h>
+#include <haproxy/activity.h>
+#include <haproxy/api.h>
+#include <haproxy/applet.h>
+#include <haproxy/arg.h>
+#include <haproxy/backend.h>
+#include <haproxy/capture.h>
+#include <haproxy/cfgparse.h>
+#include <haproxy/channel.h>
+#include <haproxy/check.h>
+#include <haproxy/cli.h>
+#include <haproxy/connection.h>
+#include <haproxy/dict.h>
+#include <haproxy/dns.h>
+#include <haproxy/dynbuf.h>
+#include <haproxy/fd.h>
+#include <haproxy/filters.h>
+#include <haproxy/freq_ctr.h>
+#include <haproxy/frontend.h>
+#include <haproxy/global.h>
+#include <haproxy/hlua.h>
+#include <haproxy/http_ana.h>
+#include <haproxy/http_rules.h>
+#include <haproxy/htx.h>
+#include <haproxy/istbuf.h>
+#include <haproxy/log.h>
+#include <haproxy/pipe.h>
+#include <haproxy/pool.h>
+#include <haproxy/proxy.h>
+#include <haproxy/queue.h>
+#include <haproxy/server.h>
+#include <haproxy/sample.h>
+#include <haproxy/session.h>
+#include <haproxy/stats-t.h>
+#include <haproxy/stick_table.h>
+#include <haproxy/stream.h>
+#include <haproxy/stream_interface.h>
+#include <haproxy/task.h>
+#include <haproxy/tcp_rules.h>
+#include <haproxy/thread.h>
+#include <haproxy/trace.h>
+#include <haproxy/vars.h>
 
-#include <proto/acl.h>
-#include <proto/action.h>
-#include <proto/arg.h>
-#include <proto/backend.h>
-#include <proto/channel.h>
-#include <proto/checks.h>
-#include <proto/cli.h>
-#include <proto/connection.h>
-#include <proto/stats.h>
-#include <proto/fd.h>
-#include <proto/filters.h>
-#include <proto/freq_ctr.h>
-#include <proto/frontend.h>
-#include <proto/hdr_idx.h>
-#include <proto/hlua.h>
-#include <proto/listener.h>
-#include <proto/log.h>
-#include <proto/raw_sock.h>
-#include <proto/session.h>
-#include <proto/stream.h>
-#include <proto/pipe.h>
-#include <proto/proto_http.h>
-#include <proto/proxy.h>
-#include <proto/queue.h>
-#include <proto/server.h>
-#include <proto/sample.h>
-#include <proto/stick_table.h>
-#include <proto/stream_interface.h>
-#include <proto/task.h>
-#include <proto/tcp_rules.h>
-#include <proto/vars.h>
 
-struct pool_head *pool2_stream;
-struct list streams;
+DECLARE_POOL(pool_head_stream, "stream", sizeof(struct stream));
+DECLARE_POOL(pool_head_uniqueid, "uniqueid", UNIQUEID_LEN);
+
+struct list streams = LIST_HEAD_INIT(streams);
+__decl_spinlock(streams_lock);
 
 /* List of all use-service keywords. */
 static struct list service_keywords = LIST_HEAD_INIT(service_keywords);
 
+
+/* trace source and events */
+static void strm_trace(enum trace_level level, uint64_t mask,
+		       const struct trace_source *src,
+		       const struct ist where, const struct ist func,
+		       const void *a1, const void *a2, const void *a3, const void *a4);
+
+/* The event representation is split like this :
+ *   strm  - stream
+ *   si    - stream interface
+ *   http  - http analyzis
+ *   tcp   - tcp analyzis
+ *
+ * STRM_EV_* macros are defined in <proto/stream.h>
+ */
+static const struct trace_event strm_trace_events[] = {
+	{ .mask = STRM_EV_STRM_NEW,     .name = "strm_new",     .desc = "new stream" },
+	{ .mask = STRM_EV_STRM_FREE,    .name = "strm_free",    .desc = "release stream" },
+	{ .mask = STRM_EV_STRM_ERR,     .name = "strm_err",     .desc = "error during stream processing" },
+	{ .mask = STRM_EV_STRM_ANA,     .name = "strm_ana",     .desc = "stream analyzers" },
+	{ .mask = STRM_EV_STRM_PROC,    .name = "strm_proc",    .desc = "stream processing" },
+
+	{ .mask = STRM_EV_SI_ST,        .name = "si_state",     .desc = "processing stream-interface states" },
+
+	{ .mask = STRM_EV_HTTP_ANA,     .name = "http_ana",     .desc = "HTTP analyzers" },
+	{ .mask = STRM_EV_HTTP_ERR,     .name = "http_err",     .desc = "error during HTTP analyzis" },
+
+	{ .mask = STRM_EV_TCP_ANA,      .name = "tcp_ana",      .desc = "TCP analyzers" },
+	{ .mask = STRM_EV_TCP_ERR,      .name = "tcp_err",      .desc = "error during TCP analyzis" },
+	{}
+};
+
+static const struct name_desc strm_trace_lockon_args[4] = {
+	/* arg1 */ { /* already used by the stream */ },
+	/* arg2 */ { },
+	/* arg3 */ { },
+	/* arg4 */ { }
+};
+
+static const struct name_desc strm_trace_decoding[] = {
+#define STRM_VERB_CLEAN    1
+	{ .name="clean",    .desc="only user-friendly stuff, generally suitable for level \"user\"" },
+#define STRM_VERB_MINIMAL  2
+	{ .name="minimal",  .desc="report info on stream and stream-interfaces" },
+#define STRM_VERB_SIMPLE   3
+	{ .name="simple",   .desc="add info on request and response channels" },
+#define STRM_VERB_ADVANCED 4
+	{ .name="advanced", .desc="add info on channel's buffer for data and developer levels only" },
+#define STRM_VERB_COMPLETE 5
+	{ .name="complete", .desc="add info on channel's buffer" },
+	{ /* end */ }
+};
+
+struct trace_source trace_strm = {
+	.name = IST("stream"),
+	.desc = "Applicative stream",
+	.arg_def = TRC_ARG1_STRM,  // TRACE()'s first argument is always a stream
+	.default_cb = strm_trace,
+	.known_events = strm_trace_events,
+	.lockon_args = strm_trace_lockon_args,
+	.decoding = strm_trace_decoding,
+	.report_events = ~0,  // report everything by default
+};
+
+#define TRACE_SOURCE &trace_strm
+INITCALL1(STG_REGISTER, trace_register_source, TRACE_SOURCE);
+
+/* the stream traces always expect that arg1, if non-null, is of a stream (from
+ * which we can derive everything), that arg2, if non-null, is an http
+ * transaction, that arg3, if non-null, is an http message.
+ */
+static void strm_trace(enum trace_level level, uint64_t mask, const struct trace_source *src,
+		       const struct ist where, const struct ist func,
+		       const void *a1, const void *a2, const void *a3, const void *a4)
+{
+	const struct stream *s = a1;
+	const struct http_txn *txn = a2;
+	const struct http_msg *msg = a3;
+	struct task *task;
+	const struct stream_interface *si_f, *si_b;
+	const struct channel *req, *res;
+	struct htx *htx;
+
+	if (!s || src->verbosity < STRM_VERB_CLEAN)
+		return;
+
+	task = s->task;
+	si_f = &s->si[0];
+	si_b = &s->si[1];
+	req  = &s->req;
+	res  = &s->res;
+	htx  = (msg ? htxbuf(&msg->chn->buf) : NULL);
+
+	/* General info about the stream (htx/tcp, id...) */
+	chunk_appendf(&trace_buf, " : [%u,%s]",
+		      s->uniq_id, ((s->flags & SF_HTX) ? "HTX" : "TCP"));
+	if (isttest(s->unique_id)) {
+		chunk_appendf(&trace_buf, " id=");
+		b_putist(&trace_buf, s->unique_id);
+	}
+
+	/* Front and back stream-int state */
+	chunk_appendf(&trace_buf, " SI=(%s,%s)",
+		      si_state_str(si_f->state), si_state_str(si_b->state));
+
+	/* If txn is defined, HTTP req/rep states */
+	if (txn)
+		chunk_appendf(&trace_buf, " HTTP=(%s,%s)",
+			      h1_msg_state_str(txn->req.msg_state), h1_msg_state_str(txn->rsp.msg_state));
+	if (msg)
+		chunk_appendf(&trace_buf, " %s", ((msg->chn->flags & CF_ISRESP) ? "RESPONSE" : "REQUEST"));
+
+	if (src->verbosity == STRM_VERB_CLEAN)
+		return;
+
+	/* If msg defined, display status-line if possible (verbosity > MINIMAL) */
+	if (src->verbosity > STRM_VERB_MINIMAL && htx && htx_nbblks(htx)) {
+		const struct htx_blk *blk = htx_get_head_blk(htx);
+		const struct htx_sl  *sl  = htx_get_blk_ptr(htx, blk);
+		enum htx_blk_type    type = htx_get_blk_type(blk);
+
+		if (type == HTX_BLK_REQ_SL || type == HTX_BLK_RES_SL)
+			chunk_appendf(&trace_buf, " - \"%.*s %.*s %.*s\"",
+				      HTX_SL_P1_LEN(sl), HTX_SL_P1_PTR(sl),
+				      HTX_SL_P2_LEN(sl), HTX_SL_P2_PTR(sl),
+				      HTX_SL_P3_LEN(sl), HTX_SL_P3_PTR(sl));
+	}
+
+
+	/* If txn defined info about HTTP msgs, otherwise info about SI. */
+	if (txn) {
+		chunk_appendf(&trace_buf, " - t=%p s=(%p,0x%08x) txn.flags=0x%08x, http.flags=(0x%08x,0x%08x) status=%d",
+			      task, s, s->flags, txn->flags, txn->req.flags, txn->rsp.flags, txn->status);
+	}
+	else {
+		chunk_appendf(&trace_buf, " - t=%p s=(%p,0x%08x) si_f=(%p,0x%08x,0x%x) si_b=(%p,0x%08x,0x%x) retries=%d",
+			      task, s, s->flags, si_f, si_f->flags, si_f->err_type,
+			      si_b, si_b->flags, si_b->err_type, si_b->conn_retries);
+	}
+
+	if (src->verbosity == STRM_VERB_MINIMAL)
+		return;
+
+
+	/* If txn defined, don't display all channel info */
+	if (src->verbosity == STRM_VERB_SIMPLE || txn) {
+		chunk_appendf(&trace_buf, " req=(%p .fl=0x%08x .exp(r,w,a)=(%u,%u,%u))",
+			      req, req->flags, req->rex, req->wex, req->analyse_exp);
+		chunk_appendf(&trace_buf, " res=(%p .fl=0x%08x .exp(r,w,a)=(%u,%u,%u))",
+			      res, res->flags, res->rex, res->wex, res->analyse_exp);
+	}
+	else {
+		chunk_appendf(&trace_buf, " req=(%p .fl=0x%08x .ana=0x%08x .exp(r,w,a)=(%u,%u,%u) .o=%lu .tot=%llu .to_fwd=%u)",
+			      req, req->flags, req->analysers, req->rex, req->wex, req->analyse_exp,
+			      (long)req->output, req->total, req->to_forward);
+		chunk_appendf(&trace_buf, " res=(%p .fl=0x%08x .ana=0x%08x .exp(r,w,a)=(%u,%u,%u) .o=%lu .tot=%llu .to_fwd=%u)",
+			      res, res->flags, res->analysers, res->rex, res->wex, res->analyse_exp,
+			      (long)res->output, res->total, res->to_forward);
+	}
+
+	if (src->verbosity == STRM_VERB_SIMPLE ||
+	    (src->verbosity == STRM_VERB_ADVANCED && src->level < TRACE_LEVEL_DATA))
+		return;
+
+	/* channels' buffer info */
+	if (s->flags & SF_HTX) {
+		struct htx *rqhtx = htxbuf(&req->buf);
+		struct htx *rphtx = htxbuf(&res->buf);
+
+		chunk_appendf(&trace_buf, " htx=(%u/%u#%u, %u/%u#%u)",
+			      rqhtx->data, rqhtx->size, htx_nbblks(rqhtx),
+			      rphtx->data, rphtx->size, htx_nbblks(rphtx));
+	}
+	else {
+		chunk_appendf(&trace_buf, " buf=(%u@%p+%u/%u, %u@%p+%u/%u)",
+			      (unsigned int)b_data(&req->buf), b_orig(&req->buf),
+			      (unsigned int)b_head_ofs(&req->buf), (unsigned int)b_size(&req->buf),
+			      (unsigned int)b_data(&req->buf), b_orig(&req->buf),
+			      (unsigned int)b_head_ofs(&req->buf), (unsigned int)b_size(&req->buf));
+	}
+
+	/* If msg defined, display htx info if defined (level > USER) */
+	if (src->level > TRACE_LEVEL_USER && htx && htx_nbblks(htx)) {
+		int full = 0;
+
+		/* Full htx info (level > STATE && verbosity > SIMPLE) */
+		if (src->level > TRACE_LEVEL_STATE) {
+			if (src->verbosity == STRM_VERB_COMPLETE)
+				full = 1;
+		}
+
+		chunk_memcat(&trace_buf, "\n\t", 2);
+		htx_dump(&trace_buf, htx, full);
+	}
+}
+
+/* Create a new stream for connection <conn>. Return < 0 on error. This is only
+ * valid right after the handshake, before the connection's data layer is
+ * initialized, because it relies on the session to be in conn->owner. On
+ * success, <input> buffer is transferred to the stream and thus points to
+ * BUF_NULL. On error, it is unchanged and it is the caller responsibility to
+ * release it.
+ */
+int stream_create_from_cs(struct conn_stream *cs, struct buffer *input)
+{
+	struct stream *strm;
+
+	strm = stream_new(cs->conn->owner, &cs->obj_type, input);
+	if (strm == NULL)
+		return -1;
+
+	task_wakeup(strm->task, TASK_WOKEN_INIT);
+	return 0;
+}
+
+/* Callback used to wake up a stream when an input buffer is available. The
+ * stream <s>'s stream interfaces are checked for a failed buffer allocation
+ * as indicated by the presence of the SI_FL_RXBLK_ROOM flag and the lack of a
+ * buffer, and and input buffer is assigned there (at most one). The function
+ * returns 1 and wakes the stream up if a buffer was taken, otherwise zero.
+ * It's designed to be called from __offer_buffer().
+ */
+int stream_buf_available(void *arg)
+{
+	struct stream *s = arg;
+
+	if (!s->req.buf.size && !s->req.pipe && (s->si[0].flags & SI_FL_RXBLK_BUFF) &&
+	    b_alloc_margin(&s->req.buf, global.tune.reserved_bufs))
+		si_rx_buff_rdy(&s->si[0]);
+	else if (!s->res.buf.size && !s->res.pipe && (s->si[1].flags & SI_FL_RXBLK_BUFF) &&
+		 b_alloc_margin(&s->res.buf, 0))
+		si_rx_buff_rdy(&s->si[1]);
+	else
+		return 0;
+
+	task_wakeup(s->task, TASK_WOKEN_RES);
+	return 1;
+
+}
+
 /* This function is called from the session handler which detects the end of
  * handshake, in order to complete initialization of a valid stream. It must be
- * called with a session (which may be embryonic). It returns the pointer to
+ * called with a completely initialized session. It returns the pointer to
  * the newly created stream, or NULL in case of fatal error. The client-facing
- * end point is assigned to <origin>, which must be valid. The task's context
- * is set to the new stream, and its function is set to process_stream().
- * Target and analysers are null.
+ * end point is assigned to <origin>, which must be valid. The stream's task
+ * is configured with a nice value inherited from the listener's nice if any.
+ * The task's context is set to the new stream, and its function is set to
+ * process_stream(). Target and analysers are null. <input> is used as input
+ * buffer for the request channel and may contain data. On success, it is
+ * transfer to the stream and <input> is set to BUF_NULL. On error, <input>
+ * buffer is unchanged and it is the caller responsibility to release it.
  */
-struct stream *stream_new(struct session *sess, struct task *t, enum obj_type *origin)
+struct stream *stream_new(struct session *sess, enum obj_type *origin, struct buffer *input)
 {
 	struct stream *s;
-	struct connection *conn = objt_conn(origin);
+	struct task *t;
+	struct conn_stream *cs  = objt_cs(origin);
 	struct appctx *appctx   = objt_appctx(origin);
 
-	if (unlikely((s = pool_alloc2(pool2_stream)) == NULL))
-		return s;
+	DBG_TRACE_ENTER(STRM_EV_STRM_NEW);
+	if (unlikely((s = pool_alloc(pool_head_stream)) == NULL))
+		goto out_fail_alloc;
 
 	/* minimum stream initialization required for an embryonic stream is
 	 * fairly low. We need very little to execute L4 ACLs, then we need a
@@ -91,21 +342,20 @@ struct stream *stream_new(struct session *sess, struct task *t, enum obj_type *o
 	s->flags = 0;
 	s->logs.logwait = sess->fe->to_log;
 	s->logs.level = 0;
-	s->logs.accept_date = sess->accept_date; /* user-visible date for logging */
-	s->logs.tv_accept = sess->tv_accept;   /* corrected date for internal use */
-	/* This function is called just after the handshake, so the handshake duration is
-	 * between the accept time and now.
-	 */
-	s->logs.t_handshake = tv_ms_elapsed(&sess->tv_accept, &now);
-	s->logs.t_idle = -1;
 	tv_zero(&s->logs.tv_request);
 	s->logs.t_queue = -1;
 	s->logs.t_connect = -1;
 	s->logs.t_data = -1;
 	s->logs.t_close = 0;
 	s->logs.bytes_in = s->logs.bytes_out = 0;
-	s->logs.prx_queue_size = 0;  /* we get the number of pending conns before us */
-	s->logs.srv_queue_size = 0; /* we will get this number soon */
+	s->logs.prx_queue_pos = 0;  /* we get the number of pending conns before us */
+	s->logs.srv_queue_pos = 0; /* we will get this number soon */
+	s->obj_type = OBJ_TYPE_STREAM;
+
+	s->logs.accept_date = sess->accept_date;
+	s->logs.tv_accept = sess->tv_accept;
+	s->logs.t_handshake = sess->t_handshake;
+	s->logs.t_idle = sess->t_idle;
 
 	/* default logging function */
 	s->do_log = strm_log;
@@ -118,6 +368,7 @@ struct stream *stream_new(struct session *sess, struct task *t, enum obj_type *o
 	 */
 	s->current_rule_list = NULL;
 	s->current_rule = NULL;
+	s->rules_exp = TICK_ETERNITY;
 
 	/* Copy SC counters for the stream. We don't touch refcounts because
 	 * any reference we have is inherited from the session. Since the stream
@@ -131,31 +382,36 @@ struct stream *stream_new(struct session *sess, struct task *t, enum obj_type *o
 	s->si[0].flags = SI_FL_NONE;
 	s->si[1].flags = SI_FL_ISBACK;
 
-	s->uniq_id = global.req_count++;
+	s->uniq_id = _HA_ATOMIC_XADD(&global.req_count, 1);
 
 	/* OK, we're keeping the stream, so let's properly initialize the stream */
-	LIST_ADDQ(&streams, &s->list);
 	LIST_INIT(&s->back_refs);
 
-	LIST_INIT(&s->buffer_wait.list);
+	MT_LIST_INIT(&s->buffer_wait.list);
 	s->buffer_wait.target = s;
-	s->buffer_wait.wakeup_cb = (int (*)(void *))stream_res_wakeup;
+	s->buffer_wait.wakeup_cb = stream_buf_available;
 
-	s->flags |= SF_INITIALIZED;
-	s->unique_id = NULL;
+	s->call_rate.curr_sec = s->call_rate.curr_ctr = s->call_rate.prev_ctr = 0;
+	s->pcli_next_pid = 0;
+	s->pcli_flags = 0;
+	s->unique_id = IST_NULL;
+
+	if ((t = task_new(tid_bit)) == NULL)
+		goto out_fail_alloc;
 
 	s->task = t;
 	s->pending_events = 0;
 	t->process = process_stream;
 	t->context = s;
 	t->expire = TICK_ETERNITY;
+	if (sess->listener)
+		t->nice = sess->listener->nice;
 
 	/* Note: initially, the stream's backend points to the frontend.
 	 * This changes later when switching rules are executed or
 	 * when the default backend is assigned.
 	 */
 	s->be  = sess->fe;
-	s->req.buf = s->res.buf = NULL;
 	s->req_cap = NULL;
 	s->res_cap = NULL;
 
@@ -166,13 +422,24 @@ struct stream *stream_new(struct session *sess, struct task *t, enum obj_type *o
 	vars_init(&s->vars_reqres, SCOPE_REQ);
 
 	/* this part should be common with other protocols */
-	si_reset(&s->si[0]);
+	if (si_reset(&s->si[0]) < 0)
+		goto out_fail_alloc;
 	si_set_state(&s->si[0], SI_ST_EST);
 	s->si[0].hcto = sess->fe->timeout.clientfin;
 
+	if (cs && cs->conn->mux) {
+		if (cs->conn->mux->flags & MX_FL_CLEAN_ABRT)
+			s->si[0].flags |= SI_FL_CLEAN_ABRT;
+		if (cs->conn->mux->flags & MX_FL_HTX)
+			s->flags |= SF_HTX;
+	}
+        /* Set SF_HTX flag for HTTP frontends. */
+	if (sess->fe->mode == PR_MODE_HTTP)
+		s->flags |= SF_HTX;
+
 	/* attach the incoming connection to the stream interface now. */
-	if (conn)
-		si_attach_conn(&s->si[0], conn);
+	if (cs)
+		si_attach_cs(&s->si[0], cs);
 	else if (appctx)
 		si_attach_appctx(&s->si[0], appctx);
 
@@ -182,24 +449,32 @@ struct stream *stream_new(struct session *sess, struct task *t, enum obj_type *o
 	/* pre-initialize the other side's stream interface to an INIT state. The
 	 * callbacks will be initialized before attempting to connect.
 	 */
-	si_reset(&s->si[1]);
+	if (si_reset(&s->si[1]) < 0)
+		goto out_fail_alloc_si1;
 	s->si[1].hcto = TICK_ETERNITY;
 
 	if (likely(sess->fe->options2 & PR_O2_INDEPSTR))
 		s->si[1].flags |= SI_FL_INDEP_STR;
 
 	stream_init_srv_conn(s);
-	s->target = NULL;
+	s->target = sess->listener ? sess->listener->default_target : NULL;
+	s->target_addr = NULL;
+
 	s->pend_pos = NULL;
+	s->priority_class = 0;
+	s->priority_offset = 0;
 
 	/* init store persistence */
 	s->store_count = 0;
 
 	channel_init(&s->req);
 	s->req.flags |= CF_READ_ATTACHED; /* the producer is already connected */
-	s->req.analysers = 0;
-	channel_auto_connect(&s->req);  /* don't wait to establish connection */
-	channel_auto_close(&s->req);    /* let the producer forward close requests */
+	s->req.analysers = sess->listener ? sess->listener->analysers : 0;
+
+	if (!sess->fe->fe_req_ana) {
+		channel_auto_connect(&s->req);  /* don't wait to establish connection */
+		channel_auto_close(&s->req);    /* let the producer forward close requests */
+	}
 
 	s->req.rto = sess->fe->timeout.client;
 	s->req.wto = TICK_ETERNITY;
@@ -223,33 +498,61 @@ struct stream *stream_new(struct session *sess, struct task *t, enum obj_type *o
 	s->res.analyse_exp = TICK_ETERNITY;
 
 	s->txn = NULL;
+	s->hlua = NULL;
 
-	HLUA_INIT(&s->hlua);
+	s->dns_ctx.dns_requester = NULL;
+	s->dns_ctx.hostname_dn = NULL;
+	s->dns_ctx.hostname_dn_len = 0;
+	s->dns_ctx.parent = NULL;
+
+	s->tunnel_timeout = TICK_ETERNITY;
+
+	HA_SPIN_LOCK(STRMS_LOCK, &streams_lock);
+	LIST_ADDQ(&streams, &s->list);
+	HA_SPIN_UNLOCK(STRMS_LOCK, &streams_lock);
 
 	if (flt_stream_init(s) < 0 || flt_stream_start(s) < 0)
 		goto out_fail_accept;
 
+	s->si[1].l7_buffer = BUF_NULL;
 	/* finish initialization of the accepted file descriptor */
-	if (conn)
-		conn_data_want_recv(conn);
-	else if (appctx)
-		si_applet_want_get(&s->si[0]);
+	if (appctx)
+		si_want_get(&s->si[0]);
 
 	if (sess->fe->accept && sess->fe->accept(s) < 0)
 		goto out_fail_accept;
 
+	if (!b_is_null(input)) {
+		/* Xfer the input buffer to the request channel. <input> will
+		 * than point to BUF_NULL. From this point, it is the stream
+		 * responsibility to release it.
+		 */
+		s->req.buf = *input;
+		*input = BUF_NULL;
+		s->req.total = (IS_HTX_STRM(s) ? htxbuf(&s->req.buf)->data : b_data(&s->req.buf));
+		s->req.flags |= (s->req.total ? CF_READ_PARTIAL : 0);
+	}
+
 	/* it is important not to call the wakeup function directly but to
 	 * pass through task_wakeup(), because this one knows how to apply
-	 * priorities to tasks.
+	 * priorities to tasks. Using multi thread we must be sure that
+	 * stream is fully initialized before calling task_wakeup. So
+	 * the caller must handle the task_wakeup
 	 */
-	task_wakeup(t, TASK_WOKEN_INIT);
+	DBG_TRACE_LEAVE(STRM_EV_STRM_NEW, s);
 	return s;
 
 	/* Error unrolling */
  out_fail_accept:
 	flt_stream_release(s, 0);
+	task_destroy(t);
+	tasklet_free(s->si[1].wait_event.tasklet);
 	LIST_DEL(&s->list);
-	pool_free2(pool2_stream, s);
+out_fail_alloc_si1:
+	tasklet_free(s->si[0].wait_event.tasklet);
+ out_fail_alloc:
+	pool_free(pool_head_stream, s);
+	DBG_TRACE_DEVEL("leaving on error", STRM_EV_STRM_NEW|STRM_EV_STRM_ERR);
 	return NULL;
 }
 
@@ -261,16 +564,24 @@ static void stream_free(struct stream *s)
 	struct session *sess = strm_sess(s);
 	struct proxy *fe = sess->fe;
 	struct bref *bref, *back;
-	struct connection *cli_conn = objt_conn(sess->origin);
+	struct conn_stream *cli_cs = objt_cs(s->si[0].end);
+	int must_free_sess;
 	int i;
 
-	if (s->pend_pos)
-		pendconn_free(s->pend_pos);
+	DBG_TRACE_POINT(STRM_EV_STRM_FREE, s);
+
+	/* detach the stream from its own task before even releasing it so
+	 * that walking over a task list never exhibits a dying stream.
+	 */
+	s->task->context = NULL;
+	__ha_barrier_store();
+
+	pendconn_free(s);
 
 	if (objt_server(s->target)) { /* there may be requests left pending in queue */
 		if (s->flags & SF_CURR_SESS) {
 			s->flags &= ~SF_CURR_SESS;
-			objt_server(s->target)->cur_sess--;
+			_HA_ATOMIC_SUB(&__objt_server(s->target)->cur_sess, 1);
 		}
 		if (may_dequeue_tasks(objt_server(s->target), s->be))
 			process_srv_queue(objt_server(s->target));
@@ -291,23 +602,26 @@ static void stream_free(struct stream *s)
 		put_pipe(s->res.pipe);
 
 	/* We may still be present in the buffer wait queue */
-	if (!LIST_ISEMPTY(&s->buffer_wait.list)) {
-		LIST_DEL(&s->buffer_wait.list);
-		LIST_INIT(&s->buffer_wait.list);
-	}
-	if (s->req.buf->size || s->res.buf->size) {
-		b_drop(&s->req.buf);
-		b_drop(&s->res.buf);
-		offer_buffers(NULL, tasks_run_queue + applets_active_queue);
+	if (MT_LIST_ADDED(&s->buffer_wait.list))
+		MT_LIST_DEL(&s->buffer_wait.list);
+
+	if (s->req.buf.size || s->res.buf.size) {
+		b_free(&s->req.buf);
+		b_free(&s->res.buf);
+		offer_buffers(NULL, tasks_run_queue);
 	}
 
-	hlua_ctx_destroy(&s->hlua);
+	pool_free(pool_head_uniqueid, s->unique_id.ptr);
+	s->unique_id = IST_NULL;
+
+	hlua_ctx_destroy(s->hlua);
+	s->hlua = NULL;
 	if (s->txn)
 		http_end_txn(s);
 
 	/* ensure the client-side transport layer is destroyed */
-	if (cli_conn)
-		conn_force_close(cli_conn);
+	if (cli_cs)
+		cs_close(cli_cs);
 
 	for (i = 0; i < s->store_count; i++) {
 		if (!s->store[i].ts)
@@ -317,25 +631,52 @@ static void stream_free(struct stream *s)
 	}
 
 	if (s->txn) {
-		pool_free2(pool2_hdr_idx, s->txn->hdr_idx.v);
-		pool_free2(pool2_http_txn, s->txn);
+		pool_free(pool_head_http_txn, s->txn);
 		s->txn = NULL;
+	}
+
+	if (s->dns_ctx.dns_requester) {
+		__decl_thread(struct dns_resolvers *resolvers = s->dns_ctx.parent->arg.dns.resolvers);
+
+		HA_SPIN_LOCK(DNS_LOCK, &resolvers->lock);
+		free(s->dns_ctx.hostname_dn); s->dns_ctx.hostname_dn = NULL;
+		s->dns_ctx.hostname_dn_len = 0;
+		dns_unlink_resolution(s->dns_ctx.dns_requester);
+		HA_SPIN_UNLOCK(DNS_LOCK, &resolvers->lock);
+
+		pool_free(dns_requester_pool, s->dns_ctx.dns_requester);
+		s->dns_ctx.dns_requester = NULL;
 	}
 
 	flt_stream_stop(s);
 	flt_stream_release(s, 0);
 
 	if (fe) {
-		pool_free2(fe->rsp_cap_pool, s->res_cap);
-		pool_free2(fe->req_cap_pool, s->req_cap);
+		if (s->req_cap) {
+			struct cap_hdr *h;
+			for (h = fe->req_cap; h; h = h->next)
+				pool_free(h->pool, s->req_cap[h->index]);
+		}
+
+		if (s->res_cap) {
+			struct cap_hdr *h;
+			for (h = fe->rsp_cap; h; h = h->next)
+				pool_free(h->pool, s->res_cap[h->index]);
+		}
+
+		pool_free(fe->rsp_cap_pool, s->res_cap);
+		pool_free(fe->req_cap_pool, s->req_cap);
 	}
 
 	/* Cleanup all variable contexts. */
-	vars_prune(&s->vars_txn, s->sess, s);
-	vars_prune(&s->vars_reqres, s->sess, s);
+	if (!LIST_ISEMPTY(&s->vars_txn.head))
+		vars_prune(&s->vars_txn, s->sess, s);
+	if (!LIST_ISEMPTY(&s->vars_reqres.head))
+		vars_prune(&s->vars_reqres, s->sess, s);
 
 	stream_store_counters(s);
 
+	HA_SPIN_LOCK(STRMS_LOCK, &streams_lock);
 	list_for_each_entry_safe(bref, back, &s->back_refs, users) {
 		/* we have to unlink all watchers. We must not relink them if
 		 * this stream was the last one in the list.
@@ -347,28 +688,39 @@ static void stream_free(struct stream *s)
 		bref->ref = s->list.n;
 	}
 	LIST_DEL(&s->list);
+	HA_SPIN_UNLOCK(STRMS_LOCK, &streams_lock);
+
+	/* applets do not release session yet */
+	must_free_sess = objt_appctx(sess->origin) && sess->origin == s->si[0].end;
+
+
 	si_release_endpoint(&s->si[1]);
 	si_release_endpoint(&s->si[0]);
 
-	/* FIXME: for now we have a 1:1 relation between stream and session so
-	 * the stream must free the session.
-	 */
-	pool_free2(pool2_stream, s);
-	session_free(sess);
+	tasklet_free(s->si[0].wait_event.tasklet);
+	tasklet_free(s->si[1].wait_event.tasklet);
+
+	b_free(&s->si[1].l7_buffer);
+	if (must_free_sess) {
+		sess->origin = NULL;
+		session_free(sess);
+	}
+
+	sockaddr_free(&s->target_addr);
+	pool_free(pool_head_stream, s);
 
 	/* We may want to free the maximum amount of pools if the proxy is stopping */
-	if (fe && unlikely(fe->state == PR_STSTOPPED)) {
-		pool_flush2(pool2_buffer);
-		pool_flush2(pool2_http_txn);
-		pool_flush2(pool2_hdr_idx);
-		pool_flush2(pool2_requri);
-		pool_flush2(pool2_capture);
-		pool_flush2(pool2_stream);
-		pool_flush2(pool2_session);
-		pool_flush2(pool2_connection);
-		pool_flush2(pool2_pendconn);
-		pool_flush2(fe->req_cap_pool);
-		pool_flush2(fe->rsp_cap_pool);
+	if (fe && unlikely(fe->disabled)) {
+		pool_flush(pool_head_buffer);
+		pool_flush(pool_head_http_txn);
+		pool_flush(pool_head_requri);
+		pool_flush(pool_head_capture);
+		pool_flush(pool_head_stream);
+		pool_flush(pool_head_session);
+		pool_flush(pool_head_connection);
+		pool_flush(pool_head_pendconn);
+		pool_flush(fe->req_cap_pool);
+		pool_flush(fe->rsp_cap_pool);
 	}
 }
 
@@ -383,15 +735,13 @@ static void stream_free(struct stream *s)
  */
 static int stream_alloc_work_buffer(struct stream *s)
 {
-	if (!LIST_ISEMPTY(&s->buffer_wait.list)) {
-		LIST_DEL(&s->buffer_wait.list);
-		LIST_INIT(&s->buffer_wait.list);
-	}
+	if (MT_LIST_ADDED(&s->buffer_wait.list))
+		MT_LIST_DEL(&s->buffer_wait.list);
 
 	if (b_alloc_margin(&s->res.buf, 0))
 		return 1;
 
-	LIST_ADDQ(&buffer_wq, &s->buffer_wait.list);
+	MT_LIST_ADDQ(&buffer_wq, &s->buffer_wait.list);
 	return 0;
 }
 
@@ -405,11 +755,11 @@ void stream_release_buffers(struct stream *s)
 {
 	int offer = 0;
 
-	if (s->req.buf->size && buffer_empty(s->req.buf)) {
+	if (c_size(&s->req) && c_empty(&s->req)) {
 		offer = 1;
 		b_free(&s->req.buf);
 	}
-	if (s->res.buf->size && buffer_empty(s->res.buf)) {
+	if (c_size(&s->res) && c_empty(&s->res)) {
 		offer = 1;
 		b_free(&s->res.buf);
 	}
@@ -418,294 +768,110 @@ void stream_release_buffers(struct stream *s)
 	 * someone waiting, we can wake up a waiter and offer them.
 	 */
 	if (offer)
-		offer_buffers(s, tasks_run_queue + applets_active_queue);
-}
-
-/* perform minimal intializations, report 0 in case of error, 1 if OK. */
-int init_stream()
-{
-	LIST_INIT(&streams);
-	pool2_stream = create_pool("stream", sizeof(struct stream), MEM_F_SHARED);
-	return pool2_stream != NULL;
+		offer_buffers(s, tasks_run_queue);
 }
 
 void stream_process_counters(struct stream *s)
 {
 	struct session *sess = s->sess;
 	unsigned long long bytes;
-	void *ptr1,*ptr2;
 	int i;
 
 	bytes = s->req.total - s->logs.bytes_in;
 	s->logs.bytes_in = s->req.total;
 	if (bytes) {
-		sess->fe->fe_counters.bytes_in += bytes;
-
-		s->be->be_counters.bytes_in += bytes;
+		_HA_ATOMIC_ADD(&sess->fe->fe_counters.bytes_in, bytes);
+		_HA_ATOMIC_ADD(&s->be->be_counters.bytes_in,    bytes);
 
 		if (objt_server(s->target))
-			objt_server(s->target)->counters.bytes_in += bytes;
+			_HA_ATOMIC_ADD(&objt_server(s->target)->counters.bytes_in, bytes);
 
 		if (sess->listener && sess->listener->counters)
-			sess->listener->counters->bytes_in += bytes;
+			_HA_ATOMIC_ADD(&sess->listener->counters->bytes_in, bytes);
 
 		for (i = 0; i < MAX_SESS_STKCTR; i++) {
-			struct stkctr *stkctr = &s->stkctr[i];
-
-			if (!stkctr_entry(stkctr)) {
-				stkctr = &sess->stkctr[i];
-				if (!stkctr_entry(stkctr))
-					continue;
-			}
-
-			ptr1 = stktable_data_ptr(stkctr->table, stkctr_entry(stkctr), STKTABLE_DT_BYTES_IN_CNT);
-			if (ptr1)
-				stktable_data_cast(ptr1, bytes_in_cnt) += bytes;
-
-			ptr2 = stktable_data_ptr(stkctr->table, stkctr_entry(stkctr), STKTABLE_DT_BYTES_IN_RATE);
-			if (ptr2)
-				update_freq_ctr_period(&stktable_data_cast(ptr2, bytes_in_rate),
-						       stkctr->table->data_arg[STKTABLE_DT_BYTES_IN_RATE].u, bytes);
-
-			/* If data was modified, we need to touch to re-schedule sync */
-			if (ptr1 || ptr2)
-				stktable_touch(stkctr->table, stkctr_entry(stkctr), 1);
+			if (!stkctr_inc_bytes_in_ctr(&s->stkctr[i], bytes))
+				stkctr_inc_bytes_in_ctr(&sess->stkctr[i], bytes);
 		}
 	}
 
 	bytes = s->res.total - s->logs.bytes_out;
 	s->logs.bytes_out = s->res.total;
 	if (bytes) {
-		sess->fe->fe_counters.bytes_out += bytes;
-
-		s->be->be_counters.bytes_out += bytes;
+		_HA_ATOMIC_ADD(&sess->fe->fe_counters.bytes_out, bytes);
+		_HA_ATOMIC_ADD(&s->be->be_counters.bytes_out,    bytes);
 
 		if (objt_server(s->target))
-			objt_server(s->target)->counters.bytes_out += bytes;
+			_HA_ATOMIC_ADD(&objt_server(s->target)->counters.bytes_out, bytes);
 
 		if (sess->listener && sess->listener->counters)
-			sess->listener->counters->bytes_out += bytes;
+			_HA_ATOMIC_ADD(&sess->listener->counters->bytes_out, bytes);
 
 		for (i = 0; i < MAX_SESS_STKCTR; i++) {
-			struct stkctr *stkctr = &s->stkctr[i];
-
-			if (!stkctr_entry(stkctr)) {
-				stkctr = &sess->stkctr[i];
-				if (!stkctr_entry(stkctr))
-					continue;
-			}
-
-			ptr1 = stktable_data_ptr(stkctr->table, stkctr_entry(stkctr), STKTABLE_DT_BYTES_OUT_CNT);
-			if (ptr1)
-				stktable_data_cast(ptr1, bytes_out_cnt) += bytes;
-
-			ptr2 = stktable_data_ptr(stkctr->table, stkctr_entry(stkctr), STKTABLE_DT_BYTES_OUT_RATE);
-			if (ptr2)
-				update_freq_ctr_period(&stktable_data_cast(ptr2, bytes_out_rate),
-						       stkctr->table->data_arg[STKTABLE_DT_BYTES_OUT_RATE].u, bytes);
-
-			/* If data was modified, we need to touch to re-schedule sync */
-			if (ptr1 || ptr2)
-				stktable_touch(stkctr->table, stkctr_entry(stkctr), 1);
+			if (!stkctr_inc_bytes_out_ctr(&s->stkctr[i], bytes))
+				stkctr_inc_bytes_out_ctr(&sess->stkctr[i], bytes);
 		}
 	}
 }
 
-/* This function is called with (si->state == SI_ST_CON) meaning that a
- * connection was attempted and that the file descriptor is already allocated.
- * We must check for establishment, error and abort. Possible output states
- * are SI_ST_EST (established), SI_ST_CER (error), SI_ST_DIS (abort), and
- * SI_ST_CON (no change). The function returns 0 if it switches to SI_ST_CER,
- * otherwise 1. This only works with connection-based streams.
- */
-static int sess_update_st_con_tcp(struct stream *s)
+int stream_set_timeout(struct stream *s, enum act_timeout_name name, int timeout)
 {
-	struct stream_interface *si = &s->si[1];
-	struct channel *req = &s->req;
-	struct channel *rep = &s->res;
-	struct connection *srv_conn = __objt_conn(si->end);
-
-	/* If we got an error, or if nothing happened and the connection timed
-	 * out, we must give up. The CER state handler will take care of retry
-	 * attempts and error reports.
-	 */
-	if (unlikely(si->flags & (SI_FL_EXP|SI_FL_ERR))) {
-		if (unlikely(req->flags & CF_WRITE_PARTIAL)) {
-			/* Some data were sent past the connection establishment,
-			 * so we need to pretend we're established to log correctly
-			 * and let later states handle the failure.
-			 */
-			si->state    = SI_ST_EST;
-			si->err_type = SI_ET_DATA_ERR;
-			rep->flags |= CF_READ_ERROR | CF_WRITE_ERROR;
-			return 1;
-		}
-		si->exp   = TICK_ETERNITY;
-		si->state = SI_ST_CER;
-
-		conn_force_close(srv_conn);
-
-		if (si->err_type)
-			return 0;
-
-		if (si->flags & SI_FL_ERR)
-			si->err_type = SI_ET_CONN_ERR;
-		else
-			si->err_type = SI_ET_CONN_TO;
-		return 0;
-	}
-
-	/* OK, maybe we want to abort */
-	if (!(req->flags & CF_WRITE_PARTIAL) &&
-	    unlikely((rep->flags & CF_SHUTW) ||
-		     ((req->flags & CF_SHUTW_NOW) && /* FIXME: this should not prevent a connection from establishing */
-		      ((!(req->flags & CF_WRITE_ACTIVITY) && channel_is_empty(req)) ||
-		       s->be->options & PR_O_ABRT_CLOSE)))) {
-		/* give up */
-		si_shutw(si);
-		si->err_type |= SI_ET_CONN_ABRT;
-		if (s->srv_error)
-			s->srv_error(s, si);
-		return 1;
-	}
-
-	/* we need to wait a bit more if there was no activity either */
-	if (!(req->flags & CF_WRITE_ACTIVITY))
+	switch (name) {
+	case ACT_TIMEOUT_SERVER:
+		s->req.wto = timeout;
+		s->res.rto = timeout;
 		return 1;
 
-	/* OK, this means that a connection succeeded. The caller will be
-	 * responsible for handling the transition from CON to EST.
-	 */
-	si->state    = SI_ST_EST;
-	si->err_type = SI_ET_NONE;
-	return 1;
-}
+	case ACT_TIMEOUT_TUNNEL:
+		s->tunnel_timeout = timeout;
+		return 1;
 
-/* This function is called with (si->state == SI_ST_CER) meaning that a
- * previous connection attempt has failed and that the file descriptor
- * has already been released. Possible causes include asynchronous error
- * notification and time out. Possible output states are SI_ST_CLO when
- * retries are exhausted, SI_ST_TAR when a delay is wanted before a new
- * connection attempt, SI_ST_ASS when it's wise to retry on the same server,
- * and SI_ST_REQ when an immediate redispatch is wanted. The buffers are
- * marked as in error state. It returns 0.
- */
-static int sess_update_st_cer(struct stream *s)
-{
-	struct stream_interface *si = &s->si[1];
-
-	/* we probably have to release last stream from the server */
-	if (objt_server(s->target)) {
-		health_adjust(objt_server(s->target), HANA_STATUS_L4_ERR);
-
-		if (s->flags & SF_CURR_SESS) {
-			s->flags &= ~SF_CURR_SESS;
-			objt_server(s->target)->cur_sess--;
-		}
-	}
-
-	/* ensure that we have enough retries left */
-	si->conn_retries--;
-	if (si->conn_retries < 0) {
-		if (!si->err_type) {
-			si->err_type = SI_ET_CONN_ERR;
-		}
-
-		if (objt_server(s->target))
-			objt_server(s->target)->counters.failed_conns++;
-		s->be->be_counters.failed_conns++;
-		sess_change_server(s, NULL);
-		if (may_dequeue_tasks(objt_server(s->target), s->be))
-			process_srv_queue(objt_server(s->target));
-
-		/* shutw is enough so stop a connecting socket */
-		si_shutw(si);
-		s->req.flags |= CF_WRITE_ERROR;
-		s->res.flags |= CF_READ_ERROR;
-
-		si->state = SI_ST_CLO;
-		if (s->srv_error)
-			s->srv_error(s, si);
+	default:
 		return 0;
 	}
-
-	/* If the "redispatch" option is set on the backend, we are allowed to
-	 * retry on another server. By default this redispatch occurs on the
-	 * last retry, but if configured we allow redispatches to occur on
-	 * configurable intervals, e.g. on every retry. In order to achieve this,
-	 * we must mark the stream unassigned, and eventually clear the DIRECT
-	 * bit to ignore any persistence cookie. We won't count a retry nor a
-	 * redispatch yet, because this will depend on what server is selected.
-	 * If the connection is not persistent, the balancing algorithm is not
-	 * determinist (round robin) and there is more than one active server,
-	 * we accept to perform an immediate redispatch without waiting since
-	 * we don't care about this particular server.
-	 */
-	if (objt_server(s->target) &&
-	    (s->be->options & PR_O_REDISP) && !(s->flags & SF_FORCE_PRST) &&
-	    ((__objt_server(s->target)->state < SRV_ST_RUNNING) ||
-	     (((s->be->redispatch_after > 0) &&
-	       ((s->be->conn_retries - si->conn_retries) %
-	        s->be->redispatch_after == 0)) ||
-	      ((s->be->redispatch_after < 0) &&
-	       ((s->be->conn_retries - si->conn_retries) %
-	        (s->be->conn_retries + 1 + s->be->redispatch_after) == 0))) ||
-	     (!(s->flags & SF_DIRECT) && s->be->srv_act > 1 &&
-	      ((s->be->lbprm.algo & BE_LB_KIND) == BE_LB_KIND_RR)))) {
-		sess_change_server(s, NULL);
-		if (may_dequeue_tasks(objt_server(s->target), s->be))
-			process_srv_queue(objt_server(s->target));
-
-		s->flags &= ~(SF_DIRECT | SF_ASSIGNED | SF_ADDR_SET);
-		si->state = SI_ST_REQ;
-	} else {
-		if (objt_server(s->target))
-			objt_server(s->target)->counters.retries++;
-		s->be->be_counters.retries++;
-		si->state = SI_ST_ASS;
-	}
-
-	if (si->flags & SI_FL_ERR) {
-		/* The error was an asynchronous connection error, and we will
-		 * likely have to retry connecting to the same server, most
-		 * likely leading to the same result. To avoid this, we wait
-		 * MIN(one second, connect timeout) before retrying.
-		 */
-
-		int delay = 1000;
-
-		if (s->be->timeout.connect && s->be->timeout.connect < delay)
-			delay = s->be->timeout.connect;
-
-		if (!si->err_type)
-			si->err_type = SI_ET_CONN_ERR;
-
-		/* only wait when we're retrying on the same server */
-		if (si->state == SI_ST_ASS ||
-		    (s->be->lbprm.algo & BE_LB_KIND) != BE_LB_KIND_RR ||
-		    (s->be->srv_act <= 1)) {
-			si->state = SI_ST_TAR;
-			si->exp = tick_add(now_ms, MS_TO_TICKS(delay));
-		}
-		return 0;
-	}
-	return 0;
 }
 
 /*
  * This function handles the transition between the SI_ST_CON state and the
  * SI_ST_EST state. It must only be called after switching from SI_ST_CON (or
- * SI_ST_INI) to SI_ST_EST, but only when a ->proto is defined.
+ * SI_ST_INI or SI_ST_RDY) to SI_ST_EST, but only when a ->proto is defined.
+ * Note that it will switch the interface to SI_ST_DIS if we already have
+ * the CF_SHUTR flag, it means we were able to forward the request, and
+ * receive the response, before process_stream() had the opportunity to
+ * make the switch from SI_ST_CON to SI_ST_EST. When that happens, we want
+ * to go through back_establish() anyway, to make sure the analysers run.
+ * Timeouts are cleared. Error are reported on the channel so that analysers
+ * can handle them.
  */
-static void sess_establish(struct stream *s)
+static void back_establish(struct stream *s)
 {
 	struct stream_interface *si = &s->si[1];
+	struct conn_stream *srv_cs = objt_cs(si->end);
+	struct connection *conn = srv_cs ? srv_cs->conn : objt_conn(si->end);
 	struct channel *req = &s->req;
 	struct channel *rep = &s->res;
 
-	/* First, centralize the timers information */
+	DBG_TRACE_ENTER(STRM_EV_STRM_PROC|STRM_EV_SI_ST, s);
+	/* First, centralize the timers information, and clear any irrelevant
+	 * timeout.
+	 */
 	s->logs.t_connect = tv_ms_elapsed(&s->logs.tv_accept, &now);
-	si->exp      = TICK_ETERNITY;
+	si->exp = TICK_ETERNITY;
+	si->flags &= ~SI_FL_EXP;
+
+	/* errors faced after sending data need to be reported */
+	if (si->flags & SI_FL_ERR && req->flags & CF_WROTE_DATA) {
+		/* Don't add CF_WRITE_ERROR if we're here because
+		 * early data were rejected by the server, or
+		 * http_wait_for_response() will never be called
+		 * to send a 425.
+		 */
+		if (conn && conn->err_code != CO_ER_SSL_EARLY_FAILED)
+			req->flags |= CF_WRITE_ERROR;
+		rep->flags |= CF_READ_ERROR;
+		si->err_type = SI_ET_DATA_ERR;
+		DBG_TRACE_STATE("read/write error", STRM_EV_STRM_PROC|STRM_EV_SI_ST|STRM_EV_STRM_ERR, s);
+	}
 
 	if (objt_server(s->target))
 		health_adjust(objt_server(s->target), HANA_STATUS_L4_OK);
@@ -714,6 +880,7 @@ static void sess_establish(struct stream *s)
 		/* if the user wants to log as soon as possible, without counting
 		 * bytes from the server, then this is the right moment. */
 		if (!LIST_ISEMPTY(&strm_fe(s)->logformat) && !(s->logs.logwait & LW_BYTES)) {
+			/* note: no pend_pos here, session is established */
 			s->logs.t_close = s->logs.t_connect; /* to get a valid end date */
 			s->do_log(s);
 		}
@@ -729,196 +896,36 @@ static void sess_establish(struct stream *s)
 	if (s->be->mode == PR_MODE_HTTP && HAS_FILTERS(s))
 		rep->analysers |= AN_RES_FLT_HTTP_HDRS;
 
+	si_rx_endp_more(si);
 	rep->flags |= CF_READ_ATTACHED; /* producer is now attached */
-	if (req->flags & CF_WAKE_CONNECT) {
-		req->flags |= CF_WAKE_ONCE;
-		req->flags &= ~CF_WAKE_CONNECT;
-	}
-	if (objt_conn(si->end)) {
-		/* real connections have timeouts */
-		req->wto = s->be->timeout.server;
-		rep->rto = s->be->timeout.server;
+	if (objt_cs(si->end)) {
+		/* real connections have timeouts
+		 * if already defined, it means that a set-timeout rule has
+		 * been executed so do not overwrite them
+		 */
+		if (!tick_isset(req->wto))
+			req->wto = s->be->timeout.server;
+		if (!tick_isset(rep->rto))
+			rep->rto = s->be->timeout.server;
+		if (!tick_isset(s->tunnel_timeout))
+			s->tunnel_timeout = s->be->timeout.tunnel;
+
+		/* The connection is now established, try to read data from the
+		 * underlying layer, and subscribe to recv events. We use a
+		 * delayed recv here to give a chance to the data to flow back
+		 * by the time we process other tasks.
+		 */
+		si_chk_rcv(si);
 	}
 	req->wex = TICK_ETERNITY;
-}
-
-/* Check if the connection request is in such a state that it can be aborted. */
-static int check_req_may_abort(struct channel *req, struct stream *s)
-{
-	return ((req->flags & (CF_READ_ERROR)) ||
-	        ((req->flags & CF_SHUTW_NOW) &&  /* empty and client aborted */
-	         (channel_is_empty(req) || s->be->options & PR_O_ABRT_CLOSE)));
-}
-
-/* Update back stream interface status for input states SI_ST_ASS, SI_ST_QUE,
- * SI_ST_TAR. Other input states are simply ignored.
- * Possible output states are SI_ST_CLO, SI_ST_TAR, SI_ST_ASS, SI_ST_REQ, SI_ST_CON
- * and SI_ST_EST. Flags must have previously been updated for timeouts and other
- * conditions.
- */
-static void sess_update_stream_int(struct stream *s)
-{
-	struct server *srv = objt_server(s->target);
-	struct stream_interface *si = &s->si[1];
-	struct channel *req = &s->req;
-
-	DPRINTF(stderr,"[%u] %s: sess=%p rq=%p, rp=%p, exp(r,w)=%u,%u rqf=%08x rpf=%08x rqh=%d rqt=%d rph=%d rpt=%d cs=%d ss=%d\n",
-		now_ms, __FUNCTION__,
-		s,
-		req, &s->res,
-		req->rex, s->res.wex,
-		req->flags, s->res.flags,
-		req->buf->i, req->buf->o, s->res.buf->i, s->res.buf->o, s->si[0].state, s->si[1].state);
-
-	if (si->state == SI_ST_ASS) {
-		/* Server assigned to connection request, we have to try to connect now */
-		int conn_err;
-
-		/* Before we try to initiate the connection, see if the
-		 * request may be aborted instead.
-		 */
-		if (check_req_may_abort(req, s)) {
-			si->err_type |= SI_ET_CONN_ABRT;
-			goto abort_connection;
-		}
-
-		conn_err = connect_server(s);
-		srv = objt_server(s->target);
-
-		if (conn_err == SF_ERR_NONE) {
-			/* state = SI_ST_CON or SI_ST_EST now */
-			if (srv)
-				srv_inc_sess_ctr(srv);
-			if (srv)
-				srv_set_sess_last(srv);
-			return;
-		}
-
-		/* We have received a synchronous error. We might have to
-		 * abort, retry immediately or redispatch.
-		 */
-		if (conn_err == SF_ERR_INTERNAL) {
-			if (!si->err_type) {
-				si->err_type = SI_ET_CONN_OTHER;
-			}
-
-			if (srv)
-				srv_inc_sess_ctr(srv);
-			if (srv)
-				srv_set_sess_last(srv);
-			if (srv)
-				srv->counters.failed_conns++;
-			s->be->be_counters.failed_conns++;
-
-			/* release other streams waiting for this server */
-			sess_change_server(s, NULL);
-			if (may_dequeue_tasks(srv, s->be))
-				process_srv_queue(srv);
-
-			/* Failed and not retryable. */
-			si_shutr(si);
-			si_shutw(si);
-			req->flags |= CF_WRITE_ERROR;
-
-			s->logs.t_queue = tv_ms_elapsed(&s->logs.tv_accept, &now);
-
-			/* no stream was ever accounted for this server */
-			si->state = SI_ST_CLO;
-			if (s->srv_error)
-				s->srv_error(s, si);
-			return;
-		}
-
-		/* We are facing a retryable error, but we don't want to run a
-		 * turn-around now, as the problem is likely a source port
-		 * allocation problem, so we want to retry now.
-		 */
-		si->state = SI_ST_CER;
-		si->flags &= ~SI_FL_ERR;
-		sess_update_st_cer(s);
-		/* now si->state is one of SI_ST_CLO, SI_ST_TAR, SI_ST_ASS, SI_ST_REQ */
-		return;
+	/* If we managed to get the whole response, and we don't have anything
+	 * left to send, or can't, switch to SI_ST_DIS now. */
+	if (rep->flags & (CF_SHUTR | CF_SHUTW)) {
+		si->state = SI_ST_DIS;
+		DBG_TRACE_STATE("response channel shutdwn for read/write", STRM_EV_STRM_PROC|STRM_EV_SI_ST|STRM_EV_STRM_ERR, s);
 	}
-	else if (si->state == SI_ST_QUE) {
-		/* connection request was queued, check for any update */
-		if (!s->pend_pos) {
-			/* The connection is not in the queue anymore. Either
-			 * we have a server connection slot available and we
-			 * go directly to the assigned state, or we need to
-			 * load-balance first and go to the INI state.
-			 */
-			si->exp = TICK_ETERNITY;
-			if (unlikely(!(s->flags & SF_ASSIGNED)))
-				si->state = SI_ST_REQ;
-			else {
-				s->logs.t_queue = tv_ms_elapsed(&s->logs.tv_accept, &now);
-				si->state = SI_ST_ASS;
-			}
-			return;
-		}
 
-		/* Connection request still in queue... */
-		if (si->flags & SI_FL_EXP) {
-			/* ... and timeout expired */
-			si->exp = TICK_ETERNITY;
-			s->logs.t_queue = tv_ms_elapsed(&s->logs.tv_accept, &now);
-			if (srv)
-				srv->counters.failed_conns++;
-			s->be->be_counters.failed_conns++;
-			si_shutr(si);
-			si_shutw(si);
-			req->flags |= CF_WRITE_TIMEOUT;
-			if (!si->err_type)
-				si->err_type = SI_ET_QUEUE_TO;
-			si->state = SI_ST_CLO;
-			if (s->srv_error)
-				s->srv_error(s, si);
-			return;
-		}
-
-		/* Connection remains in queue, check if we have to abort it */
-		if (check_req_may_abort(req, s)) {
-			s->logs.t_queue = tv_ms_elapsed(&s->logs.tv_accept, &now);
-			si->err_type |= SI_ET_QUEUE_ABRT;
-			goto abort_connection;
-		}
-
-		/* Nothing changed */
-		return;
-	}
-	else if (si->state == SI_ST_TAR) {
-		/* Connection request might be aborted */
-		if (check_req_may_abort(req, s)) {
-			si->err_type |= SI_ET_CONN_ABRT;
-			goto abort_connection;
-		}
-
-		if (!(si->flags & SI_FL_EXP))
-			return;  /* still in turn-around */
-
-		si->exp = TICK_ETERNITY;
-
-		/* we keep trying on the same server as long as the stream is
-		 * marked "assigned".
-		 * FIXME: Should we force a redispatch attempt when the server is down ?
-		 */
-		if (s->flags & SF_ASSIGNED)
-			si->state = SI_ST_ASS;
-		else
-			si->state = SI_ST_REQ;
-		return;
-	}
-	return;
-
-abort_connection:
-	/* give up */
-	si->exp = TICK_ETERNITY;
-	si_shutr(si);
-	si_shutw(si);
-	si->state = SI_ST_CLO;
-	if (s->srv_error)
-		s->srv_error(s, si);
-	return;
+	DBG_TRACE_LEAVE(STRM_EV_STRM_PROC|STRM_EV_SI_ST, s);
 }
 
 /* Set correct stream termination flags in case no analyser has done it. It
@@ -928,17 +935,17 @@ abort_connection:
 static void sess_set_term_flags(struct stream *s)
 {
 	if (!(s->flags & SF_FINST_MASK)) {
-		if (s->si[1].state < SI_ST_REQ) {
-
-			strm_fe(s)->fe_counters.failed_req++;
+		if (s->si[1].state == SI_ST_INI) {
+			/* anything before REQ in fact */
+			_HA_ATOMIC_ADD(&strm_fe(s)->fe_counters.failed_req, 1);
 			if (strm_li(s) && strm_li(s)->counters)
-				strm_li(s)->counters->failed_req++;
+				_HA_ATOMIC_ADD(&strm_li(s)->counters->failed_req, 1);
 
 			s->flags |= SF_FINST_R;
 		}
 		else if (s->si[1].state == SI_ST_QUE)
 			s->flags |= SF_FINST_Q;
-		else if (s->si[1].state < SI_ST_EST)
+		else if (si_state_in(s->si[1].state, SI_SB_REQ|SI_SB_TAR|SI_SB_ASS|SI_SB_CON|SI_SB_CER|SI_SB_RDY))
 			s->flags |= SF_FINST_C;
 		else if (s->si[1].state == SI_ST_EST || s->si[1].prev_state == SI_ST_EST)
 			s->flags |= SF_FINST_D;
@@ -947,89 +954,10 @@ static void sess_set_term_flags(struct stream *s)
 	}
 }
 
-/* This function initiates a server connection request on a stream interface
- * already in SI_ST_REQ state. Upon success, the state goes to SI_ST_ASS for
- * a real connection to a server, indicating that a server has been assigned,
- * or SI_ST_EST for a successful connection to an applet. It may also return
- * SI_ST_QUE, or SI_ST_CLO upon error.
- */
-static void sess_prepare_conn_req(struct stream *s)
-{
-	struct stream_interface *si = &s->si[1];
-
-	DPRINTF(stderr,"[%u] %s: sess=%p rq=%p, rp=%p, exp(r,w)=%u,%u rqf=%08x rpf=%08x rqh=%d rqt=%d rph=%d rpt=%d cs=%d ss=%d\n",
-		now_ms, __FUNCTION__,
-		s,
-		&s->req, &s->res,
-		s->req.rex, s->res.wex,
-		s->req.flags, s->res.flags,
-		s->req.buf->i, s->req.buf->o, s->res.buf->i, s->res.buf->o, s->si[0].state, s->si[1].state);
-
-	if (si->state != SI_ST_REQ)
-		return;
-
-	if (unlikely(obj_type(s->target) == OBJ_TYPE_APPLET)) {
-		/* the applet directly goes to the EST state */
-		struct appctx *appctx = objt_appctx(si->end);
-
-		if (!appctx || appctx->applet != __objt_applet(s->target))
-			appctx = stream_int_register_handler(si, objt_applet(s->target));
-
-		if (!appctx) {
-			/* No more memory, let's immediately abort. Force the
-			 * error code to ignore the ERR_LOCAL which is not a
-			 * real error.
-			 */
-			s->flags &= ~(SF_ERR_MASK | SF_FINST_MASK);
-
-			si_shutr(si);
-			si_shutw(si);
-			s->req.flags |= CF_WRITE_ERROR;
-			si->err_type = SI_ET_CONN_RES;
-			si->state = SI_ST_CLO;
-			if (s->srv_error)
-				s->srv_error(s, si);
-			return;
-		}
-
-		s->logs.t_queue   = tv_ms_elapsed(&s->logs.tv_accept, &now);
-		si->state         = SI_ST_EST;
-		si->err_type      = SI_ET_NONE;
-		be_set_sess_last(s->be);
-		/* let sess_establish() finish the job */
-		return;
-	}
-
-	/* Try to assign a server */
-	if (srv_redispatch_connect(s) != 0) {
-		/* We did not get a server. Either we queued the
-		 * connection request, or we encountered an error.
-		 */
-		if (si->state == SI_ST_QUE)
-			return;
-
-		/* we did not get any server, let's check the cause */
-		si_shutr(si);
-		si_shutw(si);
-		s->req.flags |= CF_WRITE_ERROR;
-		if (!si->err_type)
-			si->err_type = SI_ET_CONN_OTHER;
-		si->state = SI_ST_CLO;
-		if (s->srv_error)
-			s->srv_error(s, si);
-		return;
-	}
-
-	/* The server is assigned */
-	s->logs.t_queue = tv_ms_elapsed(&s->logs.tv_accept, &now);
-	si->state = SI_ST_ASS;
-	be_set_sess_last(s->be);
-}
-
 /* This function parses the use-service action ruleset. It executes
  * the associated ACL and set an applet as a stream or txn final node.
  * it returns ACT_RET_ERR if an error occurs, the proxy left in
- * consistent state. It returns ACT_RET_STOP in succes case because
+ * consistent state. It returns ACT_RET_STOP in success case because
  * use-service must be a terminal action. Returns ACT_RET_YIELD
  * if the initialisation function require more data.
  */
@@ -1040,10 +968,10 @@ enum act_return process_use_service(struct act_rule *rule, struct proxy *px,
 	struct appctx *appctx;
 
 	/* Initialises the applet if it is required. */
-	if (flags & ACT_FLAG_FIRST) {
+	if (flags & ACT_OPT_FIRST) {
 		/* Register applet. this function schedules the applet. */
 		s->target = &rule->applet.obj_type;
-		if (unlikely(!stream_int_register_handler(&s->si[1], objt_applet(s->target))))
+		if (unlikely(!si_register_handler(&s->si[1], objt_applet(s->target))))
 			return ACT_RET_ERR;
 
 		/* Initialise the context. */
@@ -1054,11 +982,10 @@ enum act_return process_use_service(struct act_rule *rule, struct proxy *px,
 	else
 		appctx = si_appctx(&s->si[1]);
 
-	/* Stops the applet sheduling, in case of the init function miss
+	/* Stops the applet scheduling, in case of the init function miss
 	 * some data.
 	 */
-	appctx_pause(appctx);
-	si_applet_stop_get(&s->si[1]);
+	si_stop_get(&s->si[1]);
 
 	/* Call initialisation. */
 	if (rule->applet.init)
@@ -1068,16 +995,17 @@ enum act_return process_use_service(struct act_rule *rule, struct proxy *px,
 		default: return ACT_RET_YIELD;
 	}
 
+	if (rule->from != ACT_F_HTTP_REQ) {
+		if (sess->fe == s->be) /* report it if the request was intercepted by the frontend */
+			_HA_ATOMIC_ADD(&sess->fe->fe_counters.intercepted_req, 1);
+
+		/* The flag SF_ASSIGNED prevent from server assignment. */
+		s->flags |= SF_ASSIGNED;
+	}
+
 	/* Now we can schedule the applet. */
-	si_applet_cant_get(&s->si[1]);
+	si_cant_get(&s->si[1]);
 	appctx_wakeup(appctx);
-
-	if (sess->fe == s->be) /* report it if the request was intercepted by the frontend */
-		sess->fe->fe_counters.intercepted_req++;
-
-	/* The flag SF_ASSIGNED prevent from server assignment. */
-	s->flags |= SF_ASSIGNED;
-
 	return ACT_RET_STOP;
 }
 
@@ -1096,14 +1024,7 @@ static int process_switching_rules(struct stream *s, struct channel *req, int an
 	req->analysers &= ~an_bit;
 	req->analyse_exp = TICK_ETERNITY;
 
-	DPRINTF(stderr,"[%u] %s: stream=%p b=%p, exp(r,w)=%u,%u bf=%08x bh=%d analysers=%02x\n",
-		now_ms, __FUNCTION__,
-		s,
-		req,
-		req->rex, req->wex,
-		req->flags,
-		req->buf->i,
-		req->analysers);
+	DBG_TRACE_ENTER(STRM_EV_STRM_ANA, s);
 
 	/* now check whether we have some switching rules for this request */
 	if (!(s->flags & SF_BE_ASSIGNED)) {
@@ -1124,13 +1045,21 @@ static int process_switching_rules(struct stream *s, struct channel *req, int an
 				 * If we can't resolve the name, or if any error occurs, break
 				 * the loop and fallback to the default backend.
 				 */
-				struct proxy *backend;
+				struct proxy *backend = NULL;
 
 				if (rule->dynamic) {
-					struct chunk *tmp = get_trash_chunk();
-					if (!build_logline(s, tmp->str, tmp->size, &rule->be.expr))
-						break;
-					backend = proxy_be_by_name(tmp->str);
+					struct buffer *tmp;
+
+					tmp = alloc_trash_chunk();
+					if (!tmp)
+						goto sw_failed;
+
+					if (build_logline(s, tmp->area, tmp->size, &rule->be.expr))
+						backend = proxy_be_by_name(tmp->area);
+
+					free_trash_chunk(tmp);
+					tmp = NULL;
+
 					if (!backend)
 						break;
 				}
@@ -1184,6 +1113,7 @@ static int process_switching_rules(struct stream *s, struct channel *req, int an
 		}
 	}
 
+	DBG_TRACE_LEAVE(STRM_EV_STRM_ANA, s);
 	return 1;
 
  sw_failed:
@@ -1200,6 +1130,7 @@ static int process_switching_rules(struct stream *s, struct channel *req, int an
 		s->txn->status = 500;
 	s->req.analysers &= AN_REQ_FLT_END;
 	s->req.analyse_exp = TICK_ETERNITY;
+	DBG_TRACE_DEVEL("leaving on error", STRM_EV_STRM_ANA|STRM_EV_STRM_ERR, s);
 	return 0;
 }
 
@@ -1213,14 +1144,7 @@ static int process_server_rules(struct stream *s, struct channel *req, int an_bi
 	struct session *sess = s->sess;
 	struct server_rule *rule;
 
-	DPRINTF(stderr,"[%u] %s: stream=%p b=%p, exp(r,w)=%u,%u bf=%08x bl=%d analysers=%02x\n",
-		now_ms, __FUNCTION__,
-		s,
-		req,
-		req->rex, req->wex,
-		req->flags,
-		req->buf->i + req->buf->o,
-		req->analysers);
+	DBG_TRACE_ENTER(STRM_EV_STRM_ANA, s);
 
 	if (!(s->flags & SF_ASSIGNED)) {
 		list_for_each_entry(rule, &px->server_rules, list) {
@@ -1232,9 +1156,22 @@ static int process_server_rules(struct stream *s, struct channel *req, int an_bi
 				ret = !ret;
 
 			if (ret) {
-				struct server *srv = rule->srv.ptr;
+				struct server *srv;
 
-				if ((srv->state != SRV_ST_STOPPED) ||
+				if (rule->dynamic) {
+					struct buffer *tmp = get_trash_chunk();
+
+					if (!build_logline(s, tmp->area, tmp->size, &rule->expr))
+						break;
+
+					srv = findserver(s->be, tmp->area);
+					if (!srv)
+						break;
+				}
+				else
+					srv = rule->srv.ptr;
+
+				if ((srv->cur_state != SRV_ST_STOPPED) ||
 				    (px->options & PR_O_PERSIST) ||
 				    (s->flags & SF_FORCE_PRST)) {
 					s->flags |= SF_DIRECT | SF_ASSIGNED;
@@ -1250,7 +1187,61 @@ static int process_server_rules(struct stream *s, struct channel *req, int an_bi
 
 	req->analysers &= ~an_bit;
 	req->analyse_exp = TICK_ETERNITY;
+	DBG_TRACE_LEAVE(STRM_EV_STRM_ANA, s);
 	return 1;
+}
+
+static inline void sticking_rule_find_target(struct stream *s,
+                                             struct stktable *t, struct stksess *ts)
+{
+	struct proxy *px = s->be;
+	struct eb32_node *node;
+	struct dict_entry *de;
+	void *ptr;
+	struct server *srv;
+
+	/* Look for the server name previously stored in <t> stick-table */
+	HA_RWLOCK_RDLOCK(STK_SESS_LOCK, &ts->lock);
+	ptr = __stktable_data_ptr(t, ts, STKTABLE_DT_SERVER_KEY);
+	de = stktable_data_cast(ptr, server_key);
+	HA_RWLOCK_RDUNLOCK(STK_SESS_LOCK, &ts->lock);
+
+	if (de) {
+		struct ebpt_node *node;
+
+		if (t->server_key_type == STKTABLE_SRV_NAME) {
+			node = ebis_lookup(&px->conf.used_server_name, de->value.key);
+			if (node) {
+				srv = container_of(node, struct server, conf.name);
+				goto found;
+			}
+		} else if (t->server_key_type == STKTABLE_SRV_ADDR) {
+			HA_RWLOCK_RDLOCK(PROXY_LOCK, &px->lock);
+			node = ebis_lookup(&px->used_server_addr, de->value.key);
+			HA_RWLOCK_RDUNLOCK(PROXY_LOCK, &px->lock);
+			if (node) {
+				srv = container_of(node, struct server, addr_node);
+				goto found;
+			}
+		}
+	}
+
+	/* Look for the server ID */
+	HA_RWLOCK_RDLOCK(STK_SESS_LOCK, &ts->lock);
+	ptr = __stktable_data_ptr(t, ts, STKTABLE_DT_SERVER_ID);
+	node = eb32_lookup(&px->conf.used_server_id, stktable_data_cast(ptr, server_id));
+	HA_RWLOCK_RDUNLOCK(STK_SESS_LOCK, &ts->lock);
+
+	if (!node)
+		return;
+
+	srv = container_of(node, struct server, conf.id);
+ found:
+	if ((srv->cur_state != SRV_ST_STOPPED) ||
+	    (px->options & PR_O_PERSIST) || (s->flags & SF_FORCE_PRST)) {
+		s->flags |= SF_DIRECT | SF_ASSIGNED;
+		s->target = &srv->obj_type;
+	}
 }
 
 /* This stream analyser works on a request. It applies all sticking rules on
@@ -1263,14 +1254,7 @@ static int process_sticking_rules(struct stream *s, struct channel *req, int an_
 	struct session *sess  = s->sess;
 	struct sticking_rule  *rule;
 
-	DPRINTF(stderr,"[%u] %s: stream=%p b=%p, exp(r,w)=%u,%u bf=%08x bh=%d analysers=%02x\n",
-		now_ms, __FUNCTION__,
-		s,
-		req,
-		req->rex, req->wex,
-		req->flags,
-		req->buf->i,
-		req->analysers);
+	DBG_TRACE_ENTER(STRM_EV_STRM_ANA, s);
 
 	list_for_each_entry(rule, &px->sticking_rules, list) {
 		int ret = 1 ;
@@ -1283,13 +1267,15 @@ static int process_sticking_rules(struct stream *s, struct channel *req, int an_
 		 * An example could be a store of the IP address from an HTTP
 		 * header first, then from the source if not found.
 		 */
-		for (i = 0; i < s->store_count; i++) {
-			if (rule->table.t == s->store[i].table)
-				break;
-		}
+		if (rule->flags & STK_IS_STORE) {
+			for (i = 0; i < s->store_count; i++) {
+				if (rule->table.t == s->store[i].table)
+					break;
+			}
 
-		if (i !=  s->store_count)
-			continue;
+			if (i !=  s->store_count)
+				continue;
+		}
 
 		if (rule->cond) {
 	                ret = acl_exec_cond(rule->cond, px, sess, s, SMP_OPT_DIR_REQ|SMP_OPT_FINAL);
@@ -1309,26 +1295,9 @@ static int process_sticking_rules(struct stream *s, struct channel *req, int an_
 				struct stksess *ts;
 
 				if ((ts = stktable_lookup_key(rule->table.t, key)) != NULL) {
-					if (!(s->flags & SF_ASSIGNED)) {
-						struct eb32_node *node;
-						void *ptr;
-
-						/* srv found in table */
-						ptr = stktable_data_ptr(rule->table.t, ts, STKTABLE_DT_SERVER_ID);
-						node = eb32_lookup(&px->conf.used_server_id, stktable_data_cast(ptr, server_id));
-						if (node) {
-							struct server *srv;
-
-							srv = container_of(node, struct server, conf.id);
-							if ((srv->state != SRV_ST_STOPPED) ||
-							    (px->options & PR_O_PERSIST) ||
-							    (s->flags & SF_FORCE_PRST)) {
-								s->flags |= SF_DIRECT | SF_ASSIGNED;
-								s->target = &srv->obj_type;
-							}
-						}
-					}
-					stktable_touch(rule->table.t, ts, 1);
+					if (!(s->flags & SF_ASSIGNED))
+						sticking_rule_find_target(s, rule->table.t, ts);
+					stktable_touch_local(rule->table.t, ts, 1);
 				}
 			}
 			if (rule->flags & STK_IS_STORE) {
@@ -1347,6 +1316,7 @@ static int process_sticking_rules(struct stream *s, struct channel *req, int an_
 
 	req->analysers &= ~an_bit;
 	req->analyse_exp = TICK_ETERNITY;
+	DBG_TRACE_LEAVE(STRM_EV_STRM_ANA, s);
 	return 1;
 }
 
@@ -1362,14 +1332,7 @@ static int process_store_rules(struct stream *s, struct channel *rep, int an_bit
 	int i;
 	int nbreq = s->store_count;
 
-	DPRINTF(stderr,"[%u] %s: stream=%p b=%p, exp(r,w)=%u,%u bf=%08x bh=%d analysers=%02x\n",
-		now_ms, __FUNCTION__,
-		s,
-		rep,
-		rep->rex, rep->wex,
-		rep->flags,
-		rep->buf->i,
-		rep->analysers);
+	DBG_TRACE_ENTER(STRM_EV_STRM_ANA, s);
 
 	list_for_each_entry(rule, &px->storersp_rules, list) {
 		int ret = 1 ;
@@ -1425,6 +1388,9 @@ static int process_store_rules(struct stream *s, struct channel *rep, int an_bit
 	for (i = 0; i < s->store_count; i++) {
 		struct stksess *ts;
 		void *ptr;
+		char *key;
+		struct dict_entry *de;
+		struct stktable *t = s->store[i].table;
 
 		if (objt_server(s->target) && objt_server(s->target)->flags & SRV_F_NON_STICK) {
 			stksess_free(s->store[i].table, s->store[i].ts);
@@ -1432,23 +1398,41 @@ static int process_store_rules(struct stream *s, struct channel *rep, int an_bit
 			continue;
 		}
 
-		ts = stktable_lookup(s->store[i].table, s->store[i].ts);
-		if (ts) {
+		ts = stktable_set_entry(t, s->store[i].ts);
+		if (ts != s->store[i].ts) {
 			/* the entry already existed, we can free ours */
-			stktable_touch(s->store[i].table, ts, 1);
-			stksess_free(s->store[i].table, s->store[i].ts);
+			stksess_free(t, s->store[i].ts);
 		}
-		else
-			ts = stktable_store(s->store[i].table, s->store[i].ts, 1);
-
 		s->store[i].ts = NULL;
-		ptr = stktable_data_ptr(s->store[i].table, ts, STKTABLE_DT_SERVER_ID);
-		stktable_data_cast(ptr, server_id) = objt_server(s->target)->puid;
+
+		HA_RWLOCK_WRLOCK(STK_SESS_LOCK, &ts->lock);
+		ptr = __stktable_data_ptr(t, ts, STKTABLE_DT_SERVER_ID);
+		stktable_data_cast(ptr, server_id) = __objt_server(s->target)->puid;
+		HA_RWLOCK_WRUNLOCK(STK_SESS_LOCK, &ts->lock);
+
+		if (t->server_key_type == STKTABLE_SRV_NAME)
+			key = __objt_server(s->target)->id;
+		else if (t->server_key_type == STKTABLE_SRV_ADDR)
+			key = __objt_server(s->target)->addr_node.key;
+		else
+			continue;
+
+		HA_RWLOCK_WRLOCK(STK_SESS_LOCK, &ts->lock);
+		de = dict_insert(&server_key_dict, key);
+		if (de) {
+			ptr = __stktable_data_ptr(t, ts, STKTABLE_DT_SERVER_KEY);
+			stktable_data_cast(ptr, server_key) = de;
+		}
+		HA_RWLOCK_WRUNLOCK(STK_SESS_LOCK, &ts->lock);
+
+		stktable_touch_local(t, ts, 1);
 	}
 	s->store_count = 0; /* everything is stored */
 
 	rep->analysers &= ~an_bit;
 	rep->analyse_exp = TICK_ETERNITY;
+
+	DBG_TRACE_LEAVE(STRM_EV_STRM_ANA, s);
 	return 1;
 }
 
@@ -1507,10 +1491,10 @@ static int process_store_rules(struct stream *s, struct channel *rep, int an_bit
  * and each function is called only if at least another function has changed at
  * least one flag it is interested in.
  */
-struct task *process_stream(struct task *t)
+struct task *process_stream(struct task *t, void *context, unsigned short state)
 {
 	struct server *srv;
-	struct stream *s = t->context;
+	struct stream *s = context;
 	struct session *sess = s->sess;
 	unsigned int rqf_last, rpf_last;
 	unsigned int rq_prod_last, rq_cons_last;
@@ -1518,6 +1502,11 @@ struct task *process_stream(struct task *t)
 	unsigned int req_ana_back;
 	struct channel *req, *res;
 	struct stream_interface *si_f, *si_b;
+	unsigned int rate;
+
+	DBG_TRACE_ENTER(STRM_EV_STRM_PROC, s);
+
+	activity[tid].stream_calls++;
 
 	req = &s->req;
 	res = &s->res;
@@ -1525,8 +1514,14 @@ struct task *process_stream(struct task *t)
 	si_f = &s->si[0];
 	si_b = &s->si[1];
 
-	//DPRINTF(stderr, "%s:%d: cs=%d ss=%d(%d) rqf=0x%08x rpf=0x%08x\n", __FUNCTION__, __LINE__,
-	//        si_f->state, si_b->state, si_b->err_type, req->flags, res->flags);
+	/* First, attempt to receive pending data from I/O layers */
+	si_sync_recv(si_f);
+	si_sync_recv(si_b);
+
+	rate = update_freq_ctr(&s->call_rate, 1);
+	if (rate >= 100000 && s->call_rate.prev_ctr) { // make sure to wait at least a full second
+		stream_dump_and_crash(&s->obj_type, read_freq_ctr(&s->call_rate));
+	}
 
 	/* this data may be no longer valid, clear it */
 	if (s->txn)
@@ -1545,14 +1540,14 @@ struct task *process_stream(struct task *t)
 	si_b->flags |= SI_FL_DONT_WAKE;
 
 	/* update pending events */
-	s->pending_events |= (t->state & TASK_WOKEN_ANY);
+	s->pending_events |= (state & TASK_WOKEN_ANY);
 
 	/* 1a: Check for low level timeouts if needed. We just set a flag on
 	 * stream interfaces when their timeouts have expired.
 	 */
 	if (unlikely(s->pending_events & TASK_WOKEN_TIMER)) {
-		stream_int_check_timeouts(si_f);
-		stream_int_check_timeouts(si_b);
+		si_check_timeouts(si_f);
+		si_check_timeouts(si_b);
 
 		/* check channel timeouts, and close the corresponding stream interfaces
 		 * for future reads or writes. Note: this will also concern upper layers
@@ -1605,6 +1600,7 @@ struct task *process_stream(struct task *t)
 		}
 	}
 
+ resync_stream_interface:
 	/* below we may emit error messages so we have to ensure that we have
 	 * our buffers properly allocated.
 	 */
@@ -1626,15 +1622,17 @@ struct task *process_stream(struct task *t)
 	 */
 	srv = objt_server(s->target);
 	if (unlikely(si_f->flags & SI_FL_ERR)) {
-		if (si_f->state == SI_ST_EST || si_f->state == SI_ST_DIS) {
+		if (si_state_in(si_f->state, SI_SB_EST|SI_SB_DIS)) {
 			si_shutr(si_f);
 			si_shutw(si_f);
-			stream_int_report_error(si_f);
+			si_report_error(si_f);
 			if (!(req->analysers) && !(res->analysers)) {
-				s->be->be_counters.cli_aborts++;
-				sess->fe->fe_counters.cli_aborts++;
+				_HA_ATOMIC_ADD(&s->be->be_counters.cli_aborts, 1);
+				_HA_ATOMIC_ADD(&sess->fe->fe_counters.cli_aborts, 1);
+				if (sess->listener && sess->listener->counters)
+					_HA_ATOMIC_ADD(&sess->listener->counters->cli_aborts, 1);
 				if (srv)
-					srv->counters.cli_aborts++;
+					_HA_ATOMIC_ADD(&srv->counters.cli_aborts, 1);
 				if (!(s->flags & SF_ERR_MASK))
 					s->flags |= SF_ERR_CLICL;
 				if (!(s->flags & SF_FINST_MASK))
@@ -1644,18 +1642,20 @@ struct task *process_stream(struct task *t)
 	}
 
 	if (unlikely(si_b->flags & SI_FL_ERR)) {
-		if (si_b->state == SI_ST_EST || si_b->state == SI_ST_DIS) {
+		if (si_state_in(si_b->state, SI_SB_EST|SI_SB_DIS)) {
 			si_shutr(si_b);
 			si_shutw(si_b);
-			stream_int_report_error(si_b);
-			s->be->be_counters.failed_resp++;
+			si_report_error(si_b);
+			_HA_ATOMIC_ADD(&s->be->be_counters.failed_resp, 1);
 			if (srv)
-				srv->counters.failed_resp++;
+				_HA_ATOMIC_ADD(&srv->counters.failed_resp, 1);
 			if (!(req->analysers) && !(res->analysers)) {
-				s->be->be_counters.srv_aborts++;
-				sess->fe->fe_counters.srv_aborts++;
+				_HA_ATOMIC_ADD(&s->be->be_counters.srv_aborts, 1);
+				_HA_ATOMIC_ADD(&sess->fe->fe_counters.srv_aborts, 1);
+				if (sess->listener && sess->listener->counters)
+					_HA_ATOMIC_ADD(&sess->listener->counters->srv_aborts, 1);
 				if (srv)
-					srv->counters.srv_aborts++;
+					_HA_ATOMIC_ADD(&srv->counters.srv_aborts, 1);
 				if (!(s->flags & SF_ERR_MASK))
 					s->flags |= SF_ERR_SRVCL;
 				if (!(s->flags & SF_FINST_MASK))
@@ -1665,14 +1665,19 @@ struct task *process_stream(struct task *t)
 		/* note: maybe we should process connection errors here ? */
 	}
 
-	if (si_b->state == SI_ST_CON) {
+	if (si_state_in(si_b->state, SI_SB_CON|SI_SB_RDY)) {
 		/* we were trying to establish a connection on the server side,
 		 * maybe it succeeded, maybe it failed, maybe we timed out, ...
 		 */
-		if (unlikely(!sess_update_st_con_tcp(s)))
-			sess_update_st_cer(s);
+		if (si_b->state == SI_ST_RDY)
+			back_handle_st_rdy(s);
+		else if (si_b->state == SI_ST_CON)
+			back_handle_st_con(s);
+
+		if (si_b->state == SI_ST_CER)
+			back_handle_st_cer(s);
 		else if (si_b->state == SI_ST_EST)
-			sess_establish(s);
+			back_establish(s);
 
 		/* state is now one of SI_ST_CON (still in progress), SI_ST_EST
 		 * (established), SI_ST_DIS (abort), SI_ST_CLO (last error),
@@ -1685,20 +1690,8 @@ struct task *process_stream(struct task *t)
 	rp_cons_last = si_f->state;
 	rp_prod_last = si_b->state;
 
- resync_stream_interface:
 	/* Check for connection closure */
-
-	DPRINTF(stderr,
-		"[%u] %s:%d: task=%p s=%p, sfl=0x%08x, rq=%p, rp=%p, exp(r,w)=%u,%u rqf=%08x rpf=%08x rqh=%d rqt=%d rph=%d rpt=%d cs=%d ss=%d, cet=0x%x set=0x%x retr=%d\n",
-		now_ms, __FUNCTION__, __LINE__,
-		t,
-		s, s->flags,
-		req, res,
-		req->rex, res->wex,
-		req->flags, res->flags,
-		req->buf->i, req->buf->o, res->buf->i, res->buf->o, si_f->state, si_b->state,
-		si_f->err_type, si_b->err_type,
-		si_b->conn_retries);
+	DBG_TRACE_POINT(STRM_EV_STRM_PROC, s);
 
 	/* nothing special to be done on client side */
 	if (unlikely(si_f->state == SI_ST_DIS))
@@ -1713,7 +1706,7 @@ struct task *process_stream(struct task *t)
 		if (srv) {
 			if (s->flags & SF_CURR_SESS) {
 				s->flags &= ~SF_CURR_SESS;
-				srv->cur_sess--;
+				_HA_ATOMIC_SUB(&srv->cur_sess, 1);
 			}
 			sess_change_server(s, NULL);
 			if (may_dequeue_tasks(srv, s->be))
@@ -1730,12 +1723,13 @@ struct task *process_stream(struct task *t)
 	/* Analyse request */
 	if (((req->flags & ~rqf_last) & CF_MASK_ANALYSER) ||
 	    ((req->flags ^ rqf_last) & CF_MASK_STATIC) ||
+	    (req->analysers && (req->flags & CF_SHUTW)) ||
 	    si_f->state != rq_prod_last ||
 	    si_b->state != rq_cons_last ||
 	    s->pending_events & TASK_WOKEN_MSG) {
 		unsigned int flags = req->flags;
 
-		if (si_f->state >= SI_ST_EST) {
+		if (si_state_in(si_f->state, SI_SB_EST|SI_SB_DIS|SI_SB_CLO)) {
 			int max_loops = global.tune.maxpollevents;
 			unsigned int ana_list;
 			unsigned int ana_back;
@@ -1803,6 +1797,7 @@ struct task *process_stream(struct task *t)
 				FLT_ANALYZE(s, req, process_sticking_rules,     ana_list, ana_back, AN_REQ_STICKING_RULES);
 				ANALYZE    (s, req, flt_analyze_http_headers,   ana_list, ana_back, AN_REQ_FLT_HTTP_HDRS);
 				ANALYZE    (s, req, http_request_forward_body,  ana_list, ana_back, AN_REQ_HTTP_XFER_BODY);
+				ANALYZE    (s, req, pcli_wait_for_request,      ana_list, ana_back, AN_REQ_WAIT_CLI);
 				ANALYZE    (s, req, flt_xfer_data,              ana_list, ana_back, AN_REQ_FLT_XFER_DATA);
 				ANALYZE    (s, req, flt_end_analyze,            ana_list, ana_back, AN_REQ_FLT_END);
 				break;
@@ -1814,7 +1809,7 @@ struct task *process_stream(struct task *t)
 		req->flags &= ~CF_WAKE_ONCE;
 		rqf_last = req->flags;
 
-		if ((req->flags ^ flags) & CF_MASK_STATIC)
+		if ((req->flags ^ flags) & (CF_SHUTR|CF_SHUTW))
 			goto resync_request;
 	}
 
@@ -1829,12 +1824,13 @@ struct task *process_stream(struct task *t)
 
 	if (((res->flags & ~rpf_last) & CF_MASK_ANALYSER) ||
 		 (res->flags ^ rpf_last) & CF_MASK_STATIC ||
+		 (res->analysers && (res->flags & CF_SHUTW)) ||
 		 si_f->state != rp_cons_last ||
 		 si_b->state != rp_prod_last ||
 		 s->pending_events & TASK_WOKEN_MSG) {
 		unsigned int flags = res->flags;
 
-		if (si_b->state >= SI_ST_EST) {
+		if (si_state_in(si_b->state, SI_SB_EST|SI_SB_DIS|SI_SB_CLO)) {
 			int max_loops = global.tune.maxpollevents;
 			unsigned int ana_list;
 			unsigned int ana_back;
@@ -1870,6 +1866,7 @@ struct task *process_stream(struct task *t)
 				FLT_ANALYZE(s, res, http_process_res_common,    ana_list, ana_back, AN_RES_HTTP_PROCESS_BE, s->be);
 				ANALYZE    (s, res, flt_analyze_http_headers,   ana_list, ana_back, AN_RES_FLT_HTTP_HDRS);
 				ANALYZE    (s, res, http_response_forward_body, ana_list, ana_back, AN_RES_HTTP_XFER_BODY);
+				ANALYZE    (s, res, pcli_wait_for_response,     ana_list, ana_back, AN_RES_WAIT_CLI);
 				ANALYZE    (s, res, flt_xfer_data,              ana_list, ana_back, AN_RES_FLT_XFER_DATA);
 				ANALYZE    (s, res, flt_end_analyze,            ana_list, ana_back, AN_RES_FLT_END);
 				break;
@@ -1881,7 +1878,7 @@ struct task *process_stream(struct task *t)
 		res->flags &= ~CF_WAKE_ONCE;
 		rpf_last = res->flags;
 
-		if ((res->flags ^ flags) & CF_MASK_STATIC)
+		if ((res->flags ^ flags) & (CF_SHUTR|CF_SHUTW))
 			goto resync_response;
 	}
 
@@ -1908,64 +1905,93 @@ struct task *process_stream(struct task *t)
 			/* Report it if the client got an error or a read timeout expired */
 			req->analysers = 0;
 			if (req->flags & CF_READ_ERROR) {
-				s->be->be_counters.cli_aborts++;
-				sess->fe->fe_counters.cli_aborts++;
+				_HA_ATOMIC_ADD(&s->be->be_counters.cli_aborts, 1);
+				_HA_ATOMIC_ADD(&sess->fe->fe_counters.cli_aborts, 1);
+				if (sess->listener && sess->listener->counters)
+					_HA_ATOMIC_ADD(&sess->listener->counters->cli_aborts, 1);
 				if (srv)
-					srv->counters.cli_aborts++;
+					_HA_ATOMIC_ADD(&srv->counters.cli_aborts, 1);
 				s->flags |= SF_ERR_CLICL;
 			}
 			else if (req->flags & CF_READ_TIMEOUT) {
-				s->be->be_counters.cli_aborts++;
-				sess->fe->fe_counters.cli_aborts++;
+				_HA_ATOMIC_ADD(&s->be->be_counters.cli_aborts, 1);
+				_HA_ATOMIC_ADD(&sess->fe->fe_counters.cli_aborts, 1);
+				if (sess->listener && sess->listener->counters)
+					_HA_ATOMIC_ADD(&sess->listener->counters->cli_aborts, 1);
 				if (srv)
-					srv->counters.cli_aborts++;
+					_HA_ATOMIC_ADD(&srv->counters.cli_aborts, 1);
 				s->flags |= SF_ERR_CLITO;
 			}
 			else if (req->flags & CF_WRITE_ERROR) {
-				s->be->be_counters.srv_aborts++;
-				sess->fe->fe_counters.srv_aborts++;
+				_HA_ATOMIC_ADD(&s->be->be_counters.srv_aborts, 1);
+				_HA_ATOMIC_ADD(&sess->fe->fe_counters.srv_aborts, 1);
+				if (sess->listener && sess->listener->counters)
+					_HA_ATOMIC_ADD(&sess->listener->counters->srv_aborts, 1);
 				if (srv)
-					srv->counters.srv_aborts++;
+					_HA_ATOMIC_ADD(&srv->counters.srv_aborts, 1);
 				s->flags |= SF_ERR_SRVCL;
 			}
 			else {
-				s->be->be_counters.srv_aborts++;
-				sess->fe->fe_counters.srv_aborts++;
+				_HA_ATOMIC_ADD(&s->be->be_counters.srv_aborts, 1);
+				_HA_ATOMIC_ADD(&sess->fe->fe_counters.srv_aborts, 1);
+				if (sess->listener && sess->listener->counters)
+					_HA_ATOMIC_ADD(&sess->listener->counters->srv_aborts, 1);
 				if (srv)
-					srv->counters.srv_aborts++;
+					_HA_ATOMIC_ADD(&srv->counters.srv_aborts, 1);
 				s->flags |= SF_ERR_SRVTO;
 			}
 			sess_set_term_flags(s);
+
+			/* Abort the request if a client error occurred while
+			 * the backend stream-interface is in the SI_ST_INI
+			 * state. It is switched into the SI_ST_CLO state and
+			 * the request channel is erased. */
+			if (si_b->state == SI_ST_INI) {
+				si_b->state = SI_ST_CLO;
+				channel_abort(req);
+				if (IS_HTX_STRM(s))
+					channel_htx_erase(req, htxbuf(&req->buf));
+				else
+					channel_erase(req);
+			}
 		}
 		else if (res->flags & (CF_READ_ERROR|CF_READ_TIMEOUT|CF_WRITE_ERROR|CF_WRITE_TIMEOUT)) {
 			/* Report it if the server got an error or a read timeout expired */
 			res->analysers = 0;
 			if (res->flags & CF_READ_ERROR) {
-				s->be->be_counters.srv_aborts++;
-				sess->fe->fe_counters.srv_aborts++;
+				_HA_ATOMIC_ADD(&s->be->be_counters.srv_aborts, 1);
+				_HA_ATOMIC_ADD(&sess->fe->fe_counters.srv_aborts, 1);
+				if (sess->listener && sess->listener->counters)
+					_HA_ATOMIC_ADD(&sess->listener->counters->srv_aborts, 1);
 				if (srv)
-					srv->counters.srv_aborts++;
+					_HA_ATOMIC_ADD(&srv->counters.srv_aborts, 1);
 				s->flags |= SF_ERR_SRVCL;
 			}
 			else if (res->flags & CF_READ_TIMEOUT) {
-				s->be->be_counters.srv_aborts++;
-				sess->fe->fe_counters.srv_aborts++;
+				_HA_ATOMIC_ADD(&s->be->be_counters.srv_aborts, 1);
+				_HA_ATOMIC_ADD(&sess->fe->fe_counters.srv_aborts, 1);
+				if (sess->listener && sess->listener->counters)
+					_HA_ATOMIC_ADD(&sess->listener->counters->srv_aborts, 1);
 				if (srv)
-					srv->counters.srv_aborts++;
+					_HA_ATOMIC_ADD(&srv->counters.srv_aborts, 1);
 				s->flags |= SF_ERR_SRVTO;
 			}
 			else if (res->flags & CF_WRITE_ERROR) {
-				s->be->be_counters.cli_aborts++;
-				sess->fe->fe_counters.cli_aborts++;
+				_HA_ATOMIC_ADD(&s->be->be_counters.cli_aborts, 1);
+				_HA_ATOMIC_ADD(&sess->fe->fe_counters.cli_aborts, 1);
+				if (sess->listener && sess->listener->counters)
+					_HA_ATOMIC_ADD(&sess->listener->counters->cli_aborts, 1);
 				if (srv)
-					srv->counters.cli_aborts++;
+					_HA_ATOMIC_ADD(&srv->counters.cli_aborts, 1);
 				s->flags |= SF_ERR_CLICL;
 			}
 			else {
-				s->be->be_counters.cli_aborts++;
-				sess->fe->fe_counters.cli_aborts++;
+				_HA_ATOMIC_ADD(&s->be->be_counters.cli_aborts, 1);
+				_HA_ATOMIC_ADD(&sess->fe->fe_counters.cli_aborts, 1);
+				if (sess->listener && sess->listener->counters)
+					_HA_ATOMIC_ADD(&sess->listener->counters->cli_aborts, 1);
 				if (srv)
-					srv->counters.cli_aborts++;
+					_HA_ATOMIC_ADD(&srv->counters.cli_aborts, 1);
 				s->flags |= SF_ERR_CLITO;
 			}
 			sess_set_term_flags(s);
@@ -1978,14 +2004,14 @@ struct task *process_stream(struct task *t)
 	 */
 
 
-	/* If noone is interested in analysing data, it's time to forward
+	/* If no one is interested in analysing data, it's time to forward
 	 * everything. We configure the buffer to forward indefinitely.
 	 * Note that we're checking CF_SHUTR_NOW as an indication of a possible
 	 * recent call to channel_abort().
 	 */
-	if (unlikely(!req->analysers &&
+	if (unlikely((!req->analysers || (req->analysers == AN_REQ_FLT_END && !(req->flags & CF_FLT_ANALYZE))) &&
 	    !(req->flags & (CF_SHUTW|CF_SHUTR_NOW)) &&
-	    (si_f->state >= SI_ST_EST) &&
+	    (si_state_in(si_f->state, SI_SB_EST|SI_SB_DIS|SI_SB_CLO)) &&
 	    (req->to_forward != CHN_INFINITE_FORWARD))) {
 		/* This buffer is freewheeling, there's no analyser
 		 * attached to it. If any data are left in, we'll permit them to
@@ -1994,29 +2020,35 @@ struct task *process_stream(struct task *t)
 		channel_auto_read(req);
 		channel_auto_connect(req);
 		channel_auto_close(req);
-		buffer_flush(req->buf);
 
-		/* We'll let data flow between the producer (if still connected)
-		 * to the consumer (which might possibly not be connected yet).
-		 */
-		if (!(req->flags & (CF_SHUTR|CF_SHUTW_NOW)))
-			channel_forward_forever(req);
+		if (IS_HTX_STRM(s)) {
+			struct htx *htx = htxbuf(&req->buf);
 
-		/* Just in order to support fetching HTTP contents after start
-		 * of forwarding when the HTTP forwarding analyser is not used,
-		 * we simply reset msg->sov so that HTTP rewinding points to the
-		 * headers.
-		 */
-		if (s->txn)
-			s->txn->req.sov = s->txn->req.eoh + s->txn->req.eol - req->buf->o;
+			/* We'll let data flow between the producer (if still connected)
+			 * to the consumer.
+			 */
+			co_set_data(req, htx->data);
+			if (!(req->flags & (CF_SHUTR|CF_SHUTW_NOW)))
+				channel_htx_forward_forever(req, htx);
+		}
+		else {
+			/* We'll let data flow between the producer (if still connected)
+			 * to the consumer (which might possibly not be connected yet).
+			 */
+			c_adv(req, ci_data(req));
+			if (!(req->flags & (CF_SHUTR|CF_SHUTW_NOW)))
+				channel_forward_forever(req);
+		}
 	}
 
 	/* check if it is wise to enable kernel splicing to forward request data */
 	if (!(req->flags & (CF_KERN_SPLICING|CF_SHUTR)) &&
 	    req->to_forward &&
 	    (global.tune.options & GTUNE_USE_SPLICE) &&
-	    (objt_conn(si_f->end) && __objt_conn(si_f->end)->xprt && __objt_conn(si_f->end)->xprt->rcv_pipe) &&
-	    (objt_conn(si_b->end) && __objt_conn(si_b->end)->xprt && __objt_conn(si_b->end)->xprt->snd_pipe) &&
+	    (objt_cs(si_f->end) && __objt_cs(si_f->end)->conn->xprt && __objt_cs(si_f->end)->conn->xprt->rcv_pipe &&
+	     __objt_cs(si_f->end)->conn->mux && __objt_cs(si_f->end)->conn->mux->rcv_pipe) &&
+	    (objt_cs(si_b->end) && __objt_cs(si_b->end)->conn->xprt && __objt_cs(si_b->end)->conn->xprt->snd_pipe &&
+	     __objt_cs(si_b->end)->conn->mux && __objt_cs(si_b->end)->conn->mux->snd_pipe) &&
 	    (pipes_used < global.maxpipes) &&
 	    (((sess->fe->options2|s->be->options2) & PR_O2_SPLIC_REQ) ||
 	     (((sess->fe->options2|s->be->options2) & PR_O2_SPLIC_AUT) &&
@@ -2027,8 +2059,77 @@ struct task *process_stream(struct task *t)
 	/* reflect what the L7 analysers have seen last */
 	rqf_last = req->flags;
 
+	/* it's possible that an upper layer has requested a connection setup or abort.
+	 * There are 2 situations where we decide to establish a new connection :
+	 *  - there are data scheduled for emission in the buffer
+	 *  - the CF_AUTO_CONNECT flag is set (active connection)
+	 */
+	if (si_b->state == SI_ST_INI) {
+		if (!(req->flags & CF_SHUTW)) {
+			if ((req->flags & CF_AUTO_CONNECT) || !channel_is_empty(req)) {
+				/* If we have an appctx, there is no connect method, so we
+				 * immediately switch to the connected state, otherwise we
+				 * perform a connection request.
+				 */
+				si_b->state = SI_ST_REQ; /* new connection requested */
+				si_b->conn_retries = s->be->conn_retries;
+				if ((s->be->retry_type &~ PR_RE_CONN_FAILED) &&
+				    (s->be->mode == PR_MODE_HTTP) &&
+				    !(si_b->flags & SI_FL_D_L7_RETRY))
+					si_b->flags |= SI_FL_L7_RETRY;
+			}
+		}
+		else {
+			si_release_endpoint(si_b);
+			si_b->state = SI_ST_CLO; /* shutw+ini = abort */
+			channel_shutw_now(req);        /* fix buffer flags upon abort */
+			channel_shutr_now(res);
+		}
+	}
+
+
+	/* we may have a pending connection request, or a connection waiting
+	 * for completion.
+	 */
+	if (si_state_in(si_b->state, SI_SB_REQ|SI_SB_QUE|SI_SB_TAR|SI_SB_ASS)) {
+		/* prune the request variables and swap to the response variables. */
+		if (s->vars_reqres.scope != SCOPE_RES) {
+			if (!LIST_ISEMPTY(&s->vars_reqres.head))
+				vars_prune(&s->vars_reqres, s->sess, s);
+			vars_init(&s->vars_reqres, SCOPE_RES);
+		}
+
+		do {
+			/* nb: step 1 might switch from QUE to ASS, but we first want
+			 * to give a chance to step 2 to perform a redirect if needed.
+			 */
+			if (si_b->state != SI_ST_REQ)
+				back_try_conn_req(s);
+			if (si_b->state == SI_ST_REQ)
+				back_handle_st_req(s);
+
+			/* get a chance to complete an immediate connection setup */
+			if (si_b->state == SI_ST_RDY)
+				goto resync_stream_interface;
+
+			/* applets directly go to the ESTABLISHED state. Similarly,
+			 * servers experience the same fate when their connection
+			 * is reused.
+			 */
+			if (unlikely(si_b->state == SI_ST_EST))
+				back_establish(s);
+
+			srv = objt_server(s->target);
+			if (si_b->state == SI_ST_ASS && srv && srv->rdr_len && (s->flags & SF_REDIRECTABLE))
+				http_perform_server_redirect(s, si_b);
+		} while (si_b->state == SI_ST_ASS);
+	}
+
+	/* Let's see if we can send the pending request now */
+	si_sync_send(si_b);
+
 	/*
-	 * Now forward all shutdown requests between both sides of the buffer
+	 * Now forward all shutdown requests between both sides of the request buffer
 	 */
 
 	/* first, let's check if the request buffer needs to shutdown(write), which may
@@ -2061,90 +2162,27 @@ struct task *process_stream(struct task *t)
 		si_shutr(si_f);
 	}
 
-	/* it's possible that an upper layer has requested a connection setup or abort.
-	 * There are 2 situations where we decide to establish a new connection :
-	 *  - there are data scheduled for emission in the buffer
-	 *  - the CF_AUTO_CONNECT flag is set (active connection)
-	 */
-	if (si_b->state == SI_ST_INI) {
-		if (!(req->flags & CF_SHUTW)) {
-			if ((req->flags & CF_AUTO_CONNECT) || !channel_is_empty(req)) {
-				/* If we have an appctx, there is no connect method, so we
-				 * immediately switch to the connected state, otherwise we
-				 * perform a connection request.
-				 */
-				si_b->state = SI_ST_REQ; /* new connection requested */
-				si_b->conn_retries = s->be->conn_retries;
-			}
-		}
-		else {
-			si_b->state = SI_ST_CLO; /* shutw+ini = abort */
-			channel_shutw_now(req);        /* fix buffer flags upon abort */
-			channel_shutr_now(res);
-		}
-	}
-
-
-	/* we may have a pending connection request, or a connection waiting
-	 * for completion.
-	 */
-	if (si_b->state >= SI_ST_REQ && si_b->state < SI_ST_CON) {
-
-		/* prune the request variables and swap to the response variables. */
-		if (s->vars_reqres.scope != SCOPE_RES) {
-			vars_prune(&s->vars_reqres, s->sess, s);
-			vars_init(&s->vars_reqres, SCOPE_RES);
-		}
-
-		do {
-			/* nb: step 1 might switch from QUE to ASS, but we first want
-			 * to give a chance to step 2 to perform a redirect if needed.
-			 */
-			if (si_b->state != SI_ST_REQ)
-				sess_update_stream_int(s);
-			if (si_b->state == SI_ST_REQ)
-				sess_prepare_conn_req(s);
-
-			/* applets directly go to the ESTABLISHED state. Similarly,
-			 * servers experience the same fate when their connection
-			 * is reused.
-			 */
-			if (unlikely(si_b->state == SI_ST_EST))
-				sess_establish(s);
-
-			/* Now we can add the server name to a header (if requested) */
-			/* check for HTTP mode and proxy server_name_hdr_name != NULL */
-			if ((si_b->state >= SI_ST_CON) && (si_b->state < SI_ST_CLO) &&
-			    (s->be->server_id_hdr_name != NULL) &&
-			    (s->be->mode == PR_MODE_HTTP) &&
-			    objt_server(s->target)) {
-				http_send_name_header(s->txn, s->be, objt_server(s->target)->id);
-			}
-
-			srv = objt_server(s->target);
-			if (si_b->state == SI_ST_ASS && srv && srv->rdr_len && (s->flags & SF_REDIRECTABLE))
-				http_perform_server_redirect(s, si_b);
-		} while (si_b->state == SI_ST_ASS);
-	}
-
 	/* Benchmarks have shown that it's optimal to do a full resync now */
-	if (si_f->state == SI_ST_DIS || si_b->state == SI_ST_DIS)
+	if (si_f->state == SI_ST_DIS ||
+	    si_state_in(si_b->state, SI_SB_RDY|SI_SB_DIS) ||
+	    (si_f->flags & SI_FL_ERR && si_f->state != SI_ST_CLO) ||
+	    (si_b->flags & SI_FL_ERR && si_b->state != SI_ST_CLO))
 		goto resync_stream_interface;
 
 	/* otherwise we want to check if we need to resync the req buffer or not */
-	if ((req->flags ^ rqf_last) & CF_MASK_STATIC)
+	if ((req->flags ^ rqf_last) & (CF_SHUTR|CF_SHUTW))
 		goto resync_request;
 
 	/* perform output updates to the response buffer */
 
-	/* If noone is interested in analysing data, it's time to forward
+	/* If no one is interested in analysing data, it's time to forward
 	 * everything. We configure the buffer to forward indefinitely.
 	 * Note that we're checking CF_SHUTR_NOW as an indication of a possible
 	 * recent call to channel_abort().
 	 */
-	if (unlikely(!res->analysers &&
+	if (unlikely((!res->analysers || (res->analysers == AN_RES_FLT_END && !(res->flags & CF_FLT_ANALYZE))) &&
 	    !(res->flags & (CF_SHUTW|CF_SHUTR_NOW)) &&
-	    (si_b->state >= SI_ST_EST) &&
+	    si_state_in(si_b->state, SI_SB_EST|SI_SB_DIS|SI_SB_CLO) &&
 	    (res->to_forward != CHN_INFINITE_FORWARD))) {
 		/* This buffer is freewheeling, there's no analyser
 		 * attached to it. If any data are left in, we'll permit them to
@@ -2152,29 +2190,33 @@ struct task *process_stream(struct task *t)
 		 */
 		channel_auto_read(res);
 		channel_auto_close(res);
-		buffer_flush(res->buf);
 
-		/* We'll let data flow between the producer (if still connected)
-		 * to the consumer.
-		 */
-		if (!(res->flags & (CF_SHUTR|CF_SHUTW_NOW)))
-			channel_forward_forever(res);
+		if (IS_HTX_STRM(s)) {
+			struct htx *htx = htxbuf(&res->buf);
 
-		/* Just in order to support fetching HTTP contents after start
-		 * of forwarding when the HTTP forwarding analyser is not used,
-		 * we simply reset msg->sov so that HTTP rewinding points to the
-		 * headers.
-		 */
-		if (s->txn)
-			s->txn->rsp.sov = s->txn->rsp.eoh + s->txn->rsp.eol - res->buf->o;
+			/* We'll let data flow between the producer (if still connected)
+			 * to the consumer.
+			 */
+			co_set_data(res, htx->data);
+			if (!(res->flags & (CF_SHUTR|CF_SHUTW_NOW)))
+				channel_htx_forward_forever(res, htx);
+		}
+		else {
+			/* We'll let data flow between the producer (if still connected)
+			 * to the consumer.
+			 */
+			c_adv(res, ci_data(res));
+			if (!(res->flags & (CF_SHUTR|CF_SHUTW_NOW)))
+				channel_forward_forever(res);
+		}
 
 		/* if we have no analyser anymore in any direction and have a
 		 * tunnel timeout set, use it now. Note that we must respect
 		 * the half-closed timeouts as well.
 		 */
-		if (!req->analysers && s->be->timeout.tunnel) {
+		if (!req->analysers && s->tunnel_timeout) {
 			req->rto = req->wto = res->rto = res->wto =
-				s->be->timeout.tunnel;
+				s->tunnel_timeout;
 
 			if ((req->flags & CF_SHUTR) && tick_isset(sess->fe->timeout.clientfin))
 				res->wto = sess->fe->timeout.clientfin;
@@ -2196,8 +2238,10 @@ struct task *process_stream(struct task *t)
 	if (!(res->flags & (CF_KERN_SPLICING|CF_SHUTR)) &&
 	    res->to_forward &&
 	    (global.tune.options & GTUNE_USE_SPLICE) &&
-	    (objt_conn(si_f->end) && __objt_conn(si_f->end)->xprt && __objt_conn(si_f->end)->xprt->snd_pipe) &&
-	    (objt_conn(si_b->end) && __objt_conn(si_b->end)->xprt && __objt_conn(si_b->end)->xprt->rcv_pipe) &&
+	    (objt_cs(si_f->end) && __objt_cs(si_f->end)->conn->xprt && __objt_cs(si_f->end)->conn->xprt->snd_pipe &&
+	     __objt_cs(si_f->end)->conn->mux && __objt_cs(si_f->end)->conn->mux->snd_pipe) &&
+	    (objt_cs(si_b->end) && __objt_cs(si_b->end)->conn->xprt && __objt_cs(si_b->end)->conn->xprt->rcv_pipe &&
+	     __objt_cs(si_b->end)->conn->mux && __objt_cs(si_b->end)->conn->mux->rcv_pipe) &&
 	    (pipes_used < global.maxpipes) &&
 	    (((sess->fe->options2|s->be->options2) & PR_O2_SPLIC_RTR) ||
 	     (((sess->fe->options2|s->be->options2) & PR_O2_SPLIC_AUT) &&
@@ -2207,6 +2251,9 @@ struct task *process_stream(struct task *t)
 
 	/* reflect what the L7 analysers have seen last */
 	rpf_last = res->flags;
+
+	/* Let's see if we can send the pending response now */
+	si_sync_send(si_f);
 
 	/*
 	 * Now forward all shutdown requests between both sides of the buffer
@@ -2240,14 +2287,20 @@ struct task *process_stream(struct task *t)
 		si_shutr(si_b);
 	}
 
-	if (si_f->state == SI_ST_DIS || si_b->state == SI_ST_DIS)
+	if (si_f->state == SI_ST_DIS ||
+	    si_state_in(si_b->state, SI_SB_RDY|SI_SB_DIS) ||
+	    (si_f->flags & SI_FL_ERR && si_f->state != SI_ST_CLO) ||
+	    (si_b->flags & SI_FL_ERR && si_b->state != SI_ST_CLO))
 		goto resync_stream_interface;
 
-	if (req->flags != rqf_last)
+	if ((req->flags & ~rqf_last) & CF_MASK_ANALYSER)
 		goto resync_request;
 
 	if ((res->flags ^ rpf_last) & CF_MASK_STATIC)
 		goto resync_response;
+
+	if (((req->flags ^ rqf_last) | (res->flags ^ rpf_last)) & CF_MASK_ANALYSER)
+		goto resync_request;
 
 	/* we're interested in getting wakeups again */
 	si_f->flags &= ~SI_FL_DONT_WAKE;
@@ -2265,39 +2318,26 @@ struct task *process_stream(struct task *t)
 		    si_b->prev_state == SI_ST_EST) {
 			chunk_printf(&trash, "%08x:%s.srvcls[%04x:%04x]\n",
 				      s->uniq_id, s->be->id,
-			              objt_conn(si_f->end) ? (unsigned short)objt_conn(si_f->end)->t.sock.fd : -1,
-			              objt_conn(si_b->end) ? (unsigned short)objt_conn(si_b->end)->t.sock.fd : -1);
-			shut_your_big_mouth_gcc(write(1, trash.str, trash.len));
+			              objt_cs(si_f->end) ? (unsigned short)objt_cs(si_f->end)->conn->handle.fd : -1,
+			              objt_cs(si_b->end) ? (unsigned short)objt_cs(si_b->end)->conn->handle.fd : -1);
+			DISGUISE(write(1, trash.area, trash.data));
 		}
 
 		if (si_f->state == SI_ST_CLO &&
 		    si_f->prev_state == SI_ST_EST) {
 			chunk_printf(&trash, "%08x:%s.clicls[%04x:%04x]\n",
 				      s->uniq_id, s->be->id,
-			              objt_conn(si_f->end) ? (unsigned short)objt_conn(si_f->end)->t.sock.fd : -1,
-			              objt_conn(si_b->end) ? (unsigned short)objt_conn(si_b->end)->t.sock.fd : -1);
-			shut_your_big_mouth_gcc(write(1, trash.str, trash.len));
+			              objt_cs(si_f->end) ? (unsigned short)objt_cs(si_f->end)->conn->handle.fd : -1,
+			              objt_cs(si_b->end) ? (unsigned short)objt_cs(si_b->end)->conn->handle.fd : -1);
+			DISGUISE(write(1, trash.area, trash.data));
 		}
 	}
 
-	if (likely((si_f->state != SI_ST_CLO) ||
-		   (si_b->state > SI_ST_INI && si_b->state < SI_ST_CLO))) {
-
-		if ((sess->fe->options & PR_O_CONTSTATS) && (s->flags & SF_BE_ASSIGNED))
+	if (likely((si_f->state != SI_ST_CLO) || !si_state_in(si_b->state, SI_SB_INI|SI_SB_CLO))) {
+		if ((sess->fe->options & PR_O_CONTSTATS) && (s->flags & SF_BE_ASSIGNED) && !(s->flags & SF_IGNORE))
 			stream_process_counters(s);
 
-		if (si_f->state == SI_ST_EST)
-			si_update(si_f);
-
-		if (si_b->state == SI_ST_EST)
-			si_update(si_b);
-
-		req->flags &= ~(CF_READ_NULL|CF_READ_PARTIAL|CF_WRITE_NULL|CF_WRITE_PARTIAL|CF_READ_ATTACHED);
-		res->flags &= ~(CF_READ_NULL|CF_READ_PARTIAL|CF_WRITE_NULL|CF_WRITE_PARTIAL|CF_READ_ATTACHED);
-		si_f->prev_state = si_f->state;
-		si_b->prev_state = si_b->state;
-		si_f->flags &= ~(SI_FL_ERR|SI_FL_EXP);
-		si_b->flags &= ~(SI_FL_ERR|SI_FL_EXP);
+		si_update_both(si_f, si_b);
 
 		/* Trick: if a request is being waiting for the server to respond,
 		 * and if we know the server can timeout, we don't want the timeout
@@ -2330,61 +2370,38 @@ struct task *process_stream(struct task *t)
 
 		t->expire = tick_first(t->expire, req->analyse_exp);
 
+		t->expire = tick_first(t->expire, res->analyse_exp);
+
 		if (si_f->exp)
 			t->expire = tick_first(t->expire, si_f->exp);
 
 		if (si_b->exp)
 			t->expire = tick_first(t->expire, si_b->exp);
 
-#ifdef DEBUG_FULL
-		fprintf(stderr,
-			"[%u] queuing with exp=%u req->rex=%u req->wex=%u req->ana_exp=%u"
-			" rep->rex=%u rep->wex=%u, si[0].exp=%u, si[1].exp=%u, cs=%d, ss=%d\n",
-			now_ms, t->expire, req->rex, req->wex, req->analyse_exp,
-			res->rex, res->wex, si_f->exp, si_b->exp, si_f->state, si_b->state);
-#endif
-
-#ifdef DEBUG_DEV
-		/* this may only happen when no timeout is set or in case of an FSM bug */
-		if (!tick_isset(t->expire))
-			ABORT_NOW();
-#endif
 		s->pending_events &= ~(TASK_WOKEN_TIMER | TASK_WOKEN_RES);
 		stream_release_buffers(s);
+
+		DBG_TRACE_DEVEL("queuing", STRM_EV_STRM_PROC, s);
 		return t; /* nothing more to do */
 	}
 
-	sess->fe->feconn--;
+	DBG_TRACE_DEVEL("releasing", STRM_EV_STRM_PROC, s);
+
 	if (s->flags & SF_BE_ASSIGNED)
-		s->be->beconn--;
-	jobs--;
-	if (sess->listener) {
-		if (!(sess->listener->options & LI_O_UNLIMITED))
-			actconn--;
-		sess->listener->nbconn--;
-		if (sess->listener->state == LI_FULL)
-			resume_listener(sess->listener);
-
-		/* Dequeues all of the listeners waiting for a resource */
-		if (!LIST_ISEMPTY(&global_listener_queue))
-			dequeue_all_listeners(&global_listener_queue);
-
-		if (!LIST_ISEMPTY(&sess->fe->listener_queue) &&
-		    (!sess->fe->fe_sps_lim || freq_ctr_remain(&sess->fe->fe_sess_per_sec, sess->fe->fe_sps_lim, 0) > 0))
-			dequeue_all_listeners(&sess->fe->listener_queue);
-	}
+		_HA_ATOMIC_SUB(&s->be->beconn, 1);
 
 	if (unlikely((global.mode & MODE_DEBUG) &&
 		     (!(global.mode & MODE_QUIET) || (global.mode & MODE_VERBOSE)))) {
 		chunk_printf(&trash, "%08x:%s.closed[%04x:%04x]\n",
 			      s->uniq_id, s->be->id,
-		              objt_conn(si_f->end) ? (unsigned short)objt_conn(si_f->end)->t.sock.fd : -1,
-		              objt_conn(si_b->end) ? (unsigned short)objt_conn(si_b->end)->t.sock.fd : -1);
-		shut_your_big_mouth_gcc(write(1, trash.str, trash.len));
+		              objt_cs(si_f->end) ? (unsigned short)objt_cs(si_f->end)->conn->handle.fd : -1,
+		              objt_cs(si_b->end) ? (unsigned short)objt_cs(si_b->end)->conn->handle.fd : -1);
+		DISGUISE(write(1, trash.area, trash.data));
 	}
 
 	s->logs.t_close = tv_ms_elapsed(&s->logs.tv_accept, &now);
-	stream_process_counters(s);
+	if (!(s->flags & SF_IGNORE))
+		stream_process_counters(s);
 
 	if (s->txn && s->txn->status) {
 		int n;
@@ -2394,12 +2411,12 @@ struct task *process_stream(struct task *t)
 			n = 0;
 
 		if (sess->fe->mode == PR_MODE_HTTP) {
-			sess->fe->fe_counters.p.http.rsp[n]++;
+			_HA_ATOMIC_ADD(&sess->fe->fe_counters.p.http.rsp[n], 1);
 		}
 		if ((s->flags & SF_BE_ASSIGNED) &&
 		    (s->be->mode == PR_MODE_HTTP)) {
-			s->be->be_counters.p.http.rsp[n]++;
-			s->be->be_counters.p.http.cum_req++;
+			_HA_ATOMIC_ADD(&s->be->be_counters.p.http.rsp[n], 1);
+			_HA_ATOMIC_ADD(&s->be->be_counters.p.http.cum_req, 1);
 		}
 	}
 
@@ -2407,6 +2424,8 @@ struct task *process_stream(struct task *t)
 	if (!LIST_ISEMPTY(&sess->fe->logformat) && s->logs.logwait &&
 	    !(s->flags & SF_MONITOR) &&
 	    (!(sess->fe->options & PR_O_NULLNOLOG) || req->total)) {
+		/* we may need to know the position in the queue */
+		pendconn_free(s);
 		s->do_log(s);
 	}
 
@@ -2415,8 +2434,7 @@ struct task *process_stream(struct task *t)
 
 	/* the task MUST not be in the run queue anymore */
 	stream_free(s);
-	task_delete(t);
-	task_free(t);
+	task_destroy(t);
 	return NULL;
 }
 
@@ -2429,6 +2447,7 @@ void stream_update_time_stats(struct stream *s)
 	int t_data;
 	int t_close;
 	struct server *srv;
+	unsigned int samples_window;
 
 	t_request = 0;
 	t_queue   = s->logs.t_queue;
@@ -2451,15 +2470,27 @@ void stream_update_time_stats(struct stream *s)
 
 	srv = objt_server(s->target);
 	if (srv) {
-		swrate_add(&srv->counters.q_time, TIME_STATS_SAMPLES, t_queue);
-		swrate_add(&srv->counters.c_time, TIME_STATS_SAMPLES, t_connect);
-		swrate_add(&srv->counters.d_time, TIME_STATS_SAMPLES, t_data);
-		swrate_add(&srv->counters.t_time, TIME_STATS_SAMPLES, t_close);
+		samples_window = (((s->be->mode == PR_MODE_HTTP) ?
+			srv->counters.p.http.cum_req : srv->counters.cum_lbconn) > TIME_STATS_SAMPLES) ? TIME_STATS_SAMPLES : 0;
+		swrate_add_dynamic(&srv->counters.q_time, samples_window, t_queue);
+		swrate_add_dynamic(&srv->counters.c_time, samples_window, t_connect);
+		swrate_add_dynamic(&srv->counters.d_time, samples_window, t_data);
+		swrate_add_dynamic(&srv->counters.t_time, samples_window, t_close);
+		HA_ATOMIC_UPDATE_MAX(&srv->counters.qtime_max, t_queue);
+		HA_ATOMIC_UPDATE_MAX(&srv->counters.ctime_max, t_connect);
+		HA_ATOMIC_UPDATE_MAX(&srv->counters.dtime_max, t_data);
+		HA_ATOMIC_UPDATE_MAX(&srv->counters.ttime_max, t_close);
 	}
-	swrate_add(&s->be->be_counters.q_time, TIME_STATS_SAMPLES, t_queue);
-	swrate_add(&s->be->be_counters.c_time, TIME_STATS_SAMPLES, t_connect);
-	swrate_add(&s->be->be_counters.d_time, TIME_STATS_SAMPLES, t_data);
-	swrate_add(&s->be->be_counters.t_time, TIME_STATS_SAMPLES, t_close);
+	samples_window = (((s->be->mode == PR_MODE_HTTP) ?
+		s->be->be_counters.p.http.cum_req : s->be->be_counters.cum_lbconn) > TIME_STATS_SAMPLES) ? TIME_STATS_SAMPLES : 0;
+	swrate_add_dynamic(&s->be->be_counters.q_time, samples_window, t_queue);
+	swrate_add_dynamic(&s->be->be_counters.c_time, samples_window, t_connect);
+	swrate_add_dynamic(&s->be->be_counters.d_time, samples_window, t_data);
+	swrate_add_dynamic(&s->be->be_counters.t_time, samples_window, t_close);
+	HA_ATOMIC_UPDATE_MAX(&s->be->be_counters.qtime_max, t_queue);
+	HA_ATOMIC_UPDATE_MAX(&s->be->be_counters.ctime_max, t_connect);
+	HA_ATOMIC_UPDATE_MAX(&s->be->be_counters.dtime_max, t_data);
+	HA_ATOMIC_UPDATE_MAX(&s->be->be_counters.ttime_max, t_close);
 }
 
 /*
@@ -2475,18 +2506,26 @@ void sess_change_server(struct stream *sess, struct server *newsrv)
 		return;
 
 	if (sess->srv_conn) {
-		sess->srv_conn->served--;
-		sess->srv_conn->proxy->served--;
-		if (sess->srv_conn->proxy->lbprm.server_drop_conn)
+		_HA_ATOMIC_SUB(&sess->srv_conn->served, 1);
+		_HA_ATOMIC_SUB(&sess->srv_conn->proxy->served, 1);
+		__ha_barrier_atomic_store();
+		if (sess->srv_conn->proxy->lbprm.server_drop_conn) {
+			HA_SPIN_LOCK(SERVER_LOCK, &sess->srv_conn->lock);
 			sess->srv_conn->proxy->lbprm.server_drop_conn(sess->srv_conn);
+			HA_SPIN_UNLOCK(SERVER_LOCK, &sess->srv_conn->lock);
+		}
 		stream_del_srv_conn(sess);
 	}
 
 	if (newsrv) {
-		newsrv->served++;
-		newsrv->proxy->served++;
-		if (newsrv->proxy->lbprm.server_take_conn)
+		_HA_ATOMIC_ADD(&newsrv->served, 1);
+		_HA_ATOMIC_ADD(&newsrv->proxy->served, 1);
+		__ha_barrier_atomic_store();
+		if (newsrv->proxy->lbprm.server_take_conn) {
+			HA_SPIN_LOCK(SERVER_LOCK, &newsrv->lock);
 			newsrv->proxy->lbprm.server_take_conn(newsrv);
+			HA_SPIN_UNLOCK(SERVER_LOCK, &newsrv->lock);
+		}
 		stream_add_srv_conn(sess, newsrv);
 	}
 }
@@ -2554,6 +2593,147 @@ void stream_shutdown(struct stream *stream, int why)
 	task_wakeup(stream->task, TASK_WOKEN_OTHER);
 }
 
+/* Appends a dump of the state of stream <s> into buffer <buf> which must have
+ * preliminary be prepared by its caller, with each line prepended by prefix
+ * <pfx>, and each line terminated by character <eol>.
+ */
+void stream_dump(struct buffer *buf, const struct stream *s, const char *pfx, char eol)
+{
+	const struct conn_stream *csf, *csb;
+	const struct connection  *cof, *cob;
+	const struct appctx      *acf, *acb;
+	const struct server      *srv;
+	const char *src = "unknown";
+	const char *dst = "unknown";
+	char pn[INET6_ADDRSTRLEN];
+	const struct channel *req, *res;
+	const struct stream_interface *si_f, *si_b;
+
+	if (!s) {
+		chunk_appendf(buf, "%sstrm=%p%c", pfx, s, eol);
+		return;
+	}
+
+	if (s->obj_type != OBJ_TYPE_STREAM) {
+		chunk_appendf(buf, "%sstrm=%p [invalid type=%d(%s)]%c",
+		              pfx, s, s->obj_type, obj_type_name(&s->obj_type), eol);
+		return;
+	}
+
+	si_f = &s->si[0];
+	si_b = &s->si[1];
+	req = &s->req;
+	res = &s->res;
+
+	csf = objt_cs(si_f->end);
+	cof = cs_conn(csf);
+	acf = objt_appctx(si_f->end);
+	if (cof && cof->src && addr_to_str(cof->src, pn, sizeof(pn)) >= 0)
+		src = pn;
+	else if (acf)
+		src = acf->applet->name;
+
+	csb = objt_cs(si_b->end);
+	cob = cs_conn(csb);
+	acb = objt_appctx(si_b->end);
+	srv = objt_server(s->target);
+	if (srv)
+		dst = srv->id;
+	else if (acb)
+		dst = acb->applet->name;
+
+	chunk_appendf(buf,
+	              "%sstrm=%p src=%s fe=%s be=%s dst=%s%c"
+	              "%srqf=%x rqa=%x rpf=%x rpa=%x sif=%s,%x sib=%s,%x%c"
+	              "%saf=%p,%u csf=%p,%x%c"
+	              "%sab=%p,%u csb=%p,%x%c"
+	              "%scof=%p,%x:%s(%p)/%s(%p)/%s(%d)%c"
+	              "%scob=%p,%x:%s(%p)/%s(%p)/%s(%d)%c"
+	              "",
+	              pfx, s, src, s->sess->fe->id, s->be->id, dst, eol,
+	              pfx, req->flags, req->analysers, res->flags, res->analysers,
+	                   si_state_str(si_f->state), si_f->flags,
+	                   si_state_str(si_b->state), si_b->flags, eol,
+	              pfx, acf, acf ? acf->st0   : 0, csf, csf ? csf->flags : 0, eol,
+	              pfx, acb, acb ? acb->st0   : 0, csb, csb ? csb->flags : 0, eol,
+	              pfx, cof, cof ? cof->flags : 0, conn_get_mux_name(cof), cof?cof->ctx:0, conn_get_xprt_name(cof),
+	                   cof ? cof->xprt_ctx : 0, conn_get_ctrl_name(cof), cof ? cof->handle.fd : 0, eol,
+	              pfx, cob, cob ? cob->flags : 0, conn_get_mux_name(cob), cob?cob->ctx:0, conn_get_xprt_name(cob),
+	                   cob ? cob->xprt_ctx : 0, conn_get_ctrl_name(cob), cob ? cob->handle.fd : 0, eol);
+}
+
+/* dumps an error message for type <type> at ptr <ptr> related to stream <s>,
+ * having reached loop rate <rate>, then aborts hoping to retrieve a core.
+ */
+void stream_dump_and_crash(enum obj_type *obj, int rate)
+{
+	const struct stream *s;
+	char *msg = NULL;
+	const void *ptr;
+
+	ptr = s = objt_stream(obj);
+	if (!s) {
+		const struct appctx *appctx = objt_appctx(obj);
+		if (!appctx)
+			return;
+		ptr = appctx;
+		s = si_strm(appctx->owner);
+		if (!s)
+			return;
+	}
+
+	chunk_reset(&trash);
+	stream_dump(&trash, s, "", ' ');
+
+	chunk_appendf(&trash, "filters={");
+	if (HAS_FILTERS(s)) {
+		struct filter *filter;
+
+		list_for_each_entry(filter, &s->strm_flt.filters, list) {
+			if (filter->list.p != &s->strm_flt.filters)
+				chunk_appendf(&trash, ", ");
+			chunk_appendf(&trash, "%p=\"%s\"", filter, FLT_ID(filter));
+		}
+	}
+	chunk_appendf(&trash, "}");
+
+	memprintf(&msg,
+	          "A bogus %s [%p] is spinning at %d calls per second and refuses to die, "
+	          "aborting now! Please report this error to developers "
+	          "[%s]\n",
+	          obj_type_name(obj), ptr, rate, trash.area);
+
+	ha_alert("%s", msg);
+	send_log(NULL, LOG_EMERG, "%s", msg);
+	abort();
+}
+
+/* Generates a unique ID based on the given <format>, stores it in the given <strm> and
+ * returns the unique ID.
+
+ * If this function fails to allocate memory IST_NULL is returned.
+ *
+ * If an ID is already stored within the stream nothing happens existing unique ID is
+ * returned.
+ */
+struct ist stream_generate_unique_id(struct stream *strm, struct list *format)
+{
+	if (isttest(strm->unique_id)) {
+		return strm->unique_id;
+	}
+	else {
+		char *unique_id;
+		int length;
+		if ((unique_id = pool_alloc(pool_head_uniqueid)) == NULL)
+			return IST_NULL;
+
+		length = build_logline(strm, unique_id, UNIQUEID_LEN, format);
+		strm->unique_id = ist2(unique_id, length);
+
+		return strm->unique_id;
+	}
+}
+
 /************************************************************************/
 /*           All supported ACL keywords must be declared here.          */
 /************************************************************************/
@@ -2596,6 +2776,30 @@ void service_keywords_register(struct action_kw_list *kw_list)
 	LIST_ADDQ(&service_keywords, &kw_list->list);
 }
 
+struct action_kw *service_find(const char *kw)
+{
+	return action_lookup(&service_keywords, kw);
+}
+
+/* Lists the known services on <out> */
+void list_services(FILE *out)
+{
+	struct action_kw_list *kw_list;
+	int found = 0;
+	int i;
+
+	fprintf(out, "Available services :");
+	list_for_each_entry(kw_list, &service_keywords, list) {
+		for (i = 0; kw_list->kw[i].kw != NULL; i++) {
+			if (!found)
+				fputc('\n', out);
+			found = 1;
+			fprintf(out, "\t%s\n", kw_list->kw[i].kw);
+		}
+	}
+	if (!found)
+		fprintf(out, " none\n");
+}
 
 /* This function dumps a complete stream state onto the stream interface's
  * read buffer. The stream has to be set in strm. It returns 0 if the output
@@ -2608,6 +2812,7 @@ static int stats_dump_full_strm_to_buffer(struct stream_interface *si, struct st
 	struct tm tm;
 	extern const char *monthname[12];
 	char pn[INET6_ADDRSTRLEN];
+	struct conn_stream *cs;
 	struct connection *conn;
 	struct appctx *tmpctx;
 
@@ -2616,13 +2821,9 @@ static int stats_dump_full_strm_to_buffer(struct stream_interface *si, struct st
 	if (appctx->ctx.sess.section > 0 && appctx->ctx.sess.uid != strm->uniq_id) {
 		/* stream changed, no need to go any further */
 		chunk_appendf(&trash, "  *** session terminated while we were watching it ***\n");
-		if (bi_putchk(si_ic(si), &trash) == -1) {
-			si_applet_cant_put(si);
-			return 0;
-		}
-		appctx->ctx.sess.uid = 0;
-		appctx->ctx.sess.section = 0;
-		return 1;
+		if (ci_putchk(si_ic(si), &trash) == -1)
+			goto full;
+		goto done;
 	}
 
 	switch (appctx->ctx.sess.section) {
@@ -2639,14 +2840,14 @@ static int stats_dump_full_strm_to_buffer(struct stream_interface *si, struct st
 			     tm.tm_mday, monthname[tm.tm_mon], tm.tm_year+1900,
 			     tm.tm_hour, tm.tm_min, tm.tm_sec, (int)(strm->logs.accept_date.tv_usec),
 			     strm->uniq_id,
-			     strm_li(strm) ? strm_li(strm)->proto->name : "?");
+			     strm_li(strm) ? strm_li(strm)->rx.proto->name : "?");
 
 		conn = objt_conn(strm_orig(strm));
-		switch (conn ? addr_to_str(&conn->addr.from, pn, sizeof(pn)) : AF_UNSPEC) {
+		switch (conn && conn_get_src(conn) ? addr_to_str(conn->src, pn, sizeof(pn)) : AF_UNSPEC) {
 		case AF_INET:
 		case AF_INET6:
 			chunk_appendf(&trash, " source=%s:%d\n",
-			              pn, get_host_port(&conn->addr.from));
+			              pn, get_host_port(conn->src));
 			break;
 		case AF_UNIX:
 			chunk_appendf(&trash, " source=unix:%d\n", strm_li(strm)->luid);
@@ -2658,8 +2859,9 @@ static int stats_dump_full_strm_to_buffer(struct stream_interface *si, struct st
 		}
 
 		chunk_appendf(&trash,
-			     "  flags=0x%x, conn_retries=%d, srv_conn=%p, pend_pos=%p\n",
-			     strm->flags, strm->si[1].conn_retries, strm->srv_conn, strm->pend_pos);
+			     "  flags=0x%x, conn_retries=%d, srv_conn=%p, pend_pos=%p waiting=%d\n",
+			     strm->flags, strm->si[1].conn_retries, strm->srv_conn, strm->pend_pos,
+			     MT_LIST_ADDED(&strm->buffer_wait.list));
 
 		chunk_appendf(&trash,
 			     "  frontend=%s (id=%u mode=%s), listener=%s (id=%u)",
@@ -2667,14 +2869,11 @@ static int stats_dump_full_strm_to_buffer(struct stream_interface *si, struct st
 			     strm_li(strm) ? strm_li(strm)->name ? strm_li(strm)->name : "?" : "?",
 			     strm_li(strm) ? strm_li(strm)->luid : 0);
 
-		if (conn)
-			conn_get_to_addr(conn);
-
-		switch (conn ? addr_to_str(&conn->addr.to, pn, sizeof(pn)) : AF_UNSPEC) {
+		switch (conn && conn_get_dst(conn) ? addr_to_str(conn->dst, pn, sizeof(pn)) : AF_UNSPEC) {
 		case AF_INET:
 		case AF_INET6:
 			chunk_appendf(&trash, " addr=%s:%d\n",
-				     pn, get_host_port(&conn->addr.to));
+				     pn, get_host_port(conn->dst));
 			break;
 		case AF_UNIX:
 			chunk_appendf(&trash, " addr=unix:%d\n", strm_li(strm)->luid);
@@ -2693,15 +2892,14 @@ static int stats_dump_full_strm_to_buffer(struct stream_interface *si, struct st
 		else
 			chunk_appendf(&trash, "  backend=<NONE> (id=-1 mode=-)");
 
-		conn = objt_conn(strm->si[1].end);
-		if (conn)
-			conn_get_from_addr(conn);
+		cs = objt_cs(strm->si[1].end);
+		conn = cs_conn(cs);
 
-		switch (conn ? addr_to_str(&conn->addr.from, pn, sizeof(pn)) : AF_UNSPEC) {
+		switch (conn && conn_get_src(conn) ? addr_to_str(conn->src, pn, sizeof(pn)) : AF_UNSPEC) {
 		case AF_INET:
 		case AF_INET6:
 			chunk_appendf(&trash, " addr=%s:%d\n",
-				     pn, get_host_port(&conn->addr.from));
+				     pn, get_host_port(conn->src));
 			break;
 		case AF_UNIX:
 			chunk_appendf(&trash, " addr=unix\n");
@@ -2720,14 +2918,11 @@ static int stats_dump_full_strm_to_buffer(struct stream_interface *si, struct st
 		else
 			chunk_appendf(&trash, "  server=<NONE> (id=-1)");
 
-		if (conn)
-			conn_get_to_addr(conn);
-
-		switch (conn ? addr_to_str(&conn->addr.to, pn, sizeof(pn)) : AF_UNSPEC) {
+		switch (conn && conn_get_dst(conn) ? addr_to_str(conn->dst, pn, sizeof(pn)) : AF_UNSPEC) {
 		case AF_INET:
 		case AF_INET6:
 			chunk_appendf(&trash, " addr=%s:%d\n",
-				     pn, get_host_port(&conn->addr.to));
+				     pn, get_host_port(conn->dst));
 			break;
 		case AF_UNIX:
 			chunk_appendf(&trash, " addr=unix\n");
@@ -2739,14 +2934,15 @@ static int stats_dump_full_strm_to_buffer(struct stream_interface *si, struct st
 		}
 
 		chunk_appendf(&trash,
-			     "  task=%p (state=0x%02x nice=%d calls=%d exp=%s%s",
+			     "  task=%p (state=0x%02x nice=%d calls=%u rate=%u exp=%s tmask=0x%lx%s",
 			     strm->task,
 			     strm->task->state,
-			     strm->task->nice, strm->task->calls,
+			     strm->task->nice, strm->task->calls, read_freq_ctr(&strm->call_rate),
 			     strm->task->expire ?
 			             tick_is_expired(strm->task->expire, now_ms) ? "<PAST>" :
 			                     human_time(TICKS_TO_MS(strm->task->expire - now_ms),
 			                     TICKS_TO_MS(1000)) : "<NEVER>",
+			     strm->task->thread_mask,
 			     task_in_rq(strm->task) ? ", running" : "");
 
 		chunk_appendf(&trash,
@@ -2755,12 +2951,13 @@ static int stats_dump_full_strm_to_buffer(struct stream_interface *si, struct st
 
 		if (strm->txn)
 			chunk_appendf(&trash,
-			     "  txn=%p flags=0x%x meth=%d status=%d req.st=%s rsp.st=%s waiting=%d\n",
+			      "  txn=%p flags=0x%x meth=%d status=%d req.st=%s rsp.st=%s req.f=0x%02x rsp.f=0x%02x\n",
 			      strm->txn, strm->txn->flags, strm->txn->meth, strm->txn->status,
-			      http_msg_state_str(strm->txn->req.msg_state), http_msg_state_str(strm->txn->rsp.msg_state), !LIST_ISEMPTY(&strm->buffer_wait.list));
+			      h1_msg_state_str(strm->txn->req.msg_state), h1_msg_state_str(strm->txn->rsp.msg_state),
+			      strm->txn->req.flags, strm->txn->rsp.flags);
 
 		chunk_appendf(&trash,
-			     "  si[0]=%p (state=%s flags=0x%02x endp0=%s:%p exp=%s, et=0x%03x)\n",
+			     "  si[0]=%p (state=%s flags=0x%02x endp0=%s:%p exp=%s et=0x%03x sub=%d)\n",
 			     &strm->si[0],
 			     si_state_str(strm->si[0].state),
 			     strm->si[0].flags,
@@ -2770,10 +2967,10 @@ static int stats_dump_full_strm_to_buffer(struct stream_interface *si, struct st
 			             tick_is_expired(strm->si[0].exp, now_ms) ? "<PAST>" :
 			                     human_time(TICKS_TO_MS(strm->si[0].exp - now_ms),
 			                     TICKS_TO_MS(1000)) : "<NEVER>",
-			     strm->si[0].err_type);
+			      strm->si[0].err_type, strm->si[0].wait_event.events);
 
 		chunk_appendf(&trash,
-			     "  si[1]=%p (state=%s flags=0x%02x endp1=%s:%p exp=%s, et=0x%03x)\n",
+			     "  si[1]=%p (state=%s flags=0x%02x endp1=%s:%p exp=%s et=0x%03x sub=%d)\n",
 			     &strm->si[1],
 			     si_state_str(strm->si[1].state),
 			     strm->si[1].flags,
@@ -2783,62 +2980,78 @@ static int stats_dump_full_strm_to_buffer(struct stream_interface *si, struct st
 			             tick_is_expired(strm->si[1].exp, now_ms) ? "<PAST>" :
 			                     human_time(TICKS_TO_MS(strm->si[1].exp - now_ms),
 			                     TICKS_TO_MS(1000)) : "<NEVER>",
-			     strm->si[1].err_type);
+			     strm->si[1].err_type, strm->si[1].wait_event.events);
 
-		if ((conn = objt_conn(strm->si[0].end)) != NULL) {
+		if ((cs = objt_cs(strm->si[0].end)) != NULL) {
+			conn = cs->conn;
+
 			chunk_appendf(&trash,
-			              "  co0=%p ctrl=%s xprt=%s data=%s target=%s:%p\n",
+			              "  co0=%p ctrl=%s xprt=%s mux=%s data=%s target=%s:%p\n",
 				      conn,
 				      conn_get_ctrl_name(conn),
 				      conn_get_xprt_name(conn),
-				      conn_get_data_name(conn),
+				      conn_get_mux_name(conn),
+				      cs_get_data_name(cs),
 			              obj_type_name(conn->target),
 			              obj_base_ptr(conn->target));
 
 			chunk_appendf(&trash,
-			              "      flags=0x%08x fd=%d fd.state=%02x fd.cache=%d updt=%d\n",
+			              "      flags=0x%08x fd=%d fd.state=%02x updt=%d fd.tmask=0x%lx\n",
 			              conn->flags,
-			              conn->t.sock.fd,
-			              conn->t.sock.fd >= 0 ? fdtab[conn->t.sock.fd].state : 0,
-			              conn->t.sock.fd >= 0 ? fdtab[conn->t.sock.fd].cache : 0,
-			              conn->t.sock.fd >= 0 ? fdtab[conn->t.sock.fd].updated : 0);
+			              conn->handle.fd,
+			              conn->handle.fd >= 0 ? fdtab[conn->handle.fd].state : 0,
+			              conn->handle.fd >= 0 ? !!(fdtab[conn->handle.fd].update_mask & tid_bit) : 0,
+				      conn->handle.fd >= 0 ? fdtab[conn->handle.fd].thread_mask: 0);
+
+			chunk_appendf(&trash, "      cs=%p csf=0x%08x ctx=%p\n", cs, cs->flags, cs->ctx);
 		}
 		else if ((tmpctx = objt_appctx(strm->si[0].end)) != NULL) {
 			chunk_appendf(&trash,
-			              "  app0=%p st0=%d st1=%d st2=%d applet=%s\n",
+			              "  app0=%p st0=%d st1=%d st2=%d applet=%s tmask=0x%lx nice=%d calls=%u rate=%u cpu=%llu lat=%llu\n",
 				      tmpctx,
 				      tmpctx->st0,
 				      tmpctx->st1,
 				      tmpctx->st2,
-			              tmpctx->applet->name);
+			              tmpctx->applet->name,
+			              tmpctx->thread_mask,
+			              tmpctx->t->nice, tmpctx->t->calls, read_freq_ctr(&tmpctx->call_rate),
+			              (unsigned long long)tmpctx->t->cpu_time, (unsigned long long)tmpctx->t->lat_time);
 		}
 
-		if ((conn = objt_conn(strm->si[1].end)) != NULL) {
+		if ((cs = objt_cs(strm->si[1].end)) != NULL) {
+			conn = cs->conn;
+
 			chunk_appendf(&trash,
-			              "  co1=%p ctrl=%s xprt=%s data=%s target=%s:%p\n",
+			              "  co1=%p ctrl=%s xprt=%s mux=%s data=%s target=%s:%p\n",
 				      conn,
 				      conn_get_ctrl_name(conn),
 				      conn_get_xprt_name(conn),
-				      conn_get_data_name(conn),
+				      conn_get_mux_name(conn),
+				      cs_get_data_name(cs),
 			              obj_type_name(conn->target),
 			              obj_base_ptr(conn->target));
 
 			chunk_appendf(&trash,
-			              "      flags=0x%08x fd=%d fd.state=%02x fd.cache=%d updt=%d\n",
+			              "      flags=0x%08x fd=%d fd.state=%02x updt=%d fd.tmask=0x%lx\n",
 			              conn->flags,
-			              conn->t.sock.fd,
-			              conn->t.sock.fd >= 0 ? fdtab[conn->t.sock.fd].state : 0,
-			              conn->t.sock.fd >= 0 ? fdtab[conn->t.sock.fd].cache : 0,
-			              conn->t.sock.fd >= 0 ? fdtab[conn->t.sock.fd].updated : 0);
+			              conn->handle.fd,
+			              conn->handle.fd >= 0 ? fdtab[conn->handle.fd].state : 0,
+			              conn->handle.fd >= 0 ? !!(fdtab[conn->handle.fd].update_mask & tid_bit) : 0,
+				      conn->handle.fd >= 0 ? fdtab[conn->handle.fd].thread_mask: 0);
+
+			chunk_appendf(&trash, "      cs=%p csf=0x%08x ctx=%p\n", cs, cs->flags, cs->ctx);
 		}
 		else if ((tmpctx = objt_appctx(strm->si[1].end)) != NULL) {
 			chunk_appendf(&trash,
-			              "  app1=%p st0=%d st1=%d st2=%d applet=%s\n",
+			              "  app1=%p st0=%d st1=%d st2=%d applet=%s tmask=0x%lx nice=%d calls=%u rate=%u cpu=%llu lat=%llu\n",
 				      tmpctx,
 				      tmpctx->st0,
 				      tmpctx->st1,
 				      tmpctx->st2,
-			              tmpctx->applet->name);
+			              tmpctx->applet->name,
+			              tmpctx->thread_mask,
+			              tmpctx->t->nice, tmpctx->t->calls, read_freq_ctr(&tmpctx->call_rate),
+			              (unsigned long long)tmpctx->t->cpu_time, (unsigned long long)tmpctx->t->lat_time);
 		}
 
 		chunk_appendf(&trash,
@@ -2860,15 +3073,24 @@ static int stats_dump_full_strm_to_buffer(struct stream_interface *si, struct st
 
 		chunk_appendf(&trash,
 			     " wex=%s\n"
-			     "      buf=%p data=%p o=%d p=%d req.next=%d i=%d size=%d\n",
+			     "      buf=%p data=%p o=%u p=%u i=%u size=%u\n",
 			     strm->req.wex ?
 			     human_time(TICKS_TO_MS(strm->req.wex - now_ms),
 					TICKS_TO_MS(1000)) : "<NEVER>",
-			     strm->req.buf,
-			     strm->req.buf->data, strm->req.buf->o,
-			     (int)(strm->req.buf->p - strm->req.buf->data),
-			     strm->txn ? strm->txn->req.next : 0, strm->req.buf->i,
-			     strm->req.buf->size);
+			     &strm->req.buf,
+		             b_orig(&strm->req.buf), (unsigned int)co_data(&strm->req),
+			     (unsigned int)ci_head_ofs(&strm->req), (unsigned int)ci_data(&strm->req),
+			     (unsigned int)strm->req.buf.size);
+
+		if (IS_HTX_STRM(strm)) {
+			struct htx *htx = htxbuf(&strm->req.buf);
+
+			chunk_appendf(&trash,
+				      "      htx=%p flags=0x%x size=%u data=%u used=%u wrap=%s extra=%llu\n",
+				      htx, htx->flags, htx->size, htx->data, htx_nbblks(htx),
+				      (htx->tail >= htx->head) ? "NO" : "YES",
+				      (unsigned long long)htx->extra);
+		}
 
 		chunk_appendf(&trash,
 			     "  res=%p (f=0x%06x an=0x%x pipe=%d tofwd=%d total=%lld)\n"
@@ -2889,31 +3111,41 @@ static int stats_dump_full_strm_to_buffer(struct stream_interface *si, struct st
 
 		chunk_appendf(&trash,
 			     " wex=%s\n"
-			     "      buf=%p data=%p o=%d p=%d rsp.next=%d i=%d size=%d\n",
+			     "      buf=%p data=%p o=%u p=%u i=%u size=%u\n",
 			     strm->res.wex ?
 			     human_time(TICKS_TO_MS(strm->res.wex - now_ms),
 					TICKS_TO_MS(1000)) : "<NEVER>",
-			     strm->res.buf,
-			     strm->res.buf->data, strm->res.buf->o,
-			     (int)(strm->res.buf->p - strm->res.buf->data),
-			     strm->txn ? strm->txn->rsp.next : 0, strm->res.buf->i,
-			     strm->res.buf->size);
+			     &strm->res.buf,
+		             b_orig(&strm->res.buf), (unsigned int)co_data(&strm->res),
+		             (unsigned int)ci_head_ofs(&strm->res), (unsigned int)ci_data(&strm->res),
+			     (unsigned int)strm->res.buf.size);
 
-		if (bi_putchk(si_ic(si), &trash) == -1) {
-			si_applet_cant_put(si);
-			return 0;
+		if (IS_HTX_STRM(strm)) {
+			struct htx *htx = htxbuf(&strm->res.buf);
+
+			chunk_appendf(&trash,
+				      "      htx=%p flags=0x%x size=%u data=%u used=%u wrap=%s extra=%llu\n",
+				      htx, htx->flags, htx->size, htx->data, htx_nbblks(htx),
+				      (htx->tail >= htx->head) ? "NO" : "YES",
+				      (unsigned long long)htx->extra);
 		}
+
+		if (ci_putchk(si_ic(si), &trash) == -1)
+			goto full;
 
 		/* use other states to dump the contents */
 	}
 	/* end of dump */
+ done:
 	appctx->ctx.sess.uid = 0;
 	appctx->ctx.sess.section = 0;
 	return 1;
+ full:
+	return 0;
 }
 
 
-static int cli_parse_show_sess(char **args, struct appctx *appctx, void *private)
+static int cli_parse_show_sess(char **args, char *payload, struct appctx *appctx, void *private)
 {
 	if (!cli_has_level(appctx, ACCESS_LVL_OPER))
 		return 1;
@@ -2927,18 +3159,29 @@ static int cli_parse_show_sess(char **args, struct appctx *appctx, void *private
 	appctx->ctx.sess.section = 0; /* start with stream status */
 	appctx->ctx.sess.pos = 0;
 
+	/* we need to put an end marker into the streams list. We're just moving
+	 * ourselves there, so that once we found ourselves we know we've reached
+	 * the end. Without this we can run forever if new streams arrive faster
+	 * than we can dump them.
+	 */
+	HA_SPIN_LOCK(STRMS_LOCK, &streams_lock);
+	LIST_DEL(&si_strm(appctx->owner)->list);
+	LIST_ADDQ(&streams, &si_strm(appctx->owner)->list);
+	HA_SPIN_UNLOCK(STRMS_LOCK, &streams_lock);
 	return 0;
 }
 
 /* This function dumps all streams' states onto the stream interface's
  * read buffer. It returns 0 if the output buffer is full and it needs
- * to be called again, otherwise non-zero. It is designed to be called
- * from stats_dump_sess_to_buffer() below.
+ * to be called again, otherwise non-zero. It proceeds in an isolated
+ * thread so there is no thread safety issue here.
  */
 static int cli_io_handler_dump_sess(struct appctx *appctx)
 {
 	struct stream_interface *si = appctx->owner;
 	struct connection *conn;
+
+	thread_isolate();
 
 	if (unlikely(si_ic(si)->flags & (CF_WRITE_ERROR|CF_SHUTW))) {
 		/* If we're forced to shut down, we might have to remove our
@@ -2950,7 +3193,7 @@ static int cli_io_handler_dump_sess(struct appctx *appctx)
 				LIST_INIT(&appctx->ctx.sess.bref.users);
 			}
 		}
-		return 1;
+		goto done;
 	}
 
 	chunk_reset(&trash);
@@ -2976,8 +3219,8 @@ static int cli_io_handler_dump_sess(struct appctx *appctx)
 			LIST_INIT(&appctx->ctx.sess.bref.users);
 		}
 
-		/* and start from where we stopped */
-		while (appctx->ctx.sess.bref.ref != &streams) {
+		/* and start from where we stopped, never going further than ourselves */
+		while (appctx->ctx.sess.bref.ref != si_strm(appctx->owner)->list.n) {
 			char pn[INET6_ADDRSTRLEN];
 			struct stream *curr_strm;
 
@@ -2990,7 +3233,7 @@ static int cli_io_handler_dump_sess(struct appctx *appctx)
 				LIST_ADDQ(&curr_strm->back_refs, &appctx->ctx.sess.bref.users);
 				/* call the proper dump() function and return if we're missing space */
 				if (!stats_dump_full_strm_to_buffer(si, curr_strm))
-					return 0;
+					goto full;
 
 				/* stream dump complete */
 				LIST_DEL(&appctx->ctx.sess.bref.users);
@@ -3006,16 +3249,16 @@ static int cli_io_handler_dump_sess(struct appctx *appctx)
 			chunk_appendf(&trash,
 				     "%p: proto=%s",
 				     curr_strm,
-				     strm_li(curr_strm) ? strm_li(curr_strm)->proto->name : "?");
+				     strm_li(curr_strm) ? strm_li(curr_strm)->rx.proto->name : "?");
 
 			conn = objt_conn(strm_orig(curr_strm));
-			switch (conn ? addr_to_str(&conn->addr.from, pn, sizeof(pn)) : AF_UNSPEC) {
+			switch (conn && conn_get_src(conn) ? addr_to_str(conn->src, pn, sizeof(pn)) : AF_UNSPEC) {
 			case AF_INET:
 			case AF_INET6:
 				chunk_appendf(&trash,
 					     " src=%s:%d fe=%s be=%s srv=%s",
 					     pn,
-					     get_host_port(&conn->addr.from),
+					     get_host_port(conn->src),
 					     strm_fe(curr_strm)->id,
 					     (curr_strm->be->cap & PR_CAP_BE) ? curr_strm->be->id : "<NONE>",
 					     objt_server(curr_strm->target) ? objt_server(curr_strm->target)->id : "<none>"
@@ -3033,15 +3276,16 @@ static int cli_io_handler_dump_sess(struct appctx *appctx)
 			}
 
 			chunk_appendf(&trash,
-				     " ts=%02x age=%s calls=%d",
+				     " ts=%02x age=%s calls=%u rate=%u cpu=%llu lat=%llu",
 				     curr_strm->task->state,
 				     human_time(now.tv_sec - curr_strm->logs.tv_accept.tv_sec, 1),
-				     curr_strm->task->calls);
+			             curr_strm->task->calls, read_freq_ctr(&curr_strm->call_rate),
+			             (unsigned long long)curr_strm->task->cpu_time, (unsigned long long)curr_strm->task->lat_time);
 
 			chunk_appendf(&trash,
-				     " rq[f=%06xh,i=%d,an=%02xh,rx=%s",
+				     " rq[f=%06xh,i=%u,an=%02xh,rx=%s",
 				     curr_strm->req.flags,
-				     curr_strm->req.buf->i,
+			             (unsigned int)ci_data(&curr_strm->req),
 				     curr_strm->req.analysers,
 				     curr_strm->req.rex ?
 				     human_time(TICKS_TO_MS(curr_strm->req.rex - now_ms),
@@ -3060,9 +3304,9 @@ static int cli_io_handler_dump_sess(struct appctx *appctx)
 						TICKS_TO_MS(1000)) : "");
 
 			chunk_appendf(&trash,
-				     " rp[f=%06xh,i=%d,an=%02xh,rx=%s",
+				     " rp[f=%06xh,i=%u,an=%02xh,rx=%s",
 				     curr_strm->res.flags,
-				     curr_strm->res.buf->i,
+			             (unsigned int)ci_data(&curr_strm->res),
 				     curr_strm->res.analysers,
 				     curr_strm->res.rex ?
 				     human_time(TICKS_TO_MS(curr_strm->res.rex - now_ms),
@@ -3080,22 +3324,22 @@ static int cli_io_handler_dump_sess(struct appctx *appctx)
 				     human_time(TICKS_TO_MS(curr_strm->res.analyse_exp - now_ms),
 						TICKS_TO_MS(1000)) : "");
 
-			conn = objt_conn(curr_strm->si[0].end);
+			conn = cs_conn(objt_cs(curr_strm->si[0].end));
 			chunk_appendf(&trash,
 				     " s0=[%d,%1xh,fd=%d,ex=%s]",
 				     curr_strm->si[0].state,
 				     curr_strm->si[0].flags,
-				     conn ? conn->t.sock.fd : -1,
+				     conn ? conn->handle.fd : -1,
 				     curr_strm->si[0].exp ?
 				     human_time(TICKS_TO_MS(curr_strm->si[0].exp - now_ms),
 						TICKS_TO_MS(1000)) : "");
 
-			conn = objt_conn(curr_strm->si[1].end);
+			conn = cs_conn(objt_cs(curr_strm->si[1].end));
 			chunk_appendf(&trash,
 				     " s1=[%d,%1xh,fd=%d,ex=%s]",
 				     curr_strm->si[1].state,
 				     curr_strm->si[1].flags,
-				     conn ? conn->t.sock.fd : -1,
+				     conn ? conn->handle.fd : -1,
 				     curr_strm->si[1].exp ?
 				     human_time(TICKS_TO_MS(curr_strm->si[1].exp - now_ms),
 						TICKS_TO_MS(1000)) : "");
@@ -3110,13 +3354,12 @@ static int cli_io_handler_dump_sess(struct appctx *appctx)
 
 			chunk_appendf(&trash, "\n");
 
-			if (bi_putchk(si_ic(si), &trash) == -1) {
+			if (ci_putchk(si_ic(si), &trash) == -1) {
 				/* let's try again later from this stream. We add ourselves into
 				 * this stream's users so that it can remove us upon termination.
 				 */
-				si_applet_cant_put(si);
 				LIST_ADDQ(&curr_strm->back_refs, &appctx->ctx.sess.bref.users);
-				return 0;
+				goto full;
 			}
 
 		next_sess:
@@ -3130,46 +3373,48 @@ static int cli_io_handler_dump_sess(struct appctx *appctx)
 			else
 				chunk_appendf(&trash, "Session not found.\n");
 
-			if (bi_putchk(si_ic(si), &trash) == -1) {
-				si_applet_cant_put(si);
-				return 0;
-			}
+			if (ci_putchk(si_ic(si), &trash) == -1)
+				goto full;
 
 			appctx->ctx.sess.target = NULL;
 			appctx->ctx.sess.uid = 0;
-			return 1;
+			goto done;
 		}
-
-		appctx->st2 = STAT_ST_FIN;
 		/* fall through */
 
 	default:
 		appctx->st2 = STAT_ST_FIN;
-		return 1;
+		goto done;
 	}
+ done:
+	thread_release();
+	return 1;
+ full:
+	thread_release();
+	si_rx_room_blk(si);
+	return 0;
 }
 
 static void cli_release_show_sess(struct appctx *appctx)
 {
 	if (appctx->st2 == STAT_ST_LIST) {
+		HA_SPIN_LOCK(STRMS_LOCK, &streams_lock);
 		if (!LIST_ISEMPTY(&appctx->ctx.sess.bref.users))
 			LIST_DEL(&appctx->ctx.sess.bref.users);
+		HA_SPIN_UNLOCK(STRMS_LOCK, &streams_lock);
 	}
 }
 
 /* Parses the "shutdown session" directive, it always returns 1 */
-static int cli_parse_shutdown_session(char **args, struct appctx *appctx, void *private)
+static int cli_parse_shutdown_session(char **args, char *payload, struct appctx *appctx, void *private)
 {
 	struct stream *strm, *ptr;
 
 	if (!cli_has_level(appctx, ACCESS_LVL_ADMIN))
 		return 1;
 
-	if (!*args[2]) {
-		appctx->ctx.cli.msg = "Session pointer expected (use 'show sess').\n";
-		appctx->st0 = CLI_ST_PRINT;
-		return 1;
-	}
+	if (!*args[2])
+		return cli_err(appctx, "Session pointer expected (use 'show sess').\n");
 
 	ptr = (void *)strtoul(args[2], NULL, 0);
 
@@ -3180,21 +3425,17 @@ static int cli_parse_shutdown_session(char **args, struct appctx *appctx, void *
 	}
 
 	/* do we have the stream ? */
-	if (strm != ptr) {
-		appctx->ctx.cli.msg = "No such session (use 'show sess').\n";
-		appctx->st0 = CLI_ST_PRINT;
-		return 1;
-	}
+	if (strm != ptr)
+		return cli_err(appctx, "No such session (use 'show sess').\n");
 
 	stream_shutdown(strm, SF_ERR_KILLED);
 	return 1;
 }
 
 /* Parses the "shutdown session server" directive, it always returns 1 */
-static int cli_parse_shutdown_sessions_server(char **args, struct appctx *appctx, void *private)
+static int cli_parse_shutdown_sessions_server(char **args, char *payload, struct appctx *appctx, void *private)
 {
 	struct server *sv;
-	struct stream *strm, *strm_bck;
 
 	if (!cli_has_level(appctx, ACCESS_LVL_ADMIN))
 		return 1;
@@ -3204,9 +3445,9 @@ static int cli_parse_shutdown_sessions_server(char **args, struct appctx *appctx
 		return 1;
 
 	/* kill all the stream that are on this server */
-	list_for_each_entry_safe(strm, strm_bck, &sv->actconns, by_srv)
-		if (strm->srv_conn == sv)
-			stream_shutdown(strm, SF_ERR_KILLED);
+	HA_SPIN_LOCK(SERVER_LOCK, &sv->lock);
+	srv_shutdown_streams(sv, SF_ERR_KILLED);
+	HA_SPIN_UNLOCK(SERVER_LOCK, &sv->lock);
 	return 1;
 }
 
@@ -3218,24 +3459,55 @@ static struct cli_kw_list cli_kws = {{ },{
 	{{},}
 }};
 
+INITCALL1(STG_REGISTER, cli_register_kw, &cli_kws);
+
 /* main configuration keyword registration. */
 static struct action_kw_list stream_tcp_keywords = { ILH, {
 	{ "use-service", stream_parse_use_service },
 	{ /* END */ }
 }};
 
+INITCALL1(STG_REGISTER, tcp_req_cont_keywords_register, &stream_tcp_keywords);
+
 static struct action_kw_list stream_http_keywords = { ILH, {
 	{ "use-service", stream_parse_use_service },
 	{ /* END */ }
 }};
 
-__attribute__((constructor))
-static void __stream_init(void)
+INITCALL1(STG_REGISTER, http_req_keywords_register, &stream_http_keywords);
+
+static int smp_fetch_cur_server_timeout(const struct arg *args, struct sample *smp, const char *km, void *private)
 {
-	tcp_req_cont_keywords_register(&stream_tcp_keywords);
-	http_req_keywords_register(&stream_http_keywords);
-	cli_register_kw(&cli_kws);
+	smp->flags = SMP_F_VOL_TXN;
+	smp->data.type = SMP_T_SINT;
+	if (!smp->strm)
+		return 0;
+
+	smp->data.u.sint = TICKS_TO_MS(smp->strm->res.rto);
+	return 1;
 }
+
+static int smp_fetch_cur_tunnel_timeout(const struct arg *args, struct sample *smp, const char *km, void *private)
+{
+	smp->flags = SMP_F_VOL_TXN;
+	smp->data.type = SMP_T_SINT;
+	if (!smp->strm)
+		return 0;
+
+	smp->data.u.sint = TICKS_TO_MS(smp->strm->tunnel_timeout);
+	return 1;
+}
+
+/* Note: must not be declared <const> as its list will be overwritten.
+ * Please take care of keeping this list alphabetically sorted.
+ */
+static struct sample_fetch_kw_list smp_kws = {ILH, {
+	{ "cur_server_timeout", smp_fetch_cur_server_timeout, 0, NULL, SMP_T_SINT, SMP_USE_BKEND, },
+	{ "cur_tunnel_timeout", smp_fetch_cur_tunnel_timeout, 0, NULL, SMP_T_SINT, SMP_USE_BKEND, },
+	{ NULL, NULL, 0, 0, 0 },
+}};
+
+INITCALL1(STG_REGISTER, sample_register_fetches, &smp_kws);
 
 /*
  * Local variables:

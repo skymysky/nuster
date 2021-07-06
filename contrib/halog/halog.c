@@ -20,10 +20,10 @@
 #include <ctype.h>
 #include <time.h>
 
-#include <eb32tree.h>
-#include <eb64tree.h>
-#include <ebistree.h>
-#include <ebsttree.h>
+#include <import/eb32tree.h>
+#include <import/eb64tree.h>
+#include <import/ebistree.h>
+#include <import/ebsttree.h>
 
 #define SOURCE_FIELD 5
 #define ACCEPT_FIELD 6
@@ -180,6 +180,9 @@ void help()
 	       " -v                      invert the input filtering condition\n"
 	       " -q                      don't report errors/warnings\n"
 	       " -m <lines>              limit output to the first <lines> lines\n"
+               " -s <skip_n_fields>      skip n fields from the beginning of a line (default %d)\n"
+               "                         you can also use -n to start from earlier then field %d\n"
+               "\n"
 	       "Output filters - only one may be used at a time\n"
 	       " -c    only report the number of lines that would have been printed\n"
 	       " -pct  output connect and response times percentiles\n"
@@ -187,12 +190,14 @@ void help()
 	       " -cc   output number of requests per cookie code (2 chars)\n"
 	       " -tc   output number of requests per termination code (2 chars)\n"
 	       " -srv  output statistics per server (time, requests, errors)\n"
+	       " -ic   output statistics per ip count (time, requests, errors)\n"
 	       " -u*   output statistics per URL (time, requests, errors)\n"
 	       "       Additional characters indicate the output sorting key :\n"
 	       "       -u : by URL, -uc : request count, -ue : error count\n"
 	       "       -ua : average response time, -ut : average total time\n"
 	       "       -uao, -uto: average times computed on valid ('OK') requests\n"
-	       "       -uba, -ubt: average bytes returned, total bytes returned\n"
+	       "       -uba, -ubt: average bytes returned, total bytes returned\n",
+               SOURCE_FIELD,SOURCE_FIELD
 	       );
 	exit(0);
 }
@@ -462,7 +467,7 @@ int convert_date(const char *field)
 {
 	unsigned int h, m, s, ms;
 	unsigned char c;
-	const char *b, *e;
+	const char *e;
 
 	h = m = s = ms = 0;
 	e = field;
@@ -477,7 +482,6 @@ int convert_date(const char *field)
 	}
 
 	/* hour + ':' */
-	b = e;
 	while (1) {
 		c = *(e++) - '0';
 		if (c > 9)
@@ -488,7 +492,6 @@ int convert_date(const char *field)
 		goto out_err;
 
 	/* minute + ':' */
-	b = e;
 	while (1) {
 		c = *(e++) - '0';
 		if (c > 9)
@@ -499,7 +502,6 @@ int convert_date(const char *field)
 		goto out_err;
 
 	/* second + '.' or ']' */
-	b = e;
 	while (1) {
 		c = *(e++) - '0';
 		if (c > 9)
@@ -512,7 +514,6 @@ int convert_date(const char *field)
 	/* if there's a '.', we have milliseconds */
 	if (c == (unsigned char)('.' - '0')) {
 		/* millisecond second + ']' */
-		b = e;
 		while (1) {
 			c = *(e++) - '0';
 			if (c > 9)
@@ -535,7 +536,7 @@ int convert_date_to_timestamp(const char *field)
 {
 	unsigned int d, mo, y, h, m, s;
 	unsigned char c;
-	const char *b, *e;
+	const char *e;
 	time_t rawtime;
 	static struct tm * timeinfo;
 	static int last_res;
@@ -622,7 +623,6 @@ int convert_date_to_timestamp(const char *field)
 	}
 
 	/* hour + ':' */
-	b = e;
 	while (1) {
 		c = *(e++) - '0';
 		if (c > 9)
@@ -633,7 +633,6 @@ int convert_date_to_timestamp(const char *field)
 		goto out_err;
 
 	/* minute + ':' */
-	b = e;
 	while (1) {
 		c = *(e++) - '0';
 		if (c > 9)
@@ -644,7 +643,6 @@ int convert_date_to_timestamp(const char *field)
 		goto out_err;
 
 	/* second + '.' or ']' */
-	b = e;
 	while (1) {
 		c = *(e++) - '0';
 		if (c > 9)
@@ -653,11 +651,11 @@ int convert_date_to_timestamp(const char *field)
 	}
 
 	if (likely(timeinfo)) {
-		if (timeinfo->tm_min == m &&
-		    timeinfo->tm_hour == h &&
-		    timeinfo->tm_mday == d &&
-		    timeinfo->tm_mon == mo - 1 &&
-		    timeinfo->tm_year == y - 1900)
+		if ((unsigned)timeinfo->tm_min == m &&
+		    (unsigned)timeinfo->tm_hour == h &&
+		    (unsigned)timeinfo->tm_mday == d &&
+		    (unsigned)timeinfo->tm_mon == mo - 1 &&
+		    (unsigned)timeinfo->tm_year == y - 1900)
 			return last_res + s;
 	}
 	else {
@@ -686,19 +684,19 @@ void truncated_line(int linenum, const char *line)
 
 int main(int argc, char **argv)
 {
-	const char *b, *e, *p, *time_field, *accept_field, *source_field;
+	const char *b, *p, *time_field, *accept_field, *source_field;
 	const char *filter_term_code_name = NULL;
 	const char *output_file = NULL;
-	int f, last, err;
+	int f, last;
 	struct timer *t = NULL;
 	struct eb32_node *n;
 	struct url_stat *ustat = NULL;
 	int val, test;
 	unsigned int uval;
-	int filter_acc_delay = 0, filter_acc_count = 0;
+	unsigned int filter_acc_delay = 0, filter_acc_count = 0;
 	int filter_time_resp = 0;
 	int filt_http_status_low = 0, filt_http_status_high = 0;
-	int filt2_timestamp_low = 0, filt2_timestamp_high = 0;
+	unsigned int filt2_timestamp_low = 0, filt2_timestamp_high = 0;
 	int skip_fields = 1;
 
 	void (*line_filter)(const char *accept_field, const char *time_field, struct timer **tptr) = NULL;
@@ -879,7 +877,7 @@ int main(int argc, char **argv)
 
 #if defined(POSIX_FADV_SEQUENTIAL)
 	/* around 20% performance improvement is observed on Linux with this
-	 * on cold-cache. Surprizingly, WILLNEED is less performant. Don't
+	 * on cold-cache. Surprisingly, WILLNEED is less performant. Don't
 	 * use NOREUSE as it flushes the cache and prevents easy data
 	 * manipulation on logs!
 	 */
@@ -941,7 +939,7 @@ int main(int argc, char **argv)
 				}
 			}
 
-			e = field_stop(time_field + 1);
+			field_stop(time_field + 1);
 			/* we have field TIME_FIELD in [time_field]..[e-1] */
 			p = time_field;
 			f = 0;
@@ -965,17 +963,15 @@ int main(int argc, char **argv)
 				}
 			}
 
-			e = field_stop(time_field + 1);
+			field_stop(time_field + 1);
 			/* we have field TIME_FIELD in [time_field]..[e-1], let's check only the response time */
 
 			p = time_field;
-			err = 0;
 			f = 0;
 			while (!SEP(*p)) {
 				tps = str2ic(p);
 				if (tps < 0) {
 					tps = -1;
-					err = 1;
 				}
 				if (++f == 4)
 					break;
@@ -1292,7 +1288,7 @@ int main(int argc, char **argv)
 		node = eb_last(&timers[0]);
 		while (node) {
 			ustat = container_of(node, struct url_stat, node.url.node);
-			printf("%d %d %Ld %Ld %Ld %Ld %Ld %Ld %s\n",
+			printf("%d %d %llu %llu %llu %llu %llu %llu %s\n",
 			       ustat->nb_req,
 			       ustat->nb_err,
 			       ustat->total_time,
@@ -1569,6 +1565,7 @@ void filter_count_url(const char *accept_field, const char *time_field, struct t
 
 	if (unlikely(!*e)) {
 		truncated_line(linenum, line);
+		free(ustat);
 		return;
 	}
 
@@ -1701,7 +1698,7 @@ void filter_count_ip(const char *source_field, const char *accept_field, const c
 void filter_graphs(const char *accept_field, const char *time_field, struct timer **tptr)
 {
 	struct timer *t2;
-	const char *e, *p;
+	const char *p;
 	int f, err, array[5];
 
 	if (!time_field) {
@@ -1712,7 +1709,7 @@ void filter_graphs(const char *accept_field, const char *time_field, struct time
 		}
 	}
 
-	e = field_stop(time_field + 1);
+	field_stop(time_field + 1);
 	/* we have field TIME_FIELD in [time_field]..[e-1] */
 
 	p = time_field;

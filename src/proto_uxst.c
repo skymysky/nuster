@@ -13,8 +13,6 @@
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <pwd.h>
-#include <grp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -26,91 +24,77 @@
 #include <sys/types.h>
 #include <sys/un.h>
 
-#include <common/compat.h>
-#include <common/config.h>
-#include <common/debug.h>
-#include <common/errors.h>
-#include <common/mini-clist.h>
-#include <common/standard.h>
-#include <common/time.h>
-#include <common/version.h>
+#include <haproxy/api.h>
+#include <haproxy/connection.h>
+#include <haproxy/errors.h>
+#include <haproxy/fd.h>
+#include <haproxy/global.h>
+#include <haproxy/list.h>
+#include <haproxy/listener.h>
+#include <haproxy/log.h>
+#include <haproxy/protocol.h>
+#include <haproxy/proto_uxst.h>
+#include <haproxy/sock.h>
+#include <haproxy/sock_unix.h>
+#include <haproxy/time.h>
+#include <haproxy/tools.h>
+#include <haproxy/version.h>
 
-#include <types/global.h>
-
-#include <proto/connection.h>
-#include <proto/fd.h>
-#include <proto/listener.h>
-#include <proto/log.h>
-#include <proto/protocol.h>
-#include <proto/proto_uxst.h>
-#include <proto/task.h>
 
 static int uxst_bind_listener(struct listener *listener, char *errmsg, int errlen);
-static int uxst_bind_listeners(struct protocol *proto, char *errmsg, int errlen);
-static int uxst_unbind_listeners(struct protocol *proto);
-static int uxst_connect_server(struct connection *conn, int data, int delack);
+static int uxst_connect_server(struct connection *conn, int flags);
+static void uxst_enable_listener(struct listener *listener);
+static void uxst_disable_listener(struct listener *listener);
+static int uxst_suspend_receiver(struct receiver *rx);
 
 /* Note: must not be declared <const> as its list will be overwritten */
-static struct protocol proto_unix = {
-	.name = "unix_stream",
-	.sock_domain = PF_UNIX,
-	.sock_type = SOCK_STREAM,
-	.sock_prot = 0,
-	.sock_family = AF_UNIX,
-	.sock_addrlen = sizeof(struct sockaddr_un),
-	.l3_addrlen = sizeof(((struct sockaddr_un*)0)->sun_path),/* path len */
-	.accept = &listener_accept,
-	.connect = &uxst_connect_server,
-	.bind = uxst_bind_listener,
-	.bind_all = uxst_bind_listeners,
-	.unbind_all = uxst_unbind_listeners,
-	.enable_all = enable_all_listeners,
-	.disable_all = disable_all_listeners,
-	.get_src = uxst_get_src,
-	.get_dst = uxst_get_dst,
-	.pause = uxst_pause_listener,
-	.listeners = LIST_HEAD_INIT(proto_unix.listeners),
-	.nb_listeners = 0,
+struct protocol proto_uxst = {
+	.name           = "unix_stream",
+
+	/* connection layer */
+	.ctrl_type      = SOCK_STREAM,
+	.listen         = uxst_bind_listener,
+	.enable         = uxst_enable_listener,
+	.disable        = uxst_disable_listener,
+	.add            = default_add_listener,
+	.unbind         = default_unbind_listener,
+	.suspend        = default_suspend_listener,
+	.accept_conn    = sock_accept_conn,
+	.ctrl_init      = sock_conn_ctrl_init,
+	.ctrl_close     = sock_conn_ctrl_close,
+	.connect        = uxst_connect_server,
+	.drain          = sock_drain,
+	.check_events   = sock_check_events,
+	.ignore_events  = sock_ignore_events,
+
+	/* binding layer */
+	.rx_suspend     = uxst_suspend_receiver,
+
+	/* address family */
+	.fam            = &proto_fam_unix,
+
+	/* socket layer */
+	.sock_type      = SOCK_STREAM,
+	.sock_prot      = 0,
+	.rx_enable      = sock_enable,
+	.rx_disable     = sock_disable,
+	.rx_unbind      = sock_unbind,
+	.rx_listening   = sock_accepting_conn,
+	.default_iocb   = sock_accept_iocb,
+	.receivers      = LIST_HEAD_INIT(proto_uxst.receivers),
+	.nb_receivers   = 0,
 };
+
+INITCALL1(STG_REGISTER, protocol_register, &proto_uxst);
 
 /********************************
  * 1) low-level socket functions
  ********************************/
 
-/*
- * Retrieves the source address for the socket <fd>, with <dir> indicating
- * if we're a listener (=0) or an initiator (!=0). It returns 0 in case of
- * success, -1 in case of error. The socket's source address is stored in
- * <sa> for <salen> bytes.
- */
-int uxst_get_src(int fd, struct sockaddr *sa, socklen_t salen, int dir)
-{
-	if (dir)
-		return getsockname(fd, sa, &salen);
-	else
-		return getpeername(fd, sa, &salen);
-}
-
-
-/*
- * Retrieves the original destination address for the socket <fd>, with <dir>
- * indicating if we're a listener (=0) or an initiator (!=0). It returns 0 in
- * case of success, -1 in case of error. The socket's source address is stored
- * in <sa> for <salen> bytes.
- */
-int uxst_get_dst(int fd, struct sockaddr *sa, socklen_t salen, int dir)
-{
-	if (dir)
-		return getpeername(fd, sa, &salen);
-	else
-		return getsockname(fd, sa, &salen);
-}
-
 
 /********************************
  * 2) listener-oriented functions
  ********************************/
-
 
 /* This function creates a UNIX socket associated to the listener. It changes
  * the state from ASSIGNED to LISTEN. The socket is NOT enabled for polling.
@@ -121,16 +105,9 @@ int uxst_get_dst(int fd, struct sockaddr *sa, socklen_t salen, int dir)
  */
 static int uxst_bind_listener(struct listener *listener, char *errmsg, int errlen)
 {
-	int fd;
-	char tempname[MAXPATHLEN];
-	char backname[MAXPATHLEN];
-	struct sockaddr_un addr;
-	const char *msg = NULL;
-	const char *path;
-	int ext, ready;
-	socklen_t ready_len;
-	int err;
-	int ret;
+	int fd, err;
+	int ready;
+	char *msg = NULL;
 
 	err = ERR_NONE;
 
@@ -140,213 +117,75 @@ static int uxst_bind_listener(struct listener *listener, char *errmsg, int errle
 
 	if (listener->state != LI_ASSIGNED)
 		return ERR_NONE; /* already bound */
-		
-	path = ((struct sockaddr_un *)&listener->addr)->sun_path;
 
-	/* if the listener already has an fd assigned, then we were offered the
-	 * fd by an external process (most likely the parent), and we don't want
-	 * to create a new socket. However we still want to set a few flags on
-	 * the socket.
-	 */
-	fd = listener->fd;
-	ext = (fd >= 0);
-	if (ext)
-		goto fd_ready;
-
-	if (path[0]) {
-		ret = snprintf(tempname, MAXPATHLEN, "%s.%d.tmp", path, pid);
-		if (ret < 0 || ret >= MAXPATHLEN) {
-			err |= ERR_FATAL | ERR_ALERT;
-			msg = "name too long for UNIX socket";
-			goto err_return;
-		}
-
-		ret = snprintf(backname, MAXPATHLEN, "%s.%d.bak", path, pid);
-		if (ret < 0 || ret >= MAXPATHLEN) {
-			err |= ERR_FATAL | ERR_ALERT;
-			msg = "name too long for UNIX socket";
-			goto err_return;
-		}
-
-		/* 2. clean existing orphaned entries */
-		if (unlink(tempname) < 0 && errno != ENOENT) {
-			err |= ERR_FATAL | ERR_ALERT;
-			msg = "error when trying to unlink previous UNIX socket";
-			goto err_return;
-		}
-
-		if (unlink(backname) < 0 && errno != ENOENT) {
-			err |= ERR_FATAL | ERR_ALERT;
-			msg = "error when trying to unlink previous UNIX socket";
-			goto err_return;
-		}
-
-		/* 3. backup existing socket */
-		if (link(path, backname) < 0 && errno != ENOENT) {
-			err |= ERR_FATAL | ERR_ALERT;
-			msg = "error when trying to preserve previous UNIX socket";
-			goto err_return;
-		}
-
-		strncpy(addr.sun_path, tempname, sizeof(addr.sun_path));
-		addr.sun_path[sizeof(addr.sun_path) - 1] = 0;
-	}
-	else {
-		/* first char is zero, it's an abstract socket whose address
-		 * is defined by all the bytes past this zero.
-		 */
-		memcpy(addr.sun_path, path, sizeof(addr.sun_path));
-	}
-	addr.sun_family = AF_UNIX;
-
-	fd = socket(PF_UNIX, SOCK_STREAM, 0);
-	if (fd < 0) {
-		err |= ERR_FATAL | ERR_ALERT;
-		msg = "cannot create UNIX socket";
-		goto err_unlink_back;
+	if (!(listener->rx.flags & RX_F_BOUND)) {
+		msg = "receiving socket not bound";
+		goto uxst_return;
 	}
 
- fd_ready:
-	if (fd >= global.maxsock) {
-		err |= ERR_FATAL | ERR_ALERT;
-		msg = "socket(): not enough free sockets, raise -n argument";
-		goto err_unlink_temp;
-	}
-	
-	if (fcntl(fd, F_SETFL, O_NONBLOCK) == -1) {
-		err |= ERR_FATAL | ERR_ALERT;
-		msg = "cannot make UNIX socket non-blocking";
-		goto err_unlink_temp;
-	}
-	
-	if (!ext && bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-		/* note that bind() creates the socket <tempname> on the file system */
-		if (errno == EADDRINUSE) {
-			/* the old process might still own it, let's retry */
-			err |= ERR_RETRYABLE | ERR_ALERT;
-			msg = "cannot listen to socket";
-		}
-		else {
-			err |= ERR_FATAL | ERR_ALERT;
-			msg = "cannot bind UNIX socket";
-		}
-		goto err_unlink_temp;
-	}
+	fd = listener->rx.fd;
+	ready = sock_accepting_conn(&listener->rx) > 0;
 
-	/* <uid> and <gid> different of -1 will be used to change the socket owner.
-	 * If <mode> is not 0, it will be used to restrict access to the socket.
-	 * While it is known not to be portable on every OS, it's still useful
-	 * where it works. We also don't change permissions on abstract sockets.
-	 */
-	if (!ext && path[0] &&
-	    (((listener->bind_conf->ux.uid != -1 || listener->bind_conf->ux.gid != -1) &&
-	      (chown(tempname, listener->bind_conf->ux.uid, listener->bind_conf->ux.gid) == -1)) ||
-	     (listener->bind_conf->ux.mode != 0 && chmod(tempname, listener->bind_conf->ux.mode) == -1))) {
-		err |= ERR_FATAL | ERR_ALERT;
-		msg = "cannot change UNIX socket ownership";
-		goto err_unlink_temp;
-	}
-
-	ready = 0;
-	ready_len = sizeof(ready);
-	if (getsockopt(fd, SOL_SOCKET, SO_ACCEPTCONN, &ready, &ready_len) == -1)
-		ready = 0;
-
-	if (!(ext && ready) && /* only listen if not already done by external process */
-	    listen(fd, listener->backlog ? listener->backlog : listener->maxconn) < 0) {
+	if (!ready && /* only listen if not already done by external process */
+	    listen(fd, listener_backlog(listener)) < 0) {
 		err |= ERR_FATAL | ERR_ALERT;
 		msg = "cannot listen to UNIX socket";
-		goto err_unlink_temp;
+		goto uxst_close_return;
 	}
-
-	/* Point of no return: we are ready, we'll switch the sockets. We don't
-	 * fear loosing the socket <path> because we have a copy of it in
-	 * backname. Abstract sockets are not renamed.
-	 */
-	if (!ext && path[0] && rename(tempname, path) < 0) {
-		err |= ERR_FATAL | ERR_ALERT;
-		msg = "cannot switch final and temporary UNIX sockets";
-		goto err_rename;
-	}
-
-	/* Cleanup: only unlink if we didn't inherit the fd from the parent */
-	if (!ext && path[0])
-		unlink(backname);
 
 	/* the socket is now listening */
-	listener->fd = fd;
-	listener->state = LI_LISTEN;
-
-	/* the function for the accept() event */
-	fd_insert(fd);
-	fdtab[fd].iocb = listener->proto->accept;
-	fdtab[fd].owner = listener; /* reference the listener instead of a task */
+	listener_set_state(listener, LI_LISTEN);
 	return err;
 
- err_rename:
-	ret = rename(backname, path);
-	if (ret < 0 && errno == ENOENT)
-		unlink(path);
- err_unlink_temp:
-	if (!ext && path[0])
-		unlink(tempname);
+ uxst_close_return:
 	close(fd);
- err_unlink_back:
-	if (!ext && path[0])
-		unlink(backname);
- err_return:
+ uxst_return:
 	if (msg && errlen) {
-		if (!ext)
-			snprintf(errmsg, errlen, "%s [%s]", msg, path);
-		else
-			snprintf(errmsg, errlen, "%s [fd %d]", msg, fd);
+		const char *path = ((struct sockaddr_un *)&listener->rx.addr)->sun_path;
+		snprintf(errmsg, errlen, "%s [%s]", msg, path);
 	}
 	return err;
 }
 
-/* This function closes the UNIX sockets for the specified listener.
- * The listener enters the LI_ASSIGNED state. It always returns ERR_NONE.
+/* Enable receipt of incoming connections for listener <l>. The receiver must
+ * still be valid.
  */
-static int uxst_unbind_listener(struct listener *listener)
+static void uxst_enable_listener(struct listener *l)
 {
-	if (listener->state > LI_ASSIGNED) {
-		unbind_listener(listener);
-	}
-	return ERR_NONE;
+	fd_want_recv_safe(l->rx.fd);
 }
 
-/* Add a listener to the list of unix stream listeners. The listener's state
- * is automatically updated from LI_INIT to LI_ASSIGNED. The number of
- * listeners is updated. This is the function to use to add a new listener.
+/* Disable receipt of incoming connections for listener <l>. The receiver must
+ * still be valid.
  */
-void uxst_add_listener(struct listener *listener)
+static void uxst_disable_listener(struct listener *l)
 {
-	if (listener->state != LI_INIT)
-		return;
-	listener->state = LI_ASSIGNED;
-	listener->proto = &proto_unix;
-	LIST_ADDQ(&proto_unix.listeners, &listener->proto_list);
-	proto_unix.nb_listeners++;
+	fd_stop_recv(l->rx.fd);
 }
 
-/* Pause a listener. Returns < 0 in case of failure, 0 if the listener
- * was totally stopped, or > 0 if correctly paused. Nothing is done for
+/* Suspend a receiver. Returns < 0 in case of failure, 0 if the receiver
+ * was totally stopped, or > 0 if correctly suspended. Nothing is done for
  * plain unix sockets since currently it's the new process which handles
- * the renaming. Abstract sockets are completely unbound.
+ * the renaming. Abstract sockets are completely unbound and closed so
+ * there's no need to stop the poller.
  */
-int uxst_pause_listener(struct listener *l)
+static int uxst_suspend_receiver(struct receiver *rx)
 {
-	if (((struct sockaddr_un *)&l->addr)->sun_path[0])
+	struct listener *l = LIST_ELEM(rx, struct listener *, rx);
+
+	if (((struct sockaddr_un *)&rx->addr)->sun_path[0])
 		return 1;
 
-	unbind_listener(l);
+	/* Listener's lock already held. Call lockless version of
+	 * unbind_listener. */
+	do_unbind_listener(l);
 	return 0;
 }
 
 
 /*
  * This function initiates a UNIX connection establishment to the target assigned
- * to connection <conn> using (si->{target,addr.to}). The source address is ignored
+ * to connection <conn> using (si->{target,dst}). The source address is ignored
  * and will be selected by the system. conn->target may point either to a valid
  * server or to a backend, depending on conn->target. Only OBJ_TYPE_PROXY and
  * OBJ_TYPE_SERVER are supported. The <data> parameter is a boolean indicating
@@ -367,13 +206,11 @@ int uxst_pause_listener(struct listener *l)
  * The connection's fd is inserted only when SF_ERR_NONE is returned, otherwise
  * it's invalid and the caller has nothing to do.
  */
-int uxst_connect_server(struct connection *conn, int data, int delack)
+static int uxst_connect_server(struct connection *conn, int flags)
 {
 	int fd;
 	struct server *srv;
 	struct proxy *be;
-
-	conn->flags = 0;
 
 	switch (obj_type(conn->target)) {
 	case OBJ_TYPE_PROXY:
@@ -389,26 +226,26 @@ int uxst_connect_server(struct connection *conn, int data, int delack)
 		return SF_ERR_INTERNAL;
 	}
 
-	if ((fd = conn->t.sock.fd = socket(PF_UNIX, SOCK_STREAM, 0)) == -1) {
+	if ((fd = conn->handle.fd = socket(PF_UNIX, SOCK_STREAM, 0)) == -1) {
 		qfprintf(stderr, "Cannot get a server socket.\n");
 
 		if (errno == ENFILE) {
 			conn->err_code = CO_ER_SYS_FDLIM;
 			send_log(be, LOG_EMERG,
-				 "Proxy %s reached system FD limit at %d. Please check system tunables.\n",
-				 be->id, maxfd);
+				 "Proxy %s reached system FD limit (maxsock=%d). Please check system tunables.\n",
+				 be->id, global.maxsock);
 		}
 		else if (errno == EMFILE) {
 			conn->err_code = CO_ER_PROC_FDLIM;
 			send_log(be, LOG_EMERG,
-				 "Proxy %s reached process FD limit at %d. Please check 'ulimit-n' and restart.\n",
-				 be->id, maxfd);
+				 "Proxy %s reached process FD limit (maxsock=%d). Please check 'ulimit-n' and restart.\n",
+				 be->id, global.maxsock);
 		}
 		else if (errno == ENOBUFS || errno == ENOMEM) {
 			conn->err_code = CO_ER_SYS_MEMLIM;
 			send_log(be, LOG_EMERG,
-				 "Proxy %s reached system memory limit at %d sockets. Please check system tunables.\n",
-				 be->id, maxfd);
+				 "Proxy %s reached system memory limit (maxsock=%d). Please check system tunables.\n",
+				 be->id, global.maxsock);
 		}
 		else if (errno == EAFNOSUPPORT || errno == EPROTONOSUPPORT) {
 			conn->err_code = CO_ER_NOPROTO;
@@ -425,7 +262,7 @@ int uxst_connect_server(struct connection *conn, int data, int delack)
 		/* do not log anything there, it's a normal condition when this option
 		 * is used to serialize connections to a server !
 		 */
-		Alert("socket(): not enough free sockets. Raise -n argument. Giving up.\n");
+		ha_alert("socket(): not enough free sockets. Raise -n argument. Giving up.\n");
 		close(fd);
 		conn->err_code = CO_ER_CONF_FDLIM;
 		conn->flags |= CO_FL_ERROR;
@@ -440,8 +277,17 @@ int uxst_connect_server(struct connection *conn, int data, int delack)
 		return SF_ERR_INTERNAL;
 	}
 
+	if (master == 1 && (fcntl(fd, F_SETFD, FD_CLOEXEC) == -1)) {
+		ha_alert("Cannot set CLOEXEC on client socket.\n");
+		close(fd);
+		conn->err_code = CO_ER_SOCK_ERR;
+		conn->flags |= CO_FL_ERROR;
+		return SF_ERR_INTERNAL;
+	}
+
 	/* if a send_proxy is there, there are data */
-	data |= conn->send_proxy_ofs;
+	if (conn->send_proxy_ofs)
+		flags |= CONNECT_HAS_DATA;
 
 	if (global.tune.server_sndbuf)
                 setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &global.tune.server_sndbuf, sizeof(global.tune.server_sndbuf));
@@ -449,7 +295,7 @@ int uxst_connect_server(struct connection *conn, int data, int delack)
 	if (global.tune.server_rcvbuf)
                 setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &global.tune.server_rcvbuf, sizeof(global.tune.server_rcvbuf));
 
-	if (connect(fd, (struct sockaddr *)&conn->addr.to, get_addr_len(&conn->addr.to)) == -1) {
+	if (connect(fd, (struct sockaddr *)conn->dst, get_addr_len(conn->dst)) == -1) {
 		if (errno == EINPROGRESS || errno == EALREADY) {
 			conn->flags |= CO_FL_WAIT_L4_CONN;
 		}
@@ -502,173 +348,20 @@ int uxst_connect_server(struct connection *conn, int data, int delack)
 	conn_ctrl_init(conn);       /* registers the FD */
 	fdtab[fd].linger_risk = 0;  /* no need to disable lingering */
 
+	if (conn->flags & CO_FL_WAIT_L4_CONN) {
+		fd_want_send(fd);
+		fd_cant_send(fd);
+		fd_cant_recv(fd);
+	}
+
 	if (conn_xprt_init(conn) < 0) {
-		conn_force_close(conn);
+		conn_full_close(conn);
 		conn->flags |= CO_FL_ERROR;
 		return SF_ERR_RESOURCE;
 	}
 
-	if (conn->flags & (CO_FL_HANDSHAKE | CO_FL_WAIT_L4_CONN)) {
-		conn_sock_want_send(conn);  /* for connect status, proxy protocol or SSL */
-	}
-	else {
-		/* If there's no more handshake, we need to notify the data
-		 * layer when the connection is already OK otherwise we'll have
-		 * no other opportunity to do it later (eg: health checks).
-		 */
-		data = 1;
-	}
-
-	if (data)
-		conn_data_want_send(conn);  /* prepare to send data if any */
-
 	return SF_ERR_NONE;  /* connection is OK */
 }
-
-
-/********************************
- * 3) protocol-oriented functions
- ********************************/
-
-
-/* This function creates all UNIX sockets bound to the protocol entry <proto>.
- * It is intended to be used as the protocol's bind_all() function.
- * The sockets will be registered but not added to any fd_set, in order not to
- * loose them across the fork(). A call to uxst_enable_listeners() is needed
- * to complete initialization.
- *
- * The return value is composed from ERR_NONE, ERR_RETRYABLE and ERR_FATAL.
- */
-static int uxst_bind_listeners(struct protocol *proto, char *errmsg, int errlen)
-{
-	struct listener *listener;
-	int err = ERR_NONE;
-
-	list_for_each_entry(listener, &proto->listeners, proto_list) {
-		err |= uxst_bind_listener(listener, errmsg, errlen);
-		if (err & ERR_ABORT)
-			break;
-	}
-	return err;
-}
-
-
-/* This function stops all listening UNIX sockets bound to the protocol
- * <proto>. It does not detaches them from the protocol.
- * It always returns ERR_NONE.
- */
-static int uxst_unbind_listeners(struct protocol *proto)
-{
-	struct listener *listener;
-
-	list_for_each_entry(listener, &proto->listeners, proto_list)
-		uxst_unbind_listener(listener);
-	return ERR_NONE;
-}
-
-/* parse the "mode" bind keyword */
-static int bind_parse_mode(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
-{
-	if (!*args[cur_arg + 1]) {
-		memprintf(err, "'%s' : missing mode (octal integer expected)", args[cur_arg]);
-		return ERR_ALERT | ERR_FATAL;
-	}
-
-	conf->ux.mode = strtol(args[cur_arg + 1], NULL, 8);
-	return 0;
-}
-
-/* parse the "gid" bind keyword */
-static int bind_parse_gid(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
-{
-	if (!*args[cur_arg + 1]) {
-		memprintf(err, "'%s' : missing value", args[cur_arg]);
-		return ERR_ALERT | ERR_FATAL;
-	}
-
-	conf->ux.gid = atol(args[cur_arg + 1]);
-	return 0;
-}
-
-/* parse the "group" bind keyword */
-static int bind_parse_group(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
-{
-	struct group *group;
-
-	if (!*args[cur_arg + 1]) {
-		memprintf(err, "'%s' : missing group name", args[cur_arg]);
-		return ERR_ALERT | ERR_FATAL;
-	}
-
-	group = getgrnam(args[cur_arg + 1]);
-	if (!group) {
-		memprintf(err, "'%s' : unknown group name '%s'", args[cur_arg], args[cur_arg + 1]);
-		return ERR_ALERT | ERR_FATAL;
-	}
-
-	conf->ux.gid = group->gr_gid;
-	return 0;
-}
-
-/* parse the "uid" bind keyword */
-static int bind_parse_uid(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
-{
-	if (!*args[cur_arg + 1]) {
-		memprintf(err, "'%s' : missing value", args[cur_arg]);
-		return ERR_ALERT | ERR_FATAL;
-	}
-
-	conf->ux.uid = atol(args[cur_arg + 1]);
-	return 0;
-}
-
-/* parse the "user" bind keyword */
-static int bind_parse_user(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
-{
-	struct passwd *user;
-
-	if (!*args[cur_arg + 1]) {
-		memprintf(err, "'%s' : missing user name", args[cur_arg]);
-		return ERR_ALERT | ERR_FATAL;
-	}
-
-	user = getpwnam(args[cur_arg + 1]);
-	if (!user) {
-		memprintf(err, "'%s' : unknown user name '%s'", args[cur_arg], args[cur_arg + 1]);
-		return ERR_ALERT | ERR_FATAL;
-	}
-
-	conf->ux.uid = user->pw_uid;
-	return 0;
-}
-
-/* Note: must not be declared <const> as its list will be overwritten.
- * Please take care of keeping this list alphabetically sorted, doing so helps
- * all code contributors.
- * Optional keywords are also declared with a NULL ->parse() function so that
- * the config parser can report an appropriate error when a known keyword was
- * not enabled.
- */
-static struct bind_kw_list bind_kws = { "UNIX", { }, {
-	{ "gid",   bind_parse_gid,   1 },      /* set the socket's gid */
-	{ "group", bind_parse_group, 1 },      /* set the socket's gid from the group name */
-	{ "mode",  bind_parse_mode,  1 },      /* set the socket's mode (eg: 0644)*/
-	{ "uid",   bind_parse_uid,   1 },      /* set the socket's uid */
-	{ "user",  bind_parse_user,  1 },      /* set the socket's uid from the user name */
-	{ NULL, NULL, 0 },
-}};
-
-/********************************
- * 4) high-level functions
- ********************************/
-
-__attribute__((constructor))
-static void __uxst_protocol_init(void)
-{
-	protocol_register(&proto_unix);
-	bind_register_keywords(&bind_kws);
-}
-
 
 /*
  * Local variables:

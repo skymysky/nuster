@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # creates a new haproxy release at the current commit
 # Copyright (c) 2006-2016 Willy Tarreau <w@1wt.eu>
 #
@@ -164,7 +164,11 @@ echo "Updating CHANGELOG ..."
   echo
   echo "$DATE : $NEW"
   #git shortlog v$OLD.. | sed -ne 's/^      /    - /p'
-  git log --oneline --reverse --format="    - %s" v$OLD..
+  if [ $(git log --oneline v$OLD.. | wc -l) = 0 ]; then
+    echo "    - exact copy of $OLD"
+  else
+    git log --oneline --reverse --format="    - %s" v$OLD..
+  fi
   echo
   tail -n +4 CHANGELOG
 ) >.chglog.tmp && mv .chglog.tmp CHANGELOG
@@ -177,19 +181,8 @@ echo "Updating VERDATE ..."
 echo '$Format:%ci$' > VERDATE
 echo "$DATE" >> VERDATE
 
-echo "Updating haproxy.spec ..."
-sed -e "s/^Version: .*/Version: $NEW/" < examples/haproxy.spec >examples/haproxy.spec- && mv examples/haproxy.spec- examples/haproxy.spec
-
-(sed -ne '0,/^%changelog/p';
- date -d "$DATE" "+* %a %b %e %Y $GIT_COMMITTER_NAME <$GIT_COMMITTER_EMAIL>"
- echo "- updated to $(cat VERSION)"
- echo
-) < examples/haproxy.spec >examples/haproxy.spec-
-sed -ne '0,/^%changelog/d;p' < examples/haproxy.spec >>examples/haproxy.spec-
-mv examples/haproxy.spec- examples/haproxy.spec
-
-# updating branch and date in README and all modified doc files except the outdated architecture.txt
-for file in README doc/intro.txt doc/configuration.txt doc/management.txt $(git diff --name-only v${OLD}.. -- doc); do
+# updating branch and date in all modified doc files except the outdated architecture.txt
+for file in doc/intro.txt doc/configuration.txt doc/management.txt $(git diff --name-only v${OLD}.. -- doc); do
 	if [ ! -e "$file" ]; then continue; fi
 	if [ "$file" = doc/architecture.txt ]; then continue; fi
 	echo "Updating $file ..."
@@ -204,11 +197,11 @@ sed -e "s:Copyright 2000-[0-9]*\s*Willy Tarreau.*>:Copyright 2000-$YEAR Willy Ta
 
 echo "Updating version.h ..."
 sed -e "s:^\(#define\s*PRODUCT_BRANCH\s*\)\"[^\"]*\":\1\"$BRANCH\":" \
-    -i include/common/version.h
+    -i include/haproxy/version.h
 
 if [ -n "$INTERACTIVE" ]; then
-	vi CHANGELOG VERSION VERDATE examples/haproxy*.spec \
-	   src/haproxy.c README doc/configuration.txt \
+	vi CHANGELOG VERSION VERDATE \
+	   src/haproxy.c doc/configuration.txt \
 	   $(git diff --name-only v${OLD}.. -- doc)
 fi
 
@@ -236,8 +229,9 @@ read
 do_commit || die "Failed to commit changes"
 do_tag    || die "Failed to tag changes"
 
+remote=$(git config --get branch.master.remote)
 echo "Do not forget to push updates, publish and announce this version :"
 echo
-echo "git push origin master v$NEW"
+echo "git push ${remote:-origin} master v$NEW"
 echo "${0%/*}/publish-release"
 echo "${0%/*}/announce-release"

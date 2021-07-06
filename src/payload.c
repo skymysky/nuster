@@ -13,12 +13,16 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include <proto/acl.h>
-#include <proto/arg.h>
-#include <proto/channel.h>
-#include <proto/pattern.h>
-#include <proto/payload.h>
-#include <proto/sample.h>
+#include <haproxy/acl.h>
+#include <haproxy/api.h>
+#include <haproxy/arg.h>
+#include <haproxy/channel.h>
+#include <haproxy/connection.h>
+#include <haproxy/htx.h>
+#include <haproxy/net_helper.h>
+#include <haproxy/pattern.h>
+#include <haproxy/payload.h>
+#include <haproxy/sample.h>
 
 
 /************************************************************************/
@@ -44,14 +48,23 @@ smp_fetch_wait_end(const struct arg *args, struct sample *smp, const char *kw, v
 static int
 smp_fetch_len(const struct arg *args, struct sample *smp, const char *kw, void *private)
 {
-	struct channel *chn;
-
-	if (!smp->strm)
+	if (smp->strm) {
+		struct channel *chn = ((smp->opt & SMP_OPT_DIR) == SMP_OPT_DIR_RES) ? &smp->strm->res : &smp->strm->req;
+		if (IS_HTX_STRM(smp->strm)) {
+			struct htx *htx = htxbuf(&chn->buf);
+			smp->data.u.sint = htx->data - co_data(chn);
+		}
+		else
+			smp->data.u.sint = ci_data(chn);
+	}
+	else if (obj_type(smp->sess->origin) == OBJ_TYPE_CHECK) {
+		struct check *check = __objt_check(smp->sess->origin);
+		smp->data.u.sint = ((check->cs && IS_HTX_CS(check->cs)) ? (htxbuf(&check->bi))->data: b_data(&check->bi));
+	}
+	else
 		return 0;
 
-	chn = ((smp->opt & SMP_OPT_DIR) == SMP_OPT_DIR_RES) ? &smp->strm->res : &smp->strm->req;
 	smp->data.type = SMP_T_SINT;
-	smp->data.u.sint = chn->buf->i;
 	smp->flags = SMP_F_VOLATILE | SMP_F_MAY_CHANGE;
 	return 1;
 }
@@ -72,8 +85,8 @@ smp_fetch_req_ssl_st_ext(const struct arg *args, struct sample *smp, const char 
 		goto not_ssl_hello;
 
 	chn = ((smp->opt & SMP_OPT_DIR) == SMP_OPT_DIR_RES) ? &smp->strm->res : &smp->strm->req;
-	bleft = chn->buf->i;
-	data = (unsigned char *)chn->buf->p;
+	bleft = ci_data(chn);
+	data = (unsigned char *)ci_head(chn);
 
 	/* Check for SSL/TLS Handshake */
 	if (!bleft)
@@ -202,8 +215,8 @@ smp_fetch_req_ssl_ec_ext(const struct arg *args, struct sample *smp, const char 
 		goto not_ssl_hello;
 
 	chn = ((smp->opt & SMP_OPT_DIR) == SMP_OPT_DIR_RES) ? &smp->strm->res : &smp->strm->req;
-	bleft = chn->buf->i;
-	data = (unsigned char *)chn->buf->p;
+	bleft = ci_data(chn);
+	data = (unsigned char *)ci_head(chn);
 
 	/* Check for SSL/TLS Handshake */
 	if (!bleft)
@@ -323,8 +336,8 @@ smp_fetch_ssl_hello_type(const struct arg *args, struct sample *smp, const char 
 		goto not_ssl_hello;
 
 	chn = ((smp->opt & SMP_OPT_DIR) == SMP_OPT_DIR_RES) ? &smp->strm->res : &smp->strm->req;
-	bleft = chn->buf->i;
-	data = (const unsigned char *)chn->buf->p;
+	bleft = ci_data(chn);
+	data = (const unsigned char *)ci_head(chn);
 
 	if (!bleft)
 		goto too_short;
@@ -390,11 +403,11 @@ smp_fetch_req_ssl_ver(const struct arg *args, struct sample *smp, const char *kw
 
 	req = &smp->strm->req;
 	msg_len = 0;
-	bleft = req->buf->i;
+	bleft = ci_data(req);
 	if (!bleft)
 		goto too_short;
 
-	data = (const unsigned char *)req->buf->p;
+	data = (const unsigned char *)ci_head(req);
 	if ((*data >= 0x14 && *data <= 0x17) || (*data == 0xFF)) {
 		/* SSLv3 header format */
 		if (bleft < 11)
@@ -465,8 +478,8 @@ smp_fetch_req_ssl_ver(const struct arg *args, struct sample *smp, const char *kw
 	 * all the part of the request which fits in a buffer is already
 	 * there.
 	 */
-	if (msg_len > channel_recv_limit(req) + req->buf->data - req->buf->p)
-		msg_len = channel_recv_limit(req) + req->buf->data - req->buf->p;
+	if (msg_len > channel_recv_limit(req) + b_orig(&req->buf) - ci_head(req))
+		msg_len = channel_recv_limit(req) + b_orig(&req->buf) - ci_head(req);
 
 	if (bleft < msg_len)
 		goto too_short;
@@ -529,8 +542,8 @@ smp_fetch_ssl_hello_sni(const struct arg *args, struct sample *smp, const char *
 		goto not_ssl_hello;
 
 	chn = ((smp->opt & SMP_OPT_DIR) == SMP_OPT_DIR_RES) ? &smp->strm->res : &smp->strm->req;
-	bleft = chn->buf->i;
-	data = (unsigned char *)chn->buf->p;
+	bleft = ci_data(chn);
+	data = (unsigned char *)ci_head(chn);
 
 	/* Check for SSL/TLS Handshake */
 	if (!bleft)
@@ -629,8 +642,8 @@ smp_fetch_ssl_hello_sni(const struct arg *args, struct sample *smp, const char *
 
 			if (name_type == 0) { /* hostname */
 				smp->data.type = SMP_T_STR;
-				smp->data.u.str.str = (char *)data + 9;
-				smp->data.u.str.len = name_len;
+				smp->data.u.str.area = (char *)data + 9;
+				smp->data.u.str.data = name_len;
 				smp->flags = SMP_F_VOLATILE | SMP_F_CONST;
 				return 1;
 			}
@@ -640,6 +653,177 @@ smp_fetch_ssl_hello_sni(const struct arg *args, struct sample *smp, const char *
 		data   += 4 + ext_len;
 	}
 	/* server name not found */
+	goto not_ssl_hello;
+
+ too_short:
+	smp->flags = SMP_F_MAY_CHANGE;
+
+ not_ssl_hello:
+
+	return 0;
+}
+
+/* Try to extract the Application-Layer Protocol Negotiation (ALPN) protocol
+ * names that may be presented in a TLS client hello handshake message. As the
+ * message presents a list of protocol names in descending order of preference,
+ * it may return iteratively. The format of the message is the following
+ * (cf RFC5246 + RFC7301) :
+ * TLS frame :
+ *   - uint8  type                            = 0x16   (Handshake)
+ *   - uint16 version                        >= 0x0301 (TLSv1)
+ *   - uint16 length                                   (frame length)
+ *   - TLS handshake :
+ *     - uint8  msg_type                      = 0x01   (ClientHello)
+ *     - uint24 length                                 (handshake message length)
+ *     - ClientHello :
+ *       - uint16 client_version             >= 0x0301 (TLSv1)
+ *       - uint8 Random[32]                  (4 first ones are timestamp)
+ *       - SessionID :
+ *         - uint8 session_id_len (0..32)              (SessionID len in bytes)
+ *         - uint8 session_id[session_id_len]
+ *       - CipherSuite :
+ *         - uint16 cipher_len               >= 2      (Cipher length in bytes)
+ *         - uint16 ciphers[cipher_len/2]
+ *       - CompressionMethod :
+ *         - uint8 compression_len           >= 1      (# of supported methods)
+ *         - uint8 compression_methods[compression_len]
+ *       - optional client_extension_len               (in bytes)
+ *       - optional sequence of ClientHelloExtensions  (as many bytes as above):
+ *         - uint16 extension_type            = 16 for application_layer_protocol_negotiation
+ *         - uint16 extension_len
+ *         - opaque extension_data[extension_len]
+ *           - uint16 protocol_names_len               (# of bytes here)
+ *           - opaque protocol_names[protocol_names_len bytes]
+ *             - uint8 name_len
+ *             - opaque protocol_name[name_len bytes]
+ */
+static int
+smp_fetch_ssl_hello_alpn(const struct arg *args, struct sample *smp, const char *kw, void *private)
+{
+	int hs_len, ext_len, bleft;
+	struct channel *chn;
+	unsigned char *data;
+
+	if (!smp->strm)
+		goto not_ssl_hello;
+
+	chn = ((smp->opt & SMP_OPT_DIR) == SMP_OPT_DIR_RES) ? &smp->strm->res : &smp->strm->req;
+	bleft = ci_data(chn);
+	data = (unsigned char *)ci_head(chn);
+
+	/* Check for SSL/TLS Handshake */
+	if (!bleft)
+		goto too_short;
+	if (*data != 0x16)
+		goto not_ssl_hello;
+
+	/* Check for SSLv3 or later (SSL version >= 3.0) in the record layer*/
+	if (bleft < 3)
+		goto too_short;
+	if (data[1] < 0x03)
+		goto not_ssl_hello;
+
+	if (bleft < 5)
+		goto too_short;
+	hs_len = (data[3] << 8) + data[4];
+	if (hs_len < 1 + 3 + 2 + 32 + 1 + 2 + 2 + 1 + 1 + 2 + 2)
+		goto not_ssl_hello; /* too short to have an extension */
+
+	data += 5; /* enter TLS handshake */
+	bleft -= 5;
+
+	/* Check for a complete client hello starting at <data> */
+	if (bleft < 1)
+		goto too_short;
+	if (data[0] != 0x01) /* msg_type = Client Hello */
+		goto not_ssl_hello;
+
+	/* Check the Hello's length */
+	if (bleft < 4)
+		goto too_short;
+	hs_len = (data[1] << 16) + (data[2] << 8) + data[3];
+	if (hs_len < 2 + 32 + 1 + 2 + 2 + 1 + 1 + 2 + 2)
+		goto not_ssl_hello; /* too short to have an extension */
+
+	/* We want the full handshake here */
+	if (bleft < hs_len)
+		goto too_short;
+
+	data += 4;
+	/* Start of the ClientHello message */
+	if (data[0] < 0x03 || data[1] < 0x01) /* TLSv1 minimum */
+		goto not_ssl_hello;
+
+	ext_len = data[34]; /* session_id_len */
+	if (ext_len > 32 || ext_len > (hs_len - 35)) /* check for correct session_id len */
+		goto not_ssl_hello;
+
+	/* Jump to cipher suite */
+	hs_len -= 35 + ext_len;
+	data   += 35 + ext_len;
+
+	if (hs_len < 4 ||                               /* minimum one cipher */
+	    (ext_len = (data[0] << 8) + data[1]) < 2 || /* minimum 2 bytes for a cipher */
+	    ext_len > hs_len)
+		goto not_ssl_hello;
+
+	/* Jump to the compression methods */
+	hs_len -= 2 + ext_len;
+	data   += 2 + ext_len;
+
+	if (hs_len < 2 ||                       /* minimum one compression method */
+	    data[0] < 1 || data[0] > hs_len)    /* minimum 1 bytes for a method */
+		goto not_ssl_hello;
+
+	/* Jump to the extensions */
+	hs_len -= 1 + data[0];
+	data   += 1 + data[0];
+
+	if (hs_len < 2 ||                       /* minimum one extension list length */
+	    (ext_len = (data[0] << 8) + data[1]) > hs_len - 2) /* list too long */
+		goto not_ssl_hello;
+
+	hs_len = ext_len; /* limit ourselves to the extension length */
+	data += 2;
+
+	while (hs_len >= 4) {
+		int ext_type, name_len, name_offset;
+
+		ext_type = (data[0] << 8) + data[1];
+		ext_len  = (data[2] << 8) + data[3];
+
+		if (ext_len > hs_len - 4) /* Extension too long */
+			goto not_ssl_hello;
+
+		if (ext_type == 16) { /* ALPN */
+			if (ext_len < 3) /* one list length [uint16] + at least one name length [uint8] */
+				goto not_ssl_hello;
+
+			/* Name cursor in ctx, must begin after protocol_names_len */
+			name_offset = smp->ctx.i < 6 ? 6 : smp->ctx.i;
+			name_len = data[name_offset];
+
+			if (name_len + name_offset - 3 > ext_len)
+				goto not_ssl_hello;
+
+			smp->data.type = SMP_T_STR;
+			smp->data.u.str.area = (char *)data + name_offset + 1; /* +1 to skip name_len */
+			smp->data.u.str.data = name_len;
+			smp->flags = SMP_F_VOLATILE | SMP_F_CONST;
+
+			/* May have more protocol names remaining */
+			if (name_len + name_offset - 3 < ext_len) {
+				smp->ctx.i = name_offset + name_len + 1;
+				smp->flags |= SMP_F_NOT_LAST;
+			}
+
+			return 1;
+		}
+
+		hs_len -= 4 + ext_len;
+		data   += 4 + ext_len;
+	}
+	/* alpn not found */
 	goto not_ssl_hello;
 
  too_short:
@@ -663,11 +847,11 @@ fetch_rdp_cookie_name(struct stream *s, struct sample *smp, const char *cname, i
 	smp->flags = SMP_F_CONST;
 	smp->data.type = SMP_T_STR;
 
-	bleft = s->req.buf->i;
+	bleft = ci_data(&s->req);
 	if (bleft <= 11)
 		goto too_short;
 
-	data = (const unsigned char *)s->req.buf->p + 11;
+	data = (const unsigned char *)ci_head(&s->req) + 11;
 	bleft -= 11;
 
 	if (bleft <= 7)
@@ -713,8 +897,8 @@ fetch_rdp_cookie_name(struct stream *s, struct sample *smp, const char *cname, i
 	}
 
 	/* data points to cookie value */
-	smp->data.u.str.str = (char *)data;
-	smp->data.u.str.len = 0;
+	smp->data.u.str.area = (char *)data;
+	smp->data.u.str.data = 0;
 
 	while (bleft > 0 && *data != '\r') {
 		data++;
@@ -727,7 +911,7 @@ fetch_rdp_cookie_name(struct stream *s, struct sample *smp, const char *cname, i
 	if (data[0] != '\r' || data[1] != '\n')
 		goto not_cookie;
 
-	smp->data.u.str.len = (char *)data - smp->data.u.str.str;
+	smp->data.u.str.data = (char *)data - smp->data.u.str.area;
 	smp->flags = SMP_F_VOLATILE | SMP_F_CONST;
 	return 1;
 
@@ -749,7 +933,9 @@ smp_fetch_rdp_cookie(const struct arg *args, struct sample *smp, const char *kw,
 	if (!smp->strm)
 		return 0;
 
-	return fetch_rdp_cookie_name(smp->strm, smp, args ? args->data.str.str : NULL, args ? args->data.str.len : 0);
+	return fetch_rdp_cookie_name(smp->strm, smp,
+				     args ? args->data.str.area : NULL,
+				     args ? args->data.str.data : 0);
 }
 
 /* returns either 1 or 0 depending on whether an RDP cookie is found or not */
@@ -777,22 +963,34 @@ smp_fetch_payload_lv(const struct arg *arg_p, struct sample *smp, const char *kw
 	unsigned int len_size = arg_p[1].data.sint;
 	unsigned int buf_offset;
 	unsigned int buf_size = 0;
-	struct channel *chn;
+	struct channel *chn = NULL;
+	char *head = NULL;
+	size_t max, data;
 	int i;
 
 	/* Format is (len offset, len size, buf offset) or (len offset, len size) */
 	/* by default buf offset == len offset + len size */
 	/* buf offset could be absolute or relative to len offset + len size if prefixed by + or - */
 
-	if (!smp->strm)
+	if (smp->strm) {
+		chn = ((smp->opt & SMP_OPT_DIR) == SMP_OPT_DIR_RES) ? &smp->strm->res : &smp->strm->req;
+		head = ci_head(chn);
+		data = ci_data(chn);
+	}
+	else if (obj_type(smp->sess->origin) == OBJ_TYPE_CHECK) {
+		struct buffer *buf = &(__objt_check(smp->sess->origin)->bi);
+		head = b_head(buf);
+		data = b_data(buf);
+	}
+	max = global.tune.bufsize;
+	if (!head)
 		return 0;
 
-	chn = ((smp->opt & SMP_OPT_DIR) == SMP_OPT_DIR_RES) ? &smp->strm->res : &smp->strm->req;
-	if (len_offset + len_size > chn->buf->i)
+	if (len_offset + len_size > data)
 		goto too_short;
 
 	for (i = 0; i < len_size; i++) {
-		buf_size = (buf_size << 8) + ((unsigned char *)chn->buf->p)[i + len_offset];
+		buf_size = (buf_size << 8) + ((unsigned char *)head)[i + len_offset];
 	}
 
 	/* buf offset may be implicit, absolute or relative. If the LSB
@@ -806,19 +1004,19 @@ smp_fetch_payload_lv(const struct arg *arg_p, struct sample *smp, const char *kw
 			buf_offset = arg_p[2].data.sint >> 1;
 	}
 
-	if (!buf_size || buf_size > global.tune.bufsize || buf_offset + buf_size > global.tune.bufsize) {
+	if (!buf_size || buf_size > max || buf_offset + buf_size > max) {
 		/* will never match */
 		smp->flags = 0;
 		return 0;
 	}
 
-	if (buf_offset + buf_size > chn->buf->i)
+	if (buf_offset + buf_size > data)
 		goto too_short;
 
 	/* init chunk as read only */
 	smp->data.type = SMP_T_BIN;
 	smp->flags = SMP_F_VOLATILE | SMP_F_CONST;
-	chunk_initlen(&smp->data.u.str, chn->buf->p + buf_offset, 0, buf_size);
+	chunk_initlen(&smp->data.u.str, head + buf_offset, 0, buf_size);
 	return 1;
 
  too_short:
@@ -832,31 +1030,43 @@ smp_fetch_payload(const struct arg *arg_p, struct sample *smp, const char *kw, v
 {
 	unsigned int buf_offset = arg_p[0].data.sint;
 	unsigned int buf_size = arg_p[1].data.sint;
-	struct channel *chn;
+	struct channel *chn = NULL;
+	char *head = NULL;
+	size_t max, data;
 
-	if (!smp->strm)
+	if (smp->strm) {
+		chn = ((smp->opt & SMP_OPT_DIR) == SMP_OPT_DIR_RES) ? &smp->strm->res : &smp->strm->req;
+		head = ci_head(chn);
+		data = ci_data(chn);
+	}
+	else if (obj_type(smp->sess->origin) == OBJ_TYPE_CHECK) {
+		struct buffer *buf = &(__objt_check(smp->sess->origin)->bi);
+		head = b_head(buf);
+		data = b_data(buf);
+	}
+	max = global.tune.bufsize;
+	if (!head)
 		return 0;
 
-	chn = ((smp->opt & SMP_OPT_DIR) == SMP_OPT_DIR_RES) ? &smp->strm->res : &smp->strm->req;
-	if (buf_size > global.tune.bufsize || buf_offset + buf_size > global.tune.bufsize) {
+	if (buf_size > max || buf_offset + buf_size > max) {
 		/* will never match */
 		smp->flags = 0;
 		return 0;
 	}
-
-	if (buf_offset + buf_size > chn->buf->i)
+	if (buf_offset + buf_size > data)
 		goto too_short;
 
 	/* init chunk as read only */
 	smp->data.type = SMP_T_BIN;
 	smp->flags = SMP_F_VOLATILE | SMP_F_CONST;
-	chunk_initlen(&smp->data.u.str, chn->buf->p + buf_offset, 0, buf_size ? buf_size : (chn->buf->i - buf_offset));
-	if (!buf_size && channel_may_recv(chn) && !channel_input_closed(chn))
+	chunk_initlen(&smp->data.u.str, head + buf_offset, 0, buf_size ? buf_size : (data - buf_offset));
+
+	if (!buf_size && chn && channel_may_recv(chn) && !channel_input_closed(chn))
 		smp->flags |= SMP_F_MAY_CHANGE;
 
 	return 1;
 
- too_short:
+  too_short:
 	smp->flags = SMP_F_MAY_CHANGE | SMP_F_CONST;
 	return 0;
 }
@@ -889,22 +1099,226 @@ int val_payload_lv(struct arg *arg, char **err_msg)
 		return 0;
 	}
 
-	if (arg[2].type == ARGT_STR && arg[2].data.str.len > 0) {
-		if (arg[2].data.str.str[0] == '+' || arg[2].data.str.str[0] == '-')
+	if (arg[2].type == ARGT_STR && arg[2].data.str.data > 0) {
+		long long int i;
+
+		if (arg[2].data.str.area[0] == '+' || arg[2].data.str.area[0] == '-')
 			relative = 1;
-		str = arg[2].data.str.str;
-		arg[2].type = ARGT_SINT;
-		arg[2].data.sint = read_int64(&str, str + arg[2].data.str.len);
+		str = arg[2].data.str.area;
+		i = read_int64(&str, str + arg[2].data.str.data);
 		if (*str != '\0') {
 			memprintf(err_msg, "payload offset2 is not a number");
 			return 0;
 		}
-	   if (arg[0].data.sint + arg[1].data.sint + arg[2].data.sint < 0) {
+		chunk_destroy(&arg[2].data.str);
+		arg[2].type = ARGT_SINT;
+		arg[2].data.sint = i;
+
+		if (arg[0].data.sint + arg[1].data.sint + arg[2].data.sint < 0) {
 			memprintf(err_msg, "payload offset2 too negative");
 			return 0;
 		}
 		if (relative)
 			arg[2].data.sint = ( arg[2].data.sint << 1 ) + 1;
+	}
+	return 1;
+}
+
+/* extracts the parameter value of a distcc token */
+static int
+smp_fetch_distcc_param(const struct arg *arg_p, struct sample *smp, const char *kw, void *private)
+{
+	unsigned int match_tok = arg_p[0].data.sint;
+	unsigned int match_occ = arg_p[1].data.sint;
+	unsigned int token;
+	unsigned int param;
+	unsigned int body;
+	unsigned int ofs;
+	unsigned int occ;
+	struct channel *chn;
+	int i;
+
+	/* Format is (token[,occ]). occ starts at 1. */
+
+	if (!smp->strm)
+		return 0;
+
+	chn = ((smp->opt & SMP_OPT_DIR) == SMP_OPT_DIR_RES) ? &smp->strm->res : &smp->strm->req;
+
+	ofs = 0; occ = 0;
+	while (1) {
+		if (ofs + 12 > ci_data(chn)) {
+			/* not there yet but could it at least fit ? */
+			if (!chn->buf.size)
+				goto too_short;
+
+			if (ofs + 12 <= channel_recv_limit(chn) + b_orig(&chn->buf) - ci_head(chn))
+				goto too_short;
+
+			goto no_match;
+		}
+
+		token = read_n32(ci_head(chn) + ofs);
+		ofs += 4;
+
+		for (i = param = 0; i < 8; i++) {
+			int c = hex2i(ci_head(chn)[ofs + i]);
+
+			if (c < 0)
+				goto no_match;
+			param = (param << 4) + c;
+		}
+		ofs += 8;
+
+		/* these tokens don't have a body */
+		if (token != 0x41524743 /* ARGC */ && token != 0x44495354 /* DIST */ &&
+		    token != 0x4E46494C /* NFIL */ && token != 0x53544154 /* STAT */ &&
+		    token != 0x444F4E45 /* DONE */)
+			body = param;
+		else
+			body = 0;
+
+		if (token == match_tok) {
+			occ++;
+			if (!match_occ || match_occ == occ) {
+				/* found */
+				smp->data.type = SMP_T_SINT;
+				smp->data.u.sint = param;
+				smp->flags = SMP_F_VOLATILE | SMP_F_CONST;
+				return 1;
+			}
+		}
+		ofs += body;
+	}
+
+ too_short:
+	smp->flags = SMP_F_MAY_CHANGE | SMP_F_CONST;
+	return 0;
+ no_match:
+	/* will never match (end of buffer, or bad contents) */
+	smp->flags = 0;
+	return 0;
+
+}
+
+/* extracts the (possibly truncated) body of a distcc token */
+static int
+smp_fetch_distcc_body(const struct arg *arg_p, struct sample *smp, const char *kw, void *private)
+{
+	unsigned int match_tok = arg_p[0].data.sint;
+	unsigned int match_occ = arg_p[1].data.sint;
+	unsigned int token;
+	unsigned int param;
+	unsigned int ofs;
+	unsigned int occ;
+	unsigned int body;
+	struct channel *chn;
+	int i;
+
+	/* Format is (token[,occ]). occ starts at 1. */
+
+	if (!smp->strm)
+		return 0;
+
+	chn = ((smp->opt & SMP_OPT_DIR) == SMP_OPT_DIR_RES) ? &smp->strm->res : &smp->strm->req;
+
+	ofs = 0; occ = 0;
+	while (1) {
+		if (ofs + 12 > ci_data(chn)) {
+			if (!chn->buf.size)
+				goto too_short;
+
+			if (ofs + 12 <= channel_recv_limit(chn) + b_orig(&chn->buf) - ci_head(chn))
+				goto too_short;
+
+			goto no_match;
+		}
+
+		token = read_n32(ci_head(chn) + ofs);
+		ofs += 4;
+
+		for (i = param = 0; i < 8; i++) {
+			int c = hex2i(ci_head(chn)[ofs + i]);
+
+			if (c < 0)
+				goto no_match;
+			param = (param << 4) + c;
+		}
+		ofs += 8;
+
+		/* these tokens don't have a body */
+		if (token != 0x41524743 /* ARGC */ && token != 0x44495354 /* DIST */ &&
+		    token != 0x4E46494C /* NFIL */ && token != 0x53544154 /* STAT */ &&
+		    token != 0x444F4E45 /* DONE */)
+			body = param;
+		else
+			body = 0;
+
+		if (token == match_tok) {
+			occ++;
+			if (!match_occ || match_occ == occ) {
+				/* found */
+
+				smp->data.type = SMP_T_BIN;
+				smp->flags = SMP_F_VOLATILE | SMP_F_CONST;
+
+				if (ofs + body > ci_head(chn) - b_orig(&chn->buf) + ci_data(chn)) {
+					/* incomplete body */
+
+					if (ofs + body > channel_recv_limit(chn) + b_orig(&chn->buf) - ci_head(chn)) {
+						/* truncate it to whatever will fit */
+						smp->flags |= SMP_F_MAY_CHANGE;
+						body = channel_recv_limit(chn) + b_orig(&chn->buf) - ci_head(chn) - ofs;
+					}
+				}
+
+				chunk_initlen(&smp->data.u.str, ci_head(chn) + ofs, 0, body);
+				return 1;
+			}
+		}
+		ofs += body;
+	}
+
+ too_short:
+	smp->flags = SMP_F_MAY_CHANGE | SMP_F_CONST;
+	return 0;
+ no_match:
+	/* will never match (end of buffer, or bad contents) */
+	smp->flags = 0;
+	return 0;
+
+}
+
+/* This function is used to validate the arguments passed to a "distcc_param" or
+ * "distcc_body" sample fetch keyword. They take a mandatory token name of exactly
+ * 4 characters, followed by an optional occurrence number starting at 1. It is
+ * assumed that the types are already the correct ones. Returns 0 on error, non-
+ * zero if OK. If <err_msg> is not NULL, it will be filled with a pointer to an
+ * error message in case of error, that the caller is responsible for freeing.
+ * The initial location must either be freeable or NULL.
+ */
+int val_distcc(struct arg *arg, char **err_msg)
+{
+	unsigned int token;
+
+	if (arg[0].data.str.data != 4) {
+		memprintf(err_msg, "token name must be exactly 4 characters");
+		return 0;
+	}
+
+	/* convert the token name to an unsigned int (one byte per character,
+	 * big endian format).
+	 */
+	token = (arg[0].data.str.area[0] << 24) + (arg[0].data.str.area[1] << 16) +
+		(arg[0].data.str.area[2] << 8) + (arg[0].data.str.area[3] << 0);
+
+	chunk_destroy(&arg[0].data.str);
+	arg[0].type      = ARGT_SINT;
+	arg[0].data.sint = token;
+
+	if (arg[1].type != ARGT_SINT) {
+		arg[1].type      = ARGT_SINT;
+		arg[1].data.sint = 0;
 	}
 	return 1;
 }
@@ -919,6 +1333,8 @@ int val_payload_lv(struct arg *arg, char **err_msg)
  * instance IPv4/IPv6 must be declared IPv4.
  */
 static struct sample_fetch_kw_list smp_kws = {ILH, {
+	{ "distcc_body",         smp_fetch_distcc_body,    ARG2(1,STR,SINT),       val_distcc,     SMP_T_BIN,  SMP_USE_L6REQ|SMP_USE_L6RES },
+	{ "distcc_param",        smp_fetch_distcc_param,   ARG2(1,STR,SINT),       val_distcc,     SMP_T_SINT, SMP_USE_L6REQ|SMP_USE_L6RES },
 	{ "payload",             smp_fetch_payload,        ARG2(2,SINT,SINT),      NULL,           SMP_T_BIN,  SMP_USE_L6REQ|SMP_USE_L6RES },
 	{ "payload_lv",          smp_fetch_payload_lv,     ARG3(2,SINT,SINT,STR),  val_payload_lv, SMP_T_BIN,  SMP_USE_L6REQ|SMP_USE_L6RES },
 	{ "rdp_cookie",          smp_fetch_rdp_cookie,     ARG1(0,STR),            NULL,           SMP_T_STR,  SMP_USE_L6REQ },
@@ -938,6 +1354,7 @@ static struct sample_fetch_kw_list smp_kws = {ILH, {
 	{ "req.ssl_st_ext",      smp_fetch_req_ssl_st_ext, 0,                      NULL,           SMP_T_SINT, SMP_USE_L6REQ },
 	{ "req.ssl_hello_type",  smp_fetch_ssl_hello_type, 0,                      NULL,           SMP_T_SINT, SMP_USE_L6REQ },
 	{ "req.ssl_sni",         smp_fetch_ssl_hello_sni,  0,                      NULL,           SMP_T_STR,  SMP_USE_L6REQ },
+	{ "req.ssl_alpn",        smp_fetch_ssl_hello_alpn, 0,                      NULL,           SMP_T_STR,  SMP_USE_L6REQ },
 	{ "req.ssl_ver",         smp_fetch_req_ssl_ver,    0,                      NULL,           SMP_T_SINT, SMP_USE_L6REQ },
 	{ "res.len",             smp_fetch_len,            0,                      NULL,           SMP_T_SINT, SMP_USE_L6RES },
 	{ "res.payload",         smp_fetch_payload,        ARG2(2,SINT,SINT),      NULL,           SMP_T_BIN,  SMP_USE_L6RES },
@@ -947,6 +1364,7 @@ static struct sample_fetch_kw_list smp_kws = {ILH, {
 	{ /* END */ },
 }};
 
+INITCALL1(STG_REGISTER, sample_register_fetches, &smp_kws);
 
 /* Note: must not be declared <const> as its list will be overwritten.
  * Please take care of keeping this list alphabetically sorted.
@@ -962,13 +1380,7 @@ static struct acl_kw_list acl_kws = {ILH, {
 	{ /* END */ },
 }};
 
-
-__attribute__((constructor))
-static void __payload_init(void)
-{
-	sample_register_fetches(&smp_kws);
-	acl_register_keywords(&acl_kws);
-}
+INITCALL1(STG_REGISTER, acl_register_keywords, &acl_kws);
 
 /*
  * Local variables:

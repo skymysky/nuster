@@ -14,24 +14,20 @@
 #include <stdio.h>
 #include <string.h>
 
-#include <common/config.h>
-#include <common/mini-clist.h>
-#include <common/standard.h>
-#include <common/uri_auth.h>
+#include <import/ebsttree.h>
 
-#include <types/global.h>
-
-#include <proto/acl.h>
-#include <proto/arg.h>
-#include <proto/auth.h>
-#include <proto/channel.h>
-#include <proto/log.h>
-#include <proto/pattern.h>
-#include <proto/proxy.h>
-#include <proto/sample.h>
-#include <proto/stick_table.h>
-
-#include <ebsttree.h>
+#include <haproxy/acl.h>
+#include <haproxy/api.h>
+#include <haproxy/arg.h>
+#include <haproxy/auth.h>
+#include <haproxy/errors.h>
+#include <haproxy/global.h>
+#include <haproxy/list.h>
+#include <haproxy/pattern.h>
+#include <haproxy/proxy-t.h>
+#include <haproxy/sample.h>
+#include <haproxy/stick_table.h>
+#include <haproxy/tools.h>
 
 /* List head of all known ACL keywords */
 static struct acl_kw_list acl_keywords = {
@@ -89,7 +85,7 @@ struct acl_keyword *find_acl_kw(const char *kw)
 	struct acl_kw_list *kwl;
 
 	kwend = kw;
-	while (*kwend && *kwend != '(' && *kwend != ',')
+	while (is_idchar(*kwend))
 		kwend++;
 
 	list_for_each_entry(kwl, &acl_keywords.list, list) {
@@ -113,16 +109,14 @@ static struct acl_expr *prune_acl_expr(struct acl_expr *expr)
 		if (arg->type == ARGT_STOP)
 			break;
 		if (arg->type == ARGT_STR || arg->unresolved) {
-			free(arg->data.str.str);
-			arg->data.str.str = NULL;
-			arg->data.str.len = 0;
+			chunk_destroy(&arg->data.str);
 			unresolved |= arg->unresolved;
 			arg->unresolved = 0;
 		}
 	}
 
-	if (expr->smp->arg_p != empty_arg_list && !unresolved)
-		free(expr->smp->arg_p);
+	release_sample_expr(expr->smp);
+
 	return expr;
 }
 
@@ -188,30 +182,16 @@ struct acl_expr *parse_acl_expr(const char **args, char **err, struct arg_list *
 		smp->fetch = aclkw->smp;
 		smp->arg_p = empty_arg_list;
 
-		/* look for the begining of the subject arguments */
-		for (arg = args[0]; *arg && *arg != '(' && *arg != ','; arg++);
-
-		endt = arg;
-		if (*endt == '(') {
-			/* look for the end of this term and skip the opening parenthesis */
-			endt = ++arg;
-			while (*endt && *endt != ')')
-				endt++;
-			if (*endt != ')') {
-				memprintf(err, "missing closing ')' after arguments to ACL keyword '%s'", aclkw->kw);
-				goto out_free_smp;
-			}
-		}
+		/* look for the beginning of the subject arguments */
+		for (arg = args[0]; is_idchar(*arg); arg++)
+			;
 
 		/* At this point, we have :
 		 *   - args[0] : beginning of the keyword
 		 *   - arg     : end of the keyword, first character not part of keyword
-		 *               nor the opening parenthesis (so first character of args
-		 *               if present).
-		 *   - endt    : end of the term (=arg or last parenthesis if args are present)
 		 */
-		nbargs = make_arg_list(arg, endt - arg, smp->fetch->arg_mask, &smp->arg_p,
-		                       err, NULL, NULL, al);
+		nbargs = make_arg_list(arg, -1, smp->fetch->arg_mask, &smp->arg_p,
+		                       err, &endt, NULL, al);
 		if (nbargs < 0) {
 			/* note that make_arg_list will have set <err> here */
 			memprintf(err, "ACL keyword '%s' : %s", aclkw->kw, *err);
@@ -230,7 +210,7 @@ struct acl_expr *parse_acl_expr(const char **args, char **err, struct arg_list *
 		}
 		arg = endt;
 
-		/* look for the begining of the converters list. Those directly attached
+		/* look for the beginning of the converters list. Those directly attached
 		 * to the ACL keyword are found just after <arg> which points to the comma.
 		 * If we find any converter, then we don't use the ACL keyword's match
 		 * anymore but the one related to the converter's output type.
@@ -239,9 +219,8 @@ struct acl_expr *parse_acl_expr(const char **args, char **err, struct arg_list *
 		while (*arg) {
 			struct sample_conv *conv;
 			struct sample_conv_expr *conv_expr;
-
-			if (*arg == ')') /* skip last closing parenthesis */
-				arg++;
+			int err_arg;
+			int argcnt;
 
 			if (*arg && *arg != ',') {
 				if (ckw)
@@ -253,6 +232,9 @@ struct acl_expr *parse_acl_expr(const char **args, char **err, struct arg_list *
 				goto out_free_smp;
 			}
 
+			/* FIXME: how long should we support such idiocies ? Maybe we
+			 * should already warn ?
+			 */
 			while (*arg == ',') /* then trailing commas */
 				arg++;
 
@@ -262,7 +244,8 @@ struct acl_expr *parse_acl_expr(const char **args, char **err, struct arg_list *
 				/* none ? end of converters */
 				break;
 
-			for (endw = begw; *endw && *endw != '(' && *endw != ','; endw++);
+			for (endw = begw; is_idchar(*endw); endw++)
+				;
 
 			free(ckw);
 			ckw = my_strndup(begw, endw - begw);
@@ -276,16 +259,6 @@ struct acl_expr *parse_acl_expr(const char **args, char **err, struct arg_list *
 			}
 
 			arg = endw;
-			if (*arg == '(') {
-				/* look for the end of this term */
-				while (*arg && *arg != ')')
-					arg++;
-				if (*arg != ')') {
-					memprintf(err, "ACL keyword '%s' : syntax error: missing ')' after converter '%s'.",
-						  aclkw->kw, ckw);
-					goto out_free_smp;
-				}
-			}
 
 			if (conv->in_type >= SMP_TYPES || conv->out_type >= SMP_TYPES) {
 				memprintf(err, "ACL keyword '%s' : returns type of converter '%s' is unknown.",
@@ -309,38 +282,31 @@ struct acl_expr *parse_acl_expr(const char **args, char **err, struct arg_list *
 			conv_expr->conv = conv;
 			acl_conv_found = 1;
 
-			if (arg != endw) {
-				int err_arg;
-
-				if (!conv->arg_mask) {
-					memprintf(err, "ACL keyword '%s' : converter '%s' does not support any args.",
-						  aclkw->kw, ckw);
-					goto out_free_smp;
-				}
-
-				al->kw = smp->fetch->kw;
-				al->conv = conv_expr->conv->kw;
-				if (make_arg_list(endw + 1, arg - endw - 1, conv->arg_mask, &conv_expr->arg_p, err, NULL, &err_arg, al) < 0) {
-					memprintf(err, "ACL keyword '%s' : invalid arg %d in converter '%s' : %s.",
-						  aclkw->kw, err_arg+1, ckw, *err);
-					goto out_free_smp;
-				}
-
-				if (!conv_expr->arg_p)
-					conv_expr->arg_p = empty_arg_list;
-
-				if (conv->val_args && !conv->val_args(conv_expr->arg_p, conv, file, line, err)) {
-					memprintf(err, "ACL keyword '%s' : invalid args in converter '%s' : %s.",
-						  aclkw->kw, ckw, *err);
-					goto out_free_smp;
-				}
+			al->kw = smp->fetch->kw;
+			al->conv = conv_expr->conv->kw;
+			argcnt = make_arg_list(endw, -1, conv->arg_mask, &conv_expr->arg_p, err, &arg, &err_arg, al);
+			if (argcnt < 0) {
+				memprintf(err, "ACL keyword '%s' : invalid arg %d in converter '%s' : %s.",
+				          aclkw->kw, err_arg+1, ckw, *err);
+				goto out_free_smp;
 			}
-			else if (ARGM(conv->arg_mask)) {
-				memprintf(err, "ACL keyword '%s' : missing args for converter '%s'.",
-					  aclkw->kw, ckw);
+
+			if (argcnt && !conv->arg_mask) {
+				memprintf(err, "converter '%s' does not support any args", ckw);
+				goto out_free_smp;
+			}
+
+			if (!conv_expr->arg_p)
+				conv_expr->arg_p = empty_arg_list;
+
+			if (conv->val_args && !conv->val_args(conv_expr->arg_p, conv, file, line, err)) {
+				memprintf(err, "ACL keyword '%s' : invalid args in converter '%s' : %s.",
+					  aclkw->kw, ckw, *err);
 				goto out_free_smp;
 			}
 		}
+		free(ckw);
+		ckw = NULL;
 	}
 	else {
 		/* This is not an ACL keyword, so we hope this is a sample fetch
@@ -348,7 +314,7 @@ struct acl_expr *parse_acl_expr(const char **args, char **err, struct arg_list *
 		 * so, we retrieve a completely parsed expression with args and
 		 * convs already done.
 		 */
-		smp = sample_parse_expr((char **)args, &idx, file, line, err, al);
+		smp = sample_parse_expr((char **)args, &idx, file, line, err, al, NULL);
 		if (!smp) {
 			memprintf(err, "%s in ACL expression '%s'", *err, *args);
 			goto out_return;
@@ -359,7 +325,7 @@ struct acl_expr *parse_acl_expr(const char **args, char **err, struct arg_list *
 	expr = calloc(1, sizeof(*expr));
 	if (!expr) {
 		memprintf(err, "out of memory when parsing ACL expression");
-		goto out_return;
+		goto out_free_smp;
 	}
 
 	pattern_init_head(&expr->pat);
@@ -374,7 +340,6 @@ struct acl_expr *parse_acl_expr(const char **args, char **err, struct arg_list *
 		expr->pat.parse  = aclkw->parse  ? aclkw->parse  : pat_parse_fcts[aclkw->match_type];
 		expr->pat.index  = aclkw->index  ? aclkw->index  : pat_index_fcts[aclkw->match_type];
 		expr->pat.match  = aclkw->match  ? aclkw->match  : pat_match_fcts[aclkw->match_type];
-		expr->pat.delete = aclkw->delete ? aclkw->delete : pat_delete_fcts[aclkw->match_type];
 		expr->pat.prune  = aclkw->prune  ? aclkw->prune  : pat_prune_fcts[aclkw->match_type];
 	}
 
@@ -388,7 +353,6 @@ struct acl_expr *parse_acl_expr(const char **args, char **err, struct arg_list *
 			expr->pat.parse = pat_parse_fcts[PAT_MATCH_BOOL];
 			expr->pat.index = pat_index_fcts[PAT_MATCH_BOOL];
 			expr->pat.match = pat_match_fcts[PAT_MATCH_BOOL];
-			expr->pat.delete = pat_delete_fcts[PAT_MATCH_BOOL];
 			expr->pat.prune = pat_prune_fcts[PAT_MATCH_BOOL];
 			expr->pat.expect_type = pat_match_types[PAT_MATCH_BOOL];
 			break;
@@ -396,16 +360,15 @@ struct acl_expr *parse_acl_expr(const char **args, char **err, struct arg_list *
 			expr->pat.parse = pat_parse_fcts[PAT_MATCH_INT];
 			expr->pat.index = pat_index_fcts[PAT_MATCH_INT];
 			expr->pat.match = pat_match_fcts[PAT_MATCH_INT];
-			expr->pat.delete = pat_delete_fcts[PAT_MATCH_INT];
 			expr->pat.prune = pat_prune_fcts[PAT_MATCH_INT];
 			expr->pat.expect_type = pat_match_types[PAT_MATCH_INT];
 			break;
+		case SMP_T_ADDR:
 		case SMP_T_IPV4:
 		case SMP_T_IPV6:
 			expr->pat.parse = pat_parse_fcts[PAT_MATCH_IP];
 			expr->pat.index = pat_index_fcts[PAT_MATCH_IP];
 			expr->pat.match = pat_match_fcts[PAT_MATCH_IP];
-			expr->pat.delete = pat_delete_fcts[PAT_MATCH_IP];
 			expr->pat.prune = pat_prune_fcts[PAT_MATCH_IP];
 			expr->pat.expect_type = pat_match_types[PAT_MATCH_IP];
 			break;
@@ -413,7 +376,6 @@ struct acl_expr *parse_acl_expr(const char **args, char **err, struct arg_list *
 			expr->pat.parse = pat_parse_fcts[PAT_MATCH_STR];
 			expr->pat.index = pat_index_fcts[PAT_MATCH_STR];
 			expr->pat.match = pat_match_fcts[PAT_MATCH_STR];
-			expr->pat.delete = pat_delete_fcts[PAT_MATCH_STR];
 			expr->pat.prune = pat_prune_fcts[PAT_MATCH_STR];
 			expr->pat.expect_type = pat_match_types[PAT_MATCH_STR];
 			break;
@@ -422,13 +384,13 @@ struct acl_expr *parse_acl_expr(const char **args, char **err, struct arg_list *
 
 	/* Additional check to protect against common mistakes */
 	if (expr->pat.parse && cur_type != SMP_T_BOOL && !*args[1]) {
-		Warning("parsing acl keyword '%s' :\n"
-		        "  no pattern to match against were provided, so this ACL will never match.\n"
-		        "  If this is what you intended, please add '--' to get rid of this warning.\n"
-		        "  If you intended to match only for existence, please use '-m found'.\n"
-		        "  If you wanted to force an int to match as a bool, please use '-m bool'.\n"
-		        "\n",
-		        args[0]);
+		ha_warning("parsing acl keyword '%s' :\n"
+			   "  no pattern to match against were provided, so this ACL will never match.\n"
+			   "  If this is what you intended, please add '--' to get rid of this warning.\n"
+			   "  If you intended to match only for existence, please use '-m found'.\n"
+			   "  If you wanted to force an int to match as a bool, please use '-m bool'.\n"
+			   "\n",
+			   args[0]);
 	}
 
 	args++;
@@ -498,7 +460,6 @@ struct acl_expr *parse_acl_expr(const char **args, char **err, struct arg_list *
 			expr->pat.parse = pat_parse_fcts[idx];
 			expr->pat.index = pat_index_fcts[idx];
 			expr->pat.match = pat_match_fcts[idx];
-			expr->pat.delete = pat_delete_fcts[idx];
 			expr->pat.prune = pat_prune_fcts[idx];
 			expr->pat.expect_type = pat_match_types[idx];
 			args++;
@@ -525,11 +486,12 @@ struct acl_expr *parse_acl_expr(const char **args, char **err, struct arg_list *
 	}
 
 	/* Create displayed reference */
-	snprintf(trash.str, trash.size, "acl '%s' file '%s' line %d", expr->kw, file, line);
-	trash.str[trash.size - 1] = '\0';
+	snprintf(trash.area, trash.size, "acl '%s' file '%s' line %d",
+		 expr->kw, file, line);
+	trash.area[trash.size - 1] = '\0';
 
-	/* Create new patern reference. */
-	ref = pat_ref_newid(unique_id, trash.str, PAT_REF_ACL);
+	/* Create new pattern reference. */
+	ref = pat_ref_newid(unique_id, trash.area, PAT_REF_ACL);
 	if (!ref) {
 		memprintf(err, "memory error");
 		goto out_free_expr;
@@ -546,7 +508,7 @@ struct acl_expr *parse_acl_expr(const char **args, char **err, struct arg_list *
 
 		/* Compatibility layer. Each pattern can parse only one string per pattern,
 		 * but the pat_parser_int() and pat_parse_dotted_ver() parsers were need
-		 * optionnaly two operators. The first operator is the match method: eq,
+		 * optionally two operators. The first operator is the match method: eq,
 		 * le, lt, ge and gt. pat_parse_int() and pat_parse_dotted_ver() functions
 		 * can have a compatibility syntax based on ranges:
 		 *
@@ -637,6 +599,7 @@ struct acl_expr *parse_acl_expr(const char **args, char **err, struct arg_list *
 
 				case STD_OP_GT:
 					value++; /* gt = ge + 1 */
+					/* fall through */
 
 				case STD_OP_GE:
 					if (expr->pat.parse == pat_parse_int)
@@ -649,6 +612,7 @@ struct acl_expr *parse_acl_expr(const char **args, char **err, struct arg_list *
 
 				case STD_OP_LT:
 					value--; /* lt = le - 1 */
+					/* fall through */
 
 				case STD_OP_LE:
 					if (expr->pat.parse == pat_parse_int)
@@ -675,8 +639,8 @@ struct acl_expr *parse_acl_expr(const char **args, char **err, struct arg_list *
  out_free_expr:
 	prune_acl_expr(expr);
 	free(expr);
-	free(ckw);
  out_free_smp:
+	free(ckw);
 	free(smp);
  out_return:
 	return NULL;
@@ -733,12 +697,12 @@ struct acl *parse_acl(const char **args, struct list *known_acl, char **err, str
 	 * emit a warning, so let's do so.
 	 */
 	if (!strchr(args[1], '(') && *args[2] == '(')
-		Warning("parsing acl '%s' :\n"
-			"  matching '%s' for pattern '%s' is likely a mistake and probably\n"
-			"  not what you want. Maybe you need to remove the extraneous space before '('.\n"
-			"  If you are really sure this is not an error, please insert '--' between the\n"
-			"  match and the pattern to make this warning message disappear.\n",
-			args[0], args[1], args[2]);
+		ha_warning("parsing acl '%s' :\n"
+			   "  matching '%s' for pattern '%s' is likely a mistake and probably\n"
+			   "  not what you want. Maybe you need to remove the extraneous space before '('.\n"
+			   "  If you are really sure this is not an error, please insert '--' between the\n"
+			   "  match and the pattern to make this warning message disappear.\n",
+			   args[0], args[1], args[2]);
 
 	if (*args[0])
 		cur_acl = find_acl_by_name(args[0], known_acl);
@@ -980,7 +944,6 @@ struct acl_cond *parse_acl_cond(const char **args, struct list *known_acl,
 				/* note that parse_acl() must have filled <err> here */
 				goto out_free_suite;
 			}
-			word = args[arg + 1];
 			arg = arg_end;
 		}
 		else {
@@ -1054,7 +1017,8 @@ struct acl_cond *parse_acl_cond(const char **args, struct list *known_acl,
  * caller is responsible for freeing. The initial location must either be
  * freeable or NULL.
  */
-struct acl_cond *build_acl_cond(const char *file, int line, struct proxy *px, const char **args, char **err)
+struct acl_cond *build_acl_cond(const char *file, int line, struct list *known_acl,
+				struct proxy *px, const char **args, char **err)
 {
 	enum acl_cond_pol pol = ACL_COND_NONE;
 	struct acl_cond *cond = NULL;
@@ -1062,11 +1026,11 @@ struct acl_cond *build_acl_cond(const char *file, int line, struct proxy *px, co
 	if (err)
 		*err = NULL;
 
-	if (!strcmp(*args, "if")) {
+	if (strcmp(*args, "if") == 0) {
 		pol = ACL_COND_IF;
 		args++;
 	}
-	else if (!strcmp(*args, "unless")) {
+	else if (strcmp(*args, "unless") == 0) {
 		pol = ACL_COND_UNLESS;
 		args++;
 	}
@@ -1075,7 +1039,7 @@ struct acl_cond *build_acl_cond(const char *file, int line, struct proxy *px, co
 		return NULL;
 	}
 
-	cond = parse_acl_cond(args, &px->acl, pol, err, &px->conf.args, file, line);
+	cond = parse_acl_cond(args, known_acl, pol, err, &px->conf.args, file, line);
 	if (!cond) {
 		/* note that parse_acl_cond must have filled <err> here */
 		return NULL;
@@ -1265,20 +1229,21 @@ int acl_find_targets(struct proxy *p)
 
 	list_for_each_entry(acl, &p->acl, list) {
 		list_for_each_entry(expr, &acl->expr, list) {
-			if (!strcmp(expr->kw, "http_auth_group")) {
+			if (strcmp(expr->kw, "http_auth_group") == 0) {
 				/* Note: the ARGT_USR argument may only have been resolved earlier
 				 * by smp_resolve_args().
 				 */
 				if (expr->smp->arg_p->unresolved) {
-					Alert("Internal bug in proxy %s: %sacl %s %s() makes use of unresolved userlist '%s'. Please report this.\n",
-					      p->id, *acl->name ? "" : "anonymous ", acl->name, expr->kw, expr->smp->arg_p->data.str.str);
+					ha_alert("Internal bug in proxy %s: %sacl %s %s() makes use of unresolved userlist '%s'. Please report this.\n",
+						 p->id, *acl->name ? "" : "anonymous ", acl->name, expr->kw,
+						 expr->smp->arg_p->data.str.area);
 					cfgerr++;
 					continue;
 				}
 
 				if (LIST_ISEMPTY(&expr->pat.head)) {
-					Alert("proxy %s: acl %s %s(): no groups specified.\n",
-						p->id, acl->name, expr->kw);
+					ha_alert("proxy %s: acl %s %s(): no groups specified.\n",
+						 p->id, acl->name, expr->kw);
 					cfgerr++;
 					continue;
 				}
@@ -1286,8 +1251,8 @@ int acl_find_targets(struct proxy *p)
 				/* For each pattern, check if the group exists. */
 				list_for_each_entry(pexp, &expr->pat.head, list) {
 					if (LIST_ISEMPTY(&pexp->expr->patterns)) {
-						Alert("proxy %s: acl %s %s(): no groups specified.\n",
-							p->id, acl->name, expr->kw);
+						ha_alert("proxy %s: acl %s %s(): no groups specified.\n",
+							 p->id, acl->name, expr->kw);
 						cfgerr++;
 						continue;
 					}
@@ -1295,8 +1260,8 @@ int acl_find_targets(struct proxy *p)
 					list_for_each_entry(pattern, &pexp->expr->patterns, list) {
 						/* this keyword only has one argument */
 						if (!check_group(expr->smp->arg_p->data.usr, pattern->pat.ptr.str)) {
-							Alert("proxy %s: acl %s %s(): invalid group '%s'.\n",
-							      p->id, acl->name, expr->kw, pattern->pat.ptr.str);
+							ha_alert("proxy %s: acl %s %s(): invalid group '%s'.\n",
+								 p->id, acl->name, expr->kw, pattern->pat.ptr.str);
 							cfgerr++;
 						}
 					}
@@ -1327,8 +1292,8 @@ int init_acl()
 
 			smp = find_sample_fetch(name, strlen(name));
 			if (!smp) {
-				Alert("Critical internal error: ACL keyword '%s' relies on sample fetch '%s' which was not registered!\n",
-				      kwl->kw[index].kw, name);
+				ha_alert("Critical internal error: ACL keyword '%s' relies on sample fetch '%s' which was not registered!\n",
+					 kwl->kw[index].kw, name);
 				err++;
 				continue;
 			}
@@ -1349,12 +1314,7 @@ static struct acl_kw_list acl_kws = {ILH, {
 	{ /* END */ },
 }};
 
-__attribute__((constructor))
-static void __acl_init(void)
-{
-	acl_register_keywords(&acl_kws);
-}
-
+INITCALL1(STG_REGISTER, acl_register_keywords, &acl_kws);
 
 /*
  * Local variables:

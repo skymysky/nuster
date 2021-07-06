@@ -15,10 +15,9 @@
 #include <stdio.h>
 #include <string.h>
 
-#include <common/config.h>
-#include <common/buffer.h>
-
-#include <proto/channel.h>
+#include <haproxy/api.h>
+#include <haproxy/buf.h>
+#include <haproxy/channel.h>
 
 
 /* Schedule up to <bytes> more bytes to be forwarded via the channel without
@@ -38,7 +37,7 @@ unsigned long long __channel_forward(struct channel *chn, unsigned long long byt
 	 * regular code paths.
 	 */
 	if (unlikely(chn->to_forward == CHN_INFINITE_FORWARD)) {
-		b_adv(chn->buf, chn->buf->i);
+		c_adv(chn, ci_data(chn));
 		return bytes;
 	}
 
@@ -48,8 +47,8 @@ unsigned long long __channel_forward(struct channel *chn, unsigned long long byt
 	budget = MIN(bytes, CHN_INFINITE_FORWARD - 1);
 
 	/* transfer as much as we can of buf->i */
-	forwarded = MIN(chn->buf->i, budget);
-	b_adv(chn->buf, forwarded);
+	forwarded = MIN(ci_data(chn), budget);
+	c_adv(chn, forwarded);
 	budget -= forwarded;
 
 	if (!budget)
@@ -75,14 +74,14 @@ unsigned long long __channel_forward(struct channel *chn, unsigned long long byt
  * data. Note: this function appends data to the buffer's output and possibly
  * overwrites any pending input data which are assumed not to exist.
  */
-int bo_inject(struct channel *chn, const char *msg, int len)
+int co_inject(struct channel *chn, const char *msg, int len)
 {
 	int max;
 
 	if (len == 0)
 		return -1;
 
-	if (len < 0 || len > chn->buf->size) {
+	if (len < 0 || len > c_size(chn)) {
 		/* we can't write this chunk and will never be able to, because
 		 * it is larger than the buffer. This must be reported as an
 		 * error. Then we return -2 so that writers that don't care can
@@ -91,14 +90,14 @@ int bo_inject(struct channel *chn, const char *msg, int len)
 		return -2;
 	}
 
-	buffer_realign(chn->buf);
-	max = bo_contig_space(chn->buf);
+	c_realign_if_empty(chn);
+	max = b_contig_space(&chn->buf);
 	if (len > max)
 		return max;
 
-	memcpy(chn->buf->p, msg, len);
-	chn->buf->o += len;
-	chn->buf->p = b_ptr(chn->buf, len);
+	memcpy(co_tail(chn), msg, len);
+	b_add(&chn->buf, len);
+	c_adv(chn, len);
 	chn->total += len;
 	return -1;
 }
@@ -109,7 +108,7 @@ int bo_inject(struct channel *chn, const char *msg, int len)
  * buffer, -1 is returned. Otherwise the number of bytes copied is returned
  * (1). Channel flag READ_PARTIAL is updated if some data can be transferred.
  */
-int bi_putchr(struct channel *chn, char c)
+int ci_putchr(struct channel *chn, char c)
 {
 	if (unlikely(channel_input_closed(chn)))
 		return -2;
@@ -117,15 +116,15 @@ int bi_putchr(struct channel *chn, char c)
 	if (!channel_may_recv(chn))
 		return -1;
 
-	*bi_end(chn->buf) = c;
+	*ci_tail(chn) = c;
 
-	chn->buf->i++;
+	b_add(&chn->buf, 1);
 	chn->flags |= CF_READ_PARTIAL;
 
 	if (chn->to_forward >= 1) {
 		if (chn->to_forward != CHN_INFINITE_FORWARD)
 			chn->to_forward--;
-		b_adv(chn->buf, 1);
+		c_adv(chn, 1);
 	}
 
 	chn->total++;
@@ -140,7 +139,7 @@ int bi_putchr(struct channel *chn, char c)
  * number). Channel flag READ_PARTIAL is updated if some data can be
  * transferred.
  */
-int bi_putblk(struct channel *chn, const char *blk, int len)
+int ci_putblk(struct channel *chn, const char *blk, int len)
 {
 	int max;
 
@@ -151,7 +150,7 @@ int bi_putblk(struct channel *chn, const char *blk, int len)
 		return -3;
 
 	max = channel_recv_limit(chn);
-	if (unlikely(len > max - buffer_len(chn->buf))) {
+	if (unlikely(len > max - c_data(chn))) {
 		/* we can't write this chunk right now because the buffer is
 		 * almost full or because the block is too large. Return the
 		 * available space or -2 if impossible.
@@ -166,82 +165,27 @@ int bi_putblk(struct channel *chn, const char *blk, int len)
 		return 0;
 
 	/* OK so the data fits in the buffer in one or two blocks */
-	max = bi_contig_space(chn->buf);
-	memcpy(bi_end(chn->buf), blk, MIN(len, max));
+	max = b_contig_space(&chn->buf);
+	memcpy(ci_tail(chn), blk, MIN(len, max));
 	if (len > max)
-		memcpy(chn->buf->data, blk + max, len - max);
+		memcpy(c_orig(chn), blk + max, len - max);
 
-	chn->buf->i += len;
-	chn->total += len;
-	if (chn->to_forward) {
-		unsigned long fwd = len;
-		if (chn->to_forward != CHN_INFINITE_FORWARD) {
-			if (fwd > chn->to_forward)
-				fwd = chn->to_forward;
-			chn->to_forward -= fwd;
-		}
-		b_adv(chn->buf, fwd);
-	}
-
-	/* notify that some data was read from the SI into the buffer */
-	chn->flags |= CF_READ_PARTIAL;
+	b_add(&chn->buf, len);
+	channel_add_input(chn, len);
 	return len;
 }
 
-/* Tries to copy the whole buffer <buf> into the channel's buffer after length
- * controls. It will only succeed if the target buffer is empty, in which case
- * it will simply swap the buffers. The buffer not attached to the channel is
- * returned so that the caller can store it locally. The chn->buf->o and
- * to_forward pointers are updated. If the output buffer is a dummy buffer or
- * if it still contains data <buf> is returned, indicating that nothing could
- * be done. Channel flag READ_PARTIAL is updated if some data can be transferred.
- * The chunk's length is updated with the number of bytes sent. On errors, NULL
- * is returned. Note that only buf->i is considered.
- */
-struct buffer *bi_swpbuf(struct channel *chn, struct buffer *buf)
-{
-	struct buffer *old;
-
-	if (unlikely(channel_input_closed(chn)))
-		return NULL;
-
-	if (!chn->buf->size || !buffer_empty(chn->buf))
-		return buf;
-
-	old = chn->buf;
-	chn->buf = buf;
-
-	if (!buf->i)
-		return old;
-
-	chn->total += buf->i;
-
-	if (chn->to_forward) {
-		unsigned long fwd = buf->i;
-		if (chn->to_forward != CHN_INFINITE_FORWARD) {
-			if (fwd > chn->to_forward)
-				fwd = chn->to_forward;
-			chn->to_forward -= fwd;
-		}
-		b_adv(chn->buf, fwd);
-	}
-
-	/* notify that some data was read from the SI into the buffer */
-	chn->flags |= CF_READ_PARTIAL;
-	return old;
-}
-
-/* Gets one text line out of a channel's buffer from a stream interface.
+/* Gets one text word out of a channel's buffer from a stream interface.
  * Return values :
- *   >0 : number of bytes read. Includes the \n if present before len or end.
- *   =0 : no '\n' before end found. <str> is left undefined.
+ *   >0 : number of bytes read. Includes the sep if present before len or end.
+ *   =0 : no sep before end found. <str> is left undefined.
  *   <0 : no more bytes readable because output is shut.
- * The channel status is not changed. The caller must call bo_skip() to
- * update it. The '\n' is waited for as long as neither the buffer nor the
- * output are full. If either of them is full, the string may be returned
- * as is, without the '\n'.
+ * The channel status is not changed. The caller must call co_skip() to
+ * update it. The line separator is waited for as long as neither the buffer
+ * nor the output are full. If either of them is full, the string may be
+ * returned as is, without the line separator.
  */
-int bo_getline(struct channel *chn, char *str, int len)
+int co_getword(const struct channel *chn, char *str, int len, char sep)
 {
 	int ret, max;
 	char *p;
@@ -256,10 +200,61 @@ int bo_getline(struct channel *chn, char *str, int len)
 		goto out;
 	}
 
-	p = bo_ptr(chn->buf);
+	p = co_head(chn);
 
-	if (max > chn->buf->o) {
-		max = chn->buf->o;
+	if (max > co_data(chn)) {
+		max = co_data(chn);
+		str[max-1] = 0;
+	}
+	while (max) {
+		*str++ = *p;
+		ret++;
+		max--;
+
+		if (*p == sep)
+			break;
+		p = b_next(&chn->buf, p);
+	}
+	if (ret > 0 && ret < len &&
+	    (ret < co_data(chn) || channel_may_recv(chn)) &&
+	    *(str-1) != sep &&
+	    !(chn->flags & (CF_SHUTW|CF_SHUTW_NOW)))
+		ret = 0;
+ out:
+	if (max)
+		*str = 0;
+	return ret;
+}
+
+/* Gets one text line out of a channel's buffer from a stream interface.
+ * Return values :
+ *   >0 : number of bytes read. Includes the \n if present before len or end.
+ *   =0 : no '\n' before end found. <str> is left undefined.
+ *   <0 : no more bytes readable because output is shut.
+ * The channel status is not changed. The caller must call co_skip() to
+ * update it. The '\n' is waited for as long as neither the buffer nor the
+ * output are full. If either of them is full, the string may be returned
+ * as is, without the '\n'.
+ */
+int co_getline(const struct channel *chn, char *str, int len)
+{
+	int ret, max;
+	char *p;
+
+	ret = 0;
+	max = len;
+
+	/* closed or empty + imminent close = -1; empty = 0 */
+	if (unlikely((chn->flags & CF_SHUTW) || channel_is_empty(chn))) {
+		if (chn->flags & (CF_SHUTW|CF_SHUTW_NOW))
+			ret = -1;
+		goto out;
+	}
+
+	p = co_head(chn);
+
+	if (max > co_data(chn)) {
+		max = co_data(chn);
 		str[max-1] = 0;
 	}
 	while (max) {
@@ -269,10 +264,10 @@ int bo_getline(struct channel *chn, char *str, int len)
 
 		if (*p == '\n')
 			break;
-		p = buffer_wrap_add(chn->buf, p + 1);
+		p = b_next(&chn->buf, p);
 	}
 	if (ret > 0 && ret < len &&
-	    (ret < chn->buf->o || channel_may_recv(chn)) &&
+	    (ret < co_data(chn) || channel_may_recv(chn)) &&
 	    *(str-1) != '\n' &&
 	    !(chn->flags & (CF_SHUTW|CF_SHUTW_NOW)))
 		ret = 0;
@@ -282,41 +277,49 @@ int bo_getline(struct channel *chn, char *str, int len)
 	return ret;
 }
 
-/* Gets one full block of data at once from a channel's buffer, optionally from
- * a specific offset. Return values :
- *   >0 : number of bytes read, equal to requested size.
- *   =0 : not enough data available. <blk> is left undefined.
+/* Gets one char of data from a channel's buffer,
+ * Return values :
+ *    1 : number of bytes read, equal to requested size.
+ *   =0 : not enough data available. <c> is left undefined.
  *   <0 : no more bytes readable because output is shut.
- * The channel status is not changed. The caller must call bo_skip() to
+ * The channel status is not changed. The caller must call co_skip() to
  * update it.
  */
-int bo_getblk(struct channel *chn, char *blk, int len, int offset)
+int co_getchar(const struct channel *chn, char *c)
 {
-	int firstblock;
-
 	if (chn->flags & CF_SHUTW)
 		return -1;
 
-	if (len + offset > chn->buf->o) {
+	if (unlikely(co_data(chn) == 0)) {
 		if (chn->flags & (CF_SHUTW|CF_SHUTW_NOW))
 			return -1;
 		return 0;
 	}
 
-	firstblock = chn->buf->data + chn->buf->size - bo_ptr(chn->buf);
-	if (firstblock > offset) {
-		if (firstblock >= len + offset) {
-			memcpy(blk, bo_ptr(chn->buf) + offset, len);
-			return len;
-		}
+	*c = *(co_head(chn));
+	return 1;
+}
 
-		memcpy(blk, bo_ptr(chn->buf) + offset, firstblock - offset);
-		memcpy(blk + firstblock - offset, chn->buf->data, len - firstblock + offset);
-		return len;
+/* Gets one full block of data at once from a channel's buffer, optionally from
+ * a specific offset. Return values :
+ *   >0 : number of bytes read, equal to requested size.
+ *   =0 : not enough data available. <blk> is left undefined.
+ *   <0 : no more bytes readable because output is shut.
+ * The channel status is not changed. The caller must call co_skip() to
+ * update it.
+ */
+int co_getblk(const struct channel *chn, char *blk, int len, int offset)
+{
+	if (chn->flags & CF_SHUTW)
+		return -1;
+
+	if (len + offset > co_data(chn)) {
+		if (chn->flags & (CF_SHUTW|CF_SHUTW_NOW))
+			return -1;
+		return 0;
 	}
 
-	memcpy(blk, chn->buf->data + offset - firstblock, len);
-	return len;
+	return b_getblk(&chn->buf, blk, len, offset);
 }
 
 /* Gets one or two blocks of data at once from a channel's output buffer.
@@ -324,28 +327,18 @@ int bo_getblk(struct channel *chn, char *blk, int len, int offset)
  *   >0 : number of blocks filled (1 or 2). blk1 is always filled before blk2.
  *   =0 : not enough data available. <blk*> are left undefined.
  *   <0 : no more bytes readable because output is shut.
- * The channel status is not changed. The caller must call bo_skip() to
+ * The channel status is not changed. The caller must call co_skip() to
  * update it. Unused buffers are left in an undefined state.
  */
-int bo_getblk_nc(struct channel *chn, char **blk1, int *len1, char **blk2, int *len2)
+int co_getblk_nc(const struct channel *chn, const char **blk1, size_t *len1, const char **blk2, size_t *len2)
 {
-	if (unlikely(chn->buf->o == 0)) {
-		if (chn->flags & CF_SHUTW)
+	if (unlikely(co_data(chn) == 0)) {
+		if (chn->flags & (CF_SHUTW|CF_SHUTW_NOW))
 			return -1;
 		return 0;
 	}
 
-	if (unlikely(chn->buf->p - chn->buf->o < chn->buf->data)) {
-		*blk1 = chn->buf->p - chn->buf->o + chn->buf->size;
-		*len1 = chn->buf->data + chn->buf->size - *blk1;
-		*blk2 = chn->buf->data;
-		*len2 = chn->buf->p - chn->buf->data;
-		return 2;
-	}
-
-	*blk1 = chn->buf->p - chn->buf->o;
-	*len1 = chn->buf->o;
-	return 1;
+	return b_getblk_nc(&chn->buf, blk1, len1, blk2, len2, 0, co_data(chn));
 }
 
 /* Gets one text line out of a channel's output buffer from a stream interface.
@@ -357,15 +350,15 @@ int bo_getblk_nc(struct channel *chn, char **blk1, int *len1, char **blk2, int *
  * full. If either of them is full, the string may be returned as is, without
  * the '\n'. Unused buffers are left in an undefined state.
  */
-int bo_getline_nc(struct channel *chn,
-                  char **blk1, int *len1,
-                  char **blk2, int *len2)
+int co_getline_nc(const struct channel *chn,
+                  const char **blk1, size_t *len1,
+                  const char **blk2, size_t *len2)
 {
 	int retcode;
 	int l;
 
-	retcode = bo_getblk_nc(chn, blk1, len1, blk2, len2);
-	if (unlikely(retcode) <= 0)
+	retcode = co_getblk_nc(chn, blk1, len1, blk2, len2);
+	if (unlikely(retcode <= 0))
 		return retcode;
 
 	for (l = 0; l < *len1 && (*blk1)[l] != '\n'; l++);
@@ -382,7 +375,7 @@ int bo_getline_nc(struct channel *chn,
 		}
 	}
 
-	if (chn->flags & CF_SHUTW) {
+	if (chn->flags & (CF_SHUTW|CF_SHUTW_NOW)) {
 		/* If we have found no LF and the buffer is shut, then
 		 * the resulting string is made of the concatenation of
 		 * the pending blocks (1 or 2).
@@ -401,26 +394,26 @@ int bo_getline_nc(struct channel *chn,
  *   =0 : not enough data available.
  *   <0 : no more bytes readable because input is shut.
  */
-int bi_getblk_nc(struct channel *chn,
-                 char **blk1, int *len1,
-                 char **blk2, int *len2)
+int ci_getblk_nc(const struct channel *chn,
+                 char **blk1, size_t *len1,
+                 char **blk2, size_t *len2)
 {
-	if (unlikely(chn->buf->i == 0)) {
+	if (unlikely(ci_data(chn) == 0)) {
 		if (chn->flags & CF_SHUTR)
 			return -1;
 		return 0;
 	}
 
-	if (unlikely(chn->buf->p + chn->buf->i > chn->buf->data + chn->buf->size)) {
-		*blk1 = chn->buf->p;
-		*len1 = chn->buf->data + chn->buf->size - chn->buf->p;
-		*blk2 = chn->buf->data;
-		*len2 = chn->buf->i - *len1;
+	if (unlikely(ci_head(chn) + ci_data(chn) > c_wrap(chn))) {
+		*blk1 = ci_head(chn);
+		*len1 = c_wrap(chn) - ci_head(chn);
+		*blk2 = c_orig(chn);
+		*len2 = ci_data(chn) - *len1;
 		return 2;
 	}
 
-	*blk1 = chn->buf->p;
-	*len1 = chn->buf->i;
+	*blk1 = ci_head(chn);
+	*len1 = ci_data(chn);
 	return 1;
 }
 
@@ -433,14 +426,14 @@ int bi_getblk_nc(struct channel *chn,
  * full. If either of them is full, the string may be returned as is, without
  * the '\n'. Unused buffers are left in an undefined state.
  */
-int bi_getline_nc(struct channel *chn,
-                  char **blk1, int *len1,
-                  char **blk2, int *len2)
+int ci_getline_nc(const struct channel *chn,
+                  char **blk1, size_t *len1,
+                  char **blk2, size_t *len2)
 {
 	int retcode;
 	int l;
 
-	retcode = bi_getblk_nc(chn, blk1, len1, blk2, len2);
+	retcode = ci_getblk_nc(chn, blk1, len1, blk2, len2);
 	if (unlikely(retcode <= 0))
 		return retcode;
 
@@ -468,6 +461,41 @@ int bi_getline_nc(struct channel *chn,
 
 	/* No LF yet and not shut yet */
 	return 0;
+}
+
+/* Inserts <str> followed by "\r\n" at position <pos> relative to channel <c>'s
+ * input head. The <len> argument informs about the length of string <str> so
+ * that we don't have to measure it. <str> must be a valid pointer and must not
+ * include the trailing "\r\n".
+ *
+ * The number of bytes added is returned on success. 0 is returned on failure.
+ */
+int ci_insert_line2(struct channel *c, int pos, const char *str, int len)
+{
+	struct buffer *b = &c->buf;
+	char *dst = c_ptr(c, pos);
+	int delta;
+
+	delta = len + 2;
+
+	if (__b_tail(b) + delta >= b_wrap(b))
+		return 0;  /* no space left */
+
+	if (b_data(b) &&
+	    b_tail(b) + delta > b_head(b) &&
+	    b_head(b) >= b_tail(b))
+		return 0;  /* no space left before wrapping data */
+
+	/* first, protect the end of the buffer */
+	memmove(dst + delta, dst, b_tail(b) - dst);
+
+	/* now, copy str over dst */
+	memcpy(dst, str, len);
+	dst[len] = '\r';
+	dst[len + 1] = '\n';
+
+	b_add(b, delta);
+	return delta;
 }
 
 /*

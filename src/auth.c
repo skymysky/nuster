@@ -10,34 +10,46 @@
  *
  */
 
-#ifdef CONFIG_HAP_CRYPT
+#ifdef USE_LIBCRYPT
 /* This is to have crypt() defined on Linux */
 #define _GNU_SOURCE
 
-#ifdef NEED_CRYPT_H
+#ifdef USE_CRYPT_H
 /* some platforms such as Solaris need this */
 #include <crypt.h>
 #endif
-#endif /* CONFIG_HAP_CRYPT */
+#endif /* USE_LIBCRYPT */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
-#include <common/config.h>
-#include <common/errors.h>
-
-#include <proto/acl.h>
-#include <proto/log.h>
-
-#include <types/auth.h>
-#include <types/pattern.h>
+#include <haproxy/api.h>
+#include <haproxy/auth-t.h>
+#include <haproxy/errors.h>
+#include <haproxy/global.h>
+#include <haproxy/pattern-t.h>
+#include <haproxy/sample-t.h>
+#include <haproxy/thread.h>
 
 struct userlist *userlist = NULL;    /* list of all existing userlists */
 
-/* find targets for selected gropus. The function returns pointer to
- * the userlist struct ot NULL if name is NULL/empty or unresolvable.
+#ifdef USE_LIBCRYPT
+#define CRYPT_STATE_MSG "yes"
+#ifdef HA_HAVE_CRYPT_R
+/* context for crypt_r() */
+static THREAD_LOCAL struct crypt_data crypt_data = { .initialized = 0 };
+#else
+/* lock for crypt() */
+__decl_thread(static HA_SPINLOCK_T auth_lock);
+#endif
+#else /* USE_LIBCRYPT */
+#define CRYPT_STATE_MSG "no"
+#endif
+
+/* find targets for selected groups. The function returns pointer to
+ * the userlist struct or NULL if name is NULL/empty or unresolvable.
  */
 
 struct userlist *
@@ -49,7 +61,7 @@ auth_find_userlist(char *name)
 		return NULL;
 
 	for (l = userlist; l; l = l->next)
-		if (!strcmp(l->name, name))
+		if (strcmp(l->name, name) == 0)
 			return l;
 
 	return NULL;
@@ -127,13 +139,13 @@ int userlist_postinit()
 
 			while ((group = strtok(group?NULL:curuser->u.groups_names, ","))) {
 				for (ag = curuserlist->groups; ag; ag = ag->next) {
-					if (!strcmp(ag->name, group))
+					if (strcmp(ag->name, group) == 0)
 						break;
 				}
 
 				if (!ag) {
-					Alert("userlist '%s': no such group '%s' specified in user '%s'\n",
-					      curuserlist->name, group, curuser->user);
+					ha_alert("userlist '%s': no such group '%s' specified in user '%s'\n",
+						 curuserlist->name, group, curuser->user);
 					free(groups);
 					return ERR_ALERT | ERR_FATAL;
 				}
@@ -141,8 +153,8 @@ int userlist_postinit()
 				/* Add this group at the group userlist. */
 				grl = calloc(1, sizeof(*grl));
 				if (!grl) {
-					Alert("userlist '%s': no more memory when trying to allocate the user groups.\n",
-					      curuserlist->name);
+					ha_alert("userlist '%s': no more memory when trying to allocate the user groups.\n",
+						 curuserlist->name);
 					free(groups);
 					return ERR_ALERT | ERR_FATAL;
 				}
@@ -164,21 +176,21 @@ int userlist_postinit()
 
 			while ((user = strtok(user?NULL:ag->groupusers, ","))) {
 				for (curuser = curuserlist->users; curuser; curuser = curuser->next) {
-					if (!strcmp(curuser->user, user))
+					if (strcmp(curuser->user, user) == 0)
 						break;
 				}
 
 				if (!curuser) {
-					Alert("userlist '%s': no such user '%s' specified in group '%s'\n",
-					      curuserlist->name, user, ag->name);
+					ha_alert("userlist '%s': no such user '%s' specified in group '%s'\n",
+						 curuserlist->name, user, ag->name);
 					return ERR_ALERT | ERR_FATAL;
 				}
 
 				/* Add this group at the group userlist. */
 				grl = calloc(1, sizeof(*grl));
 				if (!grl) {
-					Alert("userlist '%s': no more memory when trying to allocate the user groups.\n",
-					      curuserlist->name);
+					ha_alert("userlist '%s': no more memory when trying to allocate the user groups.\n",
+						 curuserlist->name);
 					return  ERR_ALERT | ERR_FATAL;
 				}
 
@@ -229,7 +241,7 @@ check_user(struct userlist *ul, const char *user, const char *pass)
 #endif
 
 	for (u = ul->users; u; u = u->next)
-		if (!strcmp(user, u->user))
+		if (strcmp(user, u->user) == 0)
 			break;
 
 	if (!u)
@@ -243,8 +255,14 @@ check_user(struct userlist *ul, const char *user, const char *pass)
 #endif
 
 	if (!(u->flags & AU_O_INSECURE)) {
-#ifdef CONFIG_HAP_CRYPT
+#ifdef USE_LIBCRYPT
+#ifdef HA_HAVE_CRYPT_R
+		ep = crypt_r(pass, u->pass, &crypt_data);
+#else
+		HA_SPIN_LOCK(AUTH_LOCK, &auth_lock);
 		ep = crypt(pass, u->pass);
+		HA_SPIN_UNLOCK(AUTH_LOCK, &auth_lock);
+#endif
 #else
 		return 0;
 #endif
@@ -276,7 +294,7 @@ pat_match_auth(struct sample *smp, struct pattern_expr *expr, int fill)
 
 	/* Browse the userlist for searching user. */
 	for (u = ul->users; u; u = u->next) {
-		if (strcmp(smp->data.u.str.str, u->user) == 0)
+		if (strcmp(smp->data.u.str.area, u->user) == 0)
 			break;
 	}
 	if (!u)
@@ -294,3 +312,5 @@ pat_match_auth(struct sample *smp, struct pattern_expr *expr, int fill)
 	}
 	return NULL;
 }
+
+REGISTER_BUILD_OPTS("Encrypted password support via crypt(3): "CRYPT_STATE_MSG);

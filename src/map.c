@@ -10,25 +10,20 @@
  *
  */
 
-#include <limits.h>
 #include <stdio.h>
 
-#include <common/standard.h>
+#include <haproxy/api.h>
+#include <haproxy/applet-t.h>
+#include <haproxy/arg.h>
+#include <haproxy/cli.h>
+#include <haproxy/map.h>
+#include <haproxy/pattern.h>
+#include <haproxy/regex.h>
+#include <haproxy/sample.h>
+#include <haproxy/stats-t.h>
+#include <haproxy/stream_interface.h>
+#include <haproxy/tools.h>
 
-#include <types/applet.h>
-#include <types/cli.h>
-#include <types/global.h>
-#include <types/map.h>
-#include <types/pattern.h>
-#include <types/stats.h>
-
-#include <proto/applet.h>
-#include <proto/arg.h>
-#include <proto/cli.h>
-#include <proto/map.h>
-#include <proto/pattern.h>
-#include <proto/stream_interface.h>
-#include <proto/sample.h>
 
 /* Parse an IPv4 or IPv6 address and store it into the sample.
  * The output type is IPv4 or IPv6.
@@ -56,9 +51,9 @@ int map_parse_ip(const char *text, struct sample_data *data)
  */
 int map_parse_str(const char *text, struct sample_data *data)
 {
-	data->u.str.str = (char *)text;
-	data->u.str.len = strlen(text);
-	data->u.str.size = data->u.str.len + 1;
+	data->u.str.area = (char *)text;
+	data->u.str.data = strlen(text);
+	data->u.str.size = data->u.str.data + 1;
 	data->type = SMP_T_STR;
 	return 1;
 }
@@ -103,6 +98,11 @@ int sample_load_map(struct arg *arg, struct sample_conv *conv,
 {
 	struct map_descriptor *desc;
 
+	if (!(global.mode & MODE_STARTING)) {
+		memprintf(err, "map: cannot load map at runtime");
+		return 0;
+	}
+
 	/* create new map descriptor */
 	desc = map_create_descriptor(conv);
 	if (!desc) {
@@ -120,7 +120,6 @@ int sample_load_map(struct arg *arg, struct sample_conv *conv,
 	desc->pat.match = pat_match_fcts[(long)conv->private];
 	desc->pat.parse = pat_parse_fcts[(long)conv->private];
 	desc->pat.index = pat_index_fcts[(long)conv->private];
-	desc->pat.delete = pat_delete_fcts[(long)conv->private];
 	desc->pat.prune = pat_prune_fcts[(long)conv->private];
 	desc->pat.expect_type = pat_match_types[(long)conv->private];
 
@@ -137,19 +136,21 @@ int sample_load_map(struct arg *arg, struct sample_conv *conv,
 	}
 
 	/* Load map. */
-	if (!pattern_read_from_file(&desc->pat, PAT_REF_MAP, arg[0].data.str.str, PAT_MF_NO_DNS,
+	if (!pattern_read_from_file(&desc->pat, PAT_REF_MAP, arg[0].data.str.area, PAT_MF_NO_DNS,
 	                            1, err, file, line))
 		return 0;
 
-	/* the maps of type IP have a string as defaultvalue. This
-	 * string canbe anipv4 or an ipv6, we must convert it.
+	/* the maps of type IP support a string as default value. This
+	 * string can be an ipv4 or an ipv6, we must convert it.
 	 */
-	if (desc->conv->out_type == SMP_T_ADDR) {
+	if (arg[1].type != ARGT_STOP && desc->conv->out_type == SMP_T_ADDR) {
 		struct sample_data data;
-		if (!map_parse_ip(arg[1].data.str.str, &data)) {
-			memprintf(err, "map: cannot parse default ip <%s>.", arg[1].data.str.str);
+		if (!map_parse_ip(arg[1].data.str.area, &data)) {
+			memprintf(err, "map: cannot parse default ip <%s>.",
+				  arg[1].data.str.area);
 			return 0;
 		}
+		chunk_destroy(&arg[1].data.str);
 		if (data.type == SMP_T_IPV4) {
 			arg[1].type = ARGT_IPV4;
 			arg[1].data.ipv4 = data.u.ipv4;
@@ -160,6 +161,7 @@ int sample_load_map(struct arg *arg, struct sample_conv *conv,
 	}
 
 	/* replace the first argument by this definition */
+	chunk_destroy(&arg[0].data.str);
 	arg[0].type = ARGT_MAP;
 	arg[0].data.map = desc;
 
@@ -170,7 +172,7 @@ static int sample_conv_map(const struct arg *arg_p, struct sample *smp, void *pr
 {
 	struct map_descriptor *desc;
 	struct pattern *pat;
-	struct chunk *str;
+	struct buffer *str;
 
 	/* get config */
 	desc = arg_p[0].data.map;
@@ -183,12 +185,33 @@ static int sample_conv_map(const struct arg *arg_p, struct sample *smp, void *pr
 		if (pat->data) {
 			/* In the regm case, merge the sample with the input. */
 			if ((long)private == PAT_MATCH_REGM) {
-				str = get_trash_chunk();
-				str->len = exp_replace(str->str, str->size, smp->data.u.str.str,
-				                       pat->data->u.str.str,
-				                       (regmatch_t *)smp->ctx.a[0]);
-				if (str->len == -1)
+				struct buffer *tmptrash;
+				int len;
+
+				/* Copy the content of the sample because it could
+				   be scratched by incoming get_trash_chunk */
+				tmptrash = alloc_trash_chunk();
+				if (!tmptrash)
 					return 0;
+
+				tmptrash->data = smp->data.u.str.data;
+				if (tmptrash->data > (tmptrash->size-1))
+					tmptrash->data = tmptrash->size-1;
+
+				memcpy(tmptrash->area, smp->data.u.str.area, tmptrash->data);
+				tmptrash->area[tmptrash->data] = 0;
+
+				str = get_trash_chunk();
+				len = exp_replace(str->area, str->size,
+				                  tmptrash->area,
+				                  pat->data->u.str.area,
+				                  (regmatch_t *)smp->ctx.a[0]);
+				free_trash_chunk(tmptrash);
+
+				if (len == -1)
+					return 0;
+
+				str->data = len;
 				smp->data.u.str = *str;
 				return 1;
 			}
@@ -204,7 +227,7 @@ static int sample_conv_map(const struct arg *arg_p, struct sample *smp, void *pr
 		return 1;
 	}
 
-	/* If no default value avalaible, the converter fails. */
+	/* If no default value available, the converter fails. */
 	if (arg_p[1].type == ARGT_STOP)
 		return 0;
 
@@ -306,9 +329,9 @@ static int cli_io_handler_pat_list(struct appctx *appctx)
 		 * reference to the last ref_elt being dumped.
 		 */
 		if (appctx->st2 == STAT_ST_LIST) {
-			if (!LIST_ISEMPTY(&appctx->ctx.sess.bref.users)) {
-				LIST_DEL(&appctx->ctx.sess.bref.users);
-				LIST_INIT(&appctx->ctx.sess.bref.users);
+			if (!LIST_ISEMPTY(&appctx->ctx.map.bref.users)) {
+				LIST_DEL(&appctx->ctx.map.bref.users);
+				LIST_INIT(&appctx->ctx.map.bref.users);
 			}
 		}
 		return 1;
@@ -324,12 +347,17 @@ static int cli_io_handler_pat_list(struct appctx *appctx)
 		 * this pointer. We know we have reached the end when this
 		 * pointer points back to the head of the streams list.
 		 */
+		HA_SPIN_LOCK(PATREF_LOCK, &appctx->ctx.map.ref->lock);
 		LIST_INIT(&appctx->ctx.map.bref.users);
 		appctx->ctx.map.bref.ref = appctx->ctx.map.ref->head.n;
+		HA_SPIN_UNLOCK(PATREF_LOCK, &appctx->ctx.map.ref->lock);
 		appctx->st2 = STAT_ST_LIST;
 		/* fall through */
 
 	case STAT_ST_LIST:
+
+		HA_SPIN_LOCK(PATREF_LOCK, &appctx->ctx.map.ref->lock);
+
 		if (!LIST_ISEMPTY(&appctx->ctx.map.bref.users)) {
 			LIST_DEL(&appctx->ctx.map.bref.users);
 			LIST_INIT(&appctx->ctx.map.bref.users);
@@ -340,6 +368,9 @@ static int cli_io_handler_pat_list(struct appctx *appctx)
 
 			elt = LIST_ELEM(appctx->ctx.map.bref.ref, struct pat_ref_elt *, list);
 
+			if (elt->gen_id != appctx->ctx.map.ref->curr_gen)
+				goto skip;
+
 			/* build messages */
 			if (elt->sample)
 				chunk_appendf(&trash, "%p %s %s\n",
@@ -349,20 +380,20 @@ static int cli_io_handler_pat_list(struct appctx *appctx)
 				chunk_appendf(&trash, "%p %s\n",
 				              elt, elt->pattern);
 
-			if (bi_putchk(si_ic(si), &trash) == -1) {
+			if (ci_putchk(si_ic(si), &trash) == -1) {
 				/* let's try again later from this stream. We add ourselves into
 				 * this stream's users so that it can remove us upon termination.
 				 */
-				si_applet_cant_put(si);
 				LIST_ADDQ(&elt->back_refs, &appctx->ctx.map.bref.users);
+				HA_SPIN_UNLOCK(PATREF_LOCK, &appctx->ctx.map.ref->lock);
+				si_rx_room_blk(si);
 				return 0;
 			}
-
+		skip:
 			/* get next list entry and check the end of the list */
 			appctx->ctx.map.bref.ref = elt->list.n;
 		}
-
-		appctx->st2 = STAT_ST_FIN;
+		HA_SPIN_UNLOCK(PATREF_LOCK, &appctx->ctx.map.ref->lock);
 		/* fall through */
 
 	default:
@@ -378,20 +409,20 @@ static int cli_io_handler_pats_list(struct appctx *appctx)
 	switch (appctx->st2) {
 	case STAT_ST_INIT:
 		/* Display the column headers. If the message cannot be sent,
-		 * quit the fucntion with returning 0. The function is called
-		 * later and restart at the state "STAT_ST_INIT".
+		 * quit the function with returning 0. The function is called
+		 * later and restarted at the state "STAT_ST_INIT".
 		 */
 		chunk_reset(&trash);
 		chunk_appendf(&trash, "# id (file) description\n");
-		if (bi_putchk(si_ic(si), &trash) == -1) {
-			si_applet_cant_put(si);
+		if (ci_putchk(si_ic(si), &trash) == -1) {
+			si_rx_room_blk(si);
 			return 0;
 		}
 
 		/* Now, we start the browsing of the references lists.
-		 * Note that the following call to LIST_ELEM return bad pointer. The only
+		 * Note that the following call to LIST_ELEM returns a bad pointer. The only
 		 * available field of this pointer is <list>. It is used with the function
-		 * pat_list_get_next() for retruning the first available entry
+		 * pat_list_get_next() for returning the first available entry
 		 */
 		appctx->ctx.map.ref = LIST_ELEM(&pattern_reference, struct pat_ref *, list);
 		appctx->ctx.map.ref = pat_list_get_next(appctx->ctx.map.ref, &pattern_reference,
@@ -404,17 +435,17 @@ static int cli_io_handler_pats_list(struct appctx *appctx)
 			chunk_reset(&trash);
 
 			/* Build messages. If the reference is used by another category than
-			 * the listed categorie, display the information in the massage.
+			 * the listed categories, display the information in the message.
 			 */
 			chunk_appendf(&trash, "%d (%s) %s\n", appctx->ctx.map.ref->unique_id,
 			              appctx->ctx.map.ref->reference ? appctx->ctx.map.ref->reference : "",
 			              appctx->ctx.map.ref->display);
 
-			if (bi_putchk(si_ic(si), &trash) == -1) {
+			if (ci_putchk(si_ic(si), &trash) == -1) {
 				/* let's try again later from this stream. We add ourselves into
 				 * this stream's users so that it can remove us upon termination.
 				 */
-				si_applet_cant_put(si);
+				si_rx_room_blk(si);
 				return 0;
 			}
 
@@ -423,7 +454,6 @@ static int cli_io_handler_pats_list(struct appctx *appctx)
 			                                        appctx->ctx.map.display_flags);
 		}
 
-		appctx->st2 = STAT_ST_FIN;
 		/* fall through */
 
 	default:
@@ -449,6 +479,7 @@ static int cli_io_handler_map_lookup(struct appctx *appctx)
 		/* fall through */
 
 	case STAT_ST_LIST:
+		HA_SPIN_LOCK(PATREF_LOCK, &appctx->ctx.map.ref->lock);
 		/* for each lookup type */
 		while (appctx->ctx.map.expr) {
 			/* initialise chunk to build new message */
@@ -457,8 +488,9 @@ static int cli_io_handler_map_lookup(struct appctx *appctx)
 			/* execute pattern matching */
 			sample.data.type = SMP_T_STR;
 			sample.flags = SMP_F_CONST;
-			sample.data.u.str.len = appctx->ctx.map.chunk.len;
-			sample.data.u.str.str = appctx->ctx.map.chunk.str;
+			sample.data.u.str.data = appctx->ctx.map.chunk.data;
+			sample.data.u.str.area = appctx->ctx.map.chunk.area;
+
 			if (appctx->ctx.map.expr->pat_head->match &&
 			    sample_convert(&sample, appctx->ctx.map.expr->pat_head->expect_type))
 				pat = appctx->ctx.map.expr->pat_head->match(&sample, appctx->ctx.map.expr, 1);
@@ -529,11 +561,12 @@ static int cli_io_handler_map_lookup(struct appctx *appctx)
 			chunk_appendf(&trash, "\n");
 
 			/* display response */
-			if (bi_putchk(si_ic(si), &trash) == -1) {
+			if (ci_putchk(si_ic(si), &trash) == -1) {
 				/* let's try again later from this stream. We add ourselves into
 				 * this stream's users so that it can remove us upon termination.
 				 */
-				si_applet_cant_put(si);
+				HA_SPIN_UNLOCK(PATREF_LOCK, &appctx->ctx.map.ref->lock);
+				si_rx_room_blk(si);
 				return 0;
 			}
 
@@ -541,8 +574,7 @@ static int cli_io_handler_map_lookup(struct appctx *appctx)
 			appctx->ctx.map.expr = pat_expr_get_next(appctx->ctx.map.expr,
 			                                         &appctx->ctx.map.ref->pat);
 		}
-
-		appctx->st2 = STAT_ST_FIN;
+		HA_SPIN_UNLOCK(PATREF_LOCK, &appctx->ctx.map.ref->lock);
 		/* fall through */
 
 	default:
@@ -553,12 +585,12 @@ static int cli_io_handler_map_lookup(struct appctx *appctx)
 
 static void cli_release_mlook(struct appctx *appctx)
 {
-	free(appctx->ctx.map.chunk.str);
-	appctx->ctx.map.chunk.str = NULL;
+	free(appctx->ctx.map.chunk.area);
+	appctx->ctx.map.chunk.area = NULL;
 }
 
 
-static int cli_parse_get_map(char **args, struct appctx *appctx, void *private)
+static int cli_parse_get_map(char **args, char *payload, struct appctx *appctx, void *private)
 {
 	if (strcmp(args[1], "map") == 0 || strcmp(args[1], "acl") == 0) {
 		/* Set flags. */
@@ -570,36 +602,29 @@ static int cli_parse_get_map(char **args, struct appctx *appctx, void *private)
 		/* No parameter. */
 		if (!*args[2] || !*args[3]) {
 			if (appctx->ctx.map.display_flags == PAT_REF_MAP)
-				appctx->ctx.cli.msg = "Missing map identifier and/or key.\n";
+				return cli_err(appctx, "Missing map identifier and/or key.\n");
 			else
-				appctx->ctx.cli.msg = "Missing ACL identifier and/or key.\n";
-			appctx->st0 = CLI_ST_PRINT;
-			return 1;
+				return cli_err(appctx, "Missing ACL identifier and/or key.\n");
 		}
 
 		/* lookup into the maps */
 		appctx->ctx.map.ref = pat_ref_lookup_ref(args[2]);
 		if (!appctx->ctx.map.ref) {
 			if (appctx->ctx.map.display_flags == PAT_REF_MAP)
-				appctx->ctx.cli.msg = "Unknown map identifier. Please use #<id> or <file>.\n";
+				return cli_err(appctx, "Unknown map identifier. Please use #<id> or <file>.\n");
 			else
-				appctx->ctx.cli.msg = "Unknown ACL identifier. Please use #<id> or <file>.\n";
-			appctx->st0 = CLI_ST_PRINT;
-			return 1;
+				return cli_err(appctx, "Unknown ACL identifier. Please use #<id> or <file>.\n");
 		}
 
 		/* copy input string. The string must be allocated because
 		 * it may be used over multiple iterations. It's released
 		 * at the end and upon abort anyway.
 		 */
-		appctx->ctx.map.chunk.len = strlen(args[3]);
-		appctx->ctx.map.chunk.size = appctx->ctx.map.chunk.len + 1;
-		appctx->ctx.map.chunk.str = strdup(args[3]);
-		if (!appctx->ctx.map.chunk.str) {
-			appctx->ctx.cli.msg = "Out of memory error.\n";
-			appctx->st0 = CLI_ST_PRINT;
-			return 1;
-		}
+		appctx->ctx.map.chunk.data = strlen(args[3]);
+		appctx->ctx.map.chunk.size = appctx->ctx.map.chunk.data + 1;
+		appctx->ctx.map.chunk.area = strdup(args[3]);
+		if (!appctx->ctx.map.chunk.area)
+			return cli_err(appctx,  "Out of memory error.\n");
 
 		return 0;
 	}
@@ -609,12 +634,14 @@ static int cli_parse_get_map(char **args, struct appctx *appctx, void *private)
 static void cli_release_show_map(struct appctx *appctx)
 {
 	if (appctx->st2 == STAT_ST_LIST) {
+		HA_SPIN_LOCK(PATREF_LOCK, &appctx->ctx.map.ref->lock);
 		if (!LIST_ISEMPTY(&appctx->ctx.map.bref.users))
 			LIST_DEL(&appctx->ctx.map.bref.users);
+		HA_SPIN_UNLOCK(PATREF_LOCK, &appctx->ctx.map.ref->lock);
 	}
 }
 
-static int cli_parse_show_map(char **args, struct appctx *appctx, void *private)
+static int cli_parse_show_map(char **args, char *payload, struct appctx *appctx, void *private)
 {
 	if (strcmp(args[1], "map") == 0 ||
 	    strcmp(args[1], "acl") == 0) {
@@ -636,11 +663,9 @@ static int cli_parse_show_map(char **args, struct appctx *appctx, void *private)
 		if (!appctx->ctx.map.ref ||
 		    !(appctx->ctx.map.ref->flags & appctx->ctx.map.display_flags)) {
 			if (appctx->ctx.map.display_flags == PAT_REF_MAP)
-				appctx->ctx.cli.msg = "Unknown map identifier. Please use #<id> or <file>.\n";
+				return cli_err(appctx, "Unknown map identifier. Please use #<id> or <file>.\n");
 			else
-				appctx->ctx.cli.msg = "Unknown ACL identifier. Please use #<id> or <file>.\n";
-			appctx->st0 = CLI_ST_PRINT;
-			return 1;
+				return cli_err(appctx, "Unknown ACL identifier. Please use #<id> or <file>.\n");
 		}
 		appctx->io_handler = cli_io_handler_pat_list;
 		appctx->io_release = cli_release_show_map;
@@ -650,7 +675,7 @@ static int cli_parse_show_map(char **args, struct appctx *appctx, void *private)
 	return 0;
 }
 
-static int cli_parse_set_map(char **args, struct appctx *appctx, void *private)
+static int cli_parse_set_map(char **args, char *payload, struct appctx *appctx, void *private)
 {
 	if (strcmp(args[1], "map") == 0) {
 		char *err;
@@ -659,19 +684,13 @@ static int cli_parse_set_map(char **args, struct appctx *appctx, void *private)
 		appctx->ctx.map.display_flags = PAT_REF_MAP;
 
 		/* Expect three parameters: map name, key and new value. */
-		if (!*args[2] || !*args[3] || !*args[4]) {
-			appctx->ctx.cli.msg = "'set map' expects three parameters: map identifier, key and value.\n";
-			appctx->st0 = CLI_ST_PRINT;
-			return 1;
-		}
+		if (!*args[2] || !*args[3] || !*args[4])
+			return cli_err(appctx, "'set map' expects three parameters: map identifier, key and value.\n");
 
 		/* Lookup the reference in the maps. */
 		appctx->ctx.map.ref = pat_ref_lookup_ref(args[2]);
-		if (!appctx->ctx.map.ref) {
-			appctx->ctx.cli.msg = "Unknown map identifier. Please use #<id> or <file>.\n";
-			appctx->st0 = CLI_ST_PRINT;
-			return 1;
-		}
+		if (!appctx->ctx.map.ref)
+			return cli_err(appctx, "Unknown map identifier. Please use #<id> or <file>.\n");
 
 		/* If the entry identifier start with a '#', it is considered as
 		 * pointer id
@@ -683,42 +702,40 @@ static int cli_parse_set_map(char **args, struct appctx *appctx, void *private)
 
 			/* Convert argument to integer value. */
 			conv = strtoll(&args[3][1], &error, 16);
-			if (*error != '\0') {
-				appctx->ctx.cli.msg = "Malformed identifier. Please use #<id> or <file>.\n";
-				appctx->st0 = CLI_ST_PRINT;
-				return 1;
-			}
+			if (*error != '\0')
+				return cli_err(appctx, "Malformed identifier. Please use #<id> or <file>.\n");
 
 			/* Convert and check integer to pointer. */
 			ref = (struct pat_ref_elt *)(long)conv;
-			if ((long long int)(long)ref != conv) {
-				appctx->ctx.cli.msg = "Malformed identifier. Please use #<id> or <file>.\n";
-				appctx->st0 = CLI_ST_PRINT;
-				return 1;
-			}
+			if ((long long int)(long)ref != conv)
+				return cli_err(appctx, "Malformed identifier. Please use #<id> or <file>.\n");
 
-			/* Try to delete the entry. */
+			/* Try to modify the entry. */
 			err = NULL;
+			HA_SPIN_LOCK(PATREF_LOCK, &appctx->ctx.map.ref->lock);
 			if (!pat_ref_set_by_id(appctx->ctx.map.ref, ref, args[4], &err)) {
+				HA_SPIN_UNLOCK(PATREF_LOCK, &appctx->ctx.map.ref->lock);
 				if (err)
-					memprintf(&err, "%s.\n", err);
-				appctx->ctx.cli.err = err;
-				appctx->st0 = CLI_ST_PRINT_FREE;
-				return 1;
+					return cli_dynerr(appctx, memprintf(&err, "%s.\n", err));
+				else
+					return cli_err(appctx, "Failed to update an entry.\n");
 			}
+			HA_SPIN_UNLOCK(PATREF_LOCK, &appctx->ctx.map.ref->lock);
 		}
 		else {
 			/* Else, use the entry identifier as pattern
 			 * string, and update the value.
 			 */
 			err = NULL;
+			HA_SPIN_LOCK(PATREF_LOCK, &appctx->ctx.map.ref->lock);
 			if (!pat_ref_set(appctx->ctx.map.ref, args[3], args[4], &err)) {
+				HA_SPIN_UNLOCK(PATREF_LOCK, &appctx->ctx.map.ref->lock);
 				if (err)
-					memprintf(&err, "%s.\n", err);
-				appctx->ctx.cli.err = err;
-				appctx->st0 = CLI_ST_PRINT_FREE;
-				return 1;
+					return cli_dynerr(appctx, memprintf(&err, "%s.\n", err));
+				else
+					return cli_err(appctx, "Failed to update an entry.\n");
 			}
+			HA_SPIN_UNLOCK(PATREF_LOCK, &appctx->ctx.map.ref->lock);
 		}
 
 		/* The set is done, send message. */
@@ -728,7 +745,21 @@ static int cli_parse_set_map(char **args, struct appctx *appctx, void *private)
 	return 1;
 }
 
-static int cli_parse_add_map(char **args, struct appctx *appctx, void *private)
+static int map_add_key_value(struct appctx *appctx, const char *key, const char *value, char **err)
+{
+	int ret;
+
+	HA_SPIN_LOCK(PATREF_LOCK, &appctx->ctx.map.ref->lock);
+	if (appctx->ctx.map.display_flags == PAT_REF_MAP)
+		ret = pat_ref_add(appctx->ctx.map.ref, key, value, err);
+	else
+		ret = pat_ref_add(appctx->ctx.map.ref, key, NULL, err);
+	HA_SPIN_UNLOCK(PATREF_LOCK, &appctx->ctx.map.ref->lock);
+
+	return ret;
+}
+
+static int cli_parse_add_map(char **args, char *payload, struct appctx *appctx, void *private)
 {
 	if (strcmp(args[1], "map") == 0 ||
 	    strcmp(args[1], "acl") == 0) {
@@ -741,33 +772,28 @@ static int cli_parse_add_map(char **args, struct appctx *appctx, void *private)
 		else
 			appctx->ctx.map.display_flags = PAT_REF_ACL;
 
-		/* If the keywork is "map", we expect three parameters, if it
-		 * is "acl", we expect only two parameters
+		/* If the keyword is "map", we expect:
+		 *   - three parameters if there is no payload
+		 *   - one parameter if there is a payload
+		 * If it is "acl", we expect only two parameters
 		 */
 		if (appctx->ctx.map.display_flags == PAT_REF_MAP) {
-			if (!*args[2] || !*args[3] || !*args[4]) {
-				appctx->ctx.cli.msg = "'add map' expects three parameters: map identifier, key and value.\n";
-				appctx->st0 = CLI_ST_PRINT;
-				return 1;
-			}
+			if ((!payload && (!*args[2] || !*args[3] || !*args[4])) ||
+			    (payload && !*args[2]))
+				return cli_err(appctx,
+					       "'add map' expects three parameters (map identifier, key and value)"
+					       " or one parameter (map identifier) and a payload\n");
 		}
-		else {
-			if (!*args[2] || !*args[3]) {
-				appctx->ctx.cli.msg = "'add acl' expects two parameters: ACL identifier and pattern.\n";
-				appctx->st0 = CLI_ST_PRINT;
-				return 1;
-			}
-		}
+		else if (!*args[2] || !*args[3])
+			return cli_err(appctx, "'add acl' expects two parameters: ACL identifier and pattern.\n");
 
 		/* Lookup for the reference. */
 		appctx->ctx.map.ref = pat_ref_lookup_ref(args[2]);
 		if (!appctx->ctx.map.ref) {
 			if (appctx->ctx.map.display_flags == PAT_REF_MAP)
-				appctx->ctx.cli.msg = "Unknown map identifier. Please use #<id> or <file>.\n";
+				return cli_err(appctx, "Unknown map identifier. Please use #<id> or <file>.\n");
 			else
-				appctx->ctx.cli.msg = "Unknown ACL identifier. Please use #<id> or <file>.\n";
-			appctx->st0 = CLI_ST_PRINT;
-			return 1;
+				return cli_err(appctx, "Unknown ACL identifier. Please use #<id> or <file>.\n");
 		}
 
 		/* The command "add acl" is prohibited if the reference
@@ -775,24 +801,56 @@ static int cli_parse_add_map(char **args, struct appctx *appctx, void *private)
 		 */
 		if ((appctx->ctx.map.display_flags & PAT_REF_ACL) &&
 		    (appctx->ctx.map.ref->flags & PAT_REF_SMP)) {
-			appctx->ctx.cli.msg = "This ACL is shared with a map containing samples. "
-				"You must use the command 'add map' to add values.\n";
-			appctx->st0 = CLI_ST_PRINT;
-			return 1;
+			return cli_err(appctx,
+				       "This ACL is shared with a map containing samples. "
+				       "You must use the command 'add map' to add values.\n");
 		}
-
-		/* Add value. */
+		/* Add value(s). */
 		err = NULL;
-		if (appctx->ctx.map.display_flags == PAT_REF_MAP)
-			ret = pat_ref_add(appctx->ctx.map.ref, args[3], args[4], &err);
-		else
-			ret = pat_ref_add(appctx->ctx.map.ref, args[3], NULL, &err);
-		if (!ret) {
-			if (err)
-				memprintf(&err, "%s.\n", err);
-			appctx->ctx.cli.err = err;
-			appctx->st0 = CLI_ST_PRINT_FREE;
-			return 1;
+		if (!payload) {
+			ret = map_add_key_value(appctx, args[3], args[4], &err);
+			if (!ret) {
+				if (err)
+					return cli_dynerr(appctx, memprintf(&err, "%s.\n", err));
+				else
+					return cli_err(appctx, "Failed to add an entry.\n");
+			}
+		}
+		else {
+			const char *end = payload + strlen(payload);
+
+			while (payload < end) {
+				char *key, *value;
+				size_t l;
+
+				/* key */
+				key = payload;
+				l = strcspn(key, " \t");
+				payload += l;
+
+				if (!*payload && appctx->ctx.map.display_flags == PAT_REF_MAP)
+					return cli_dynerr(appctx, memprintf(&err, "Missing value for key '%s'.\n", key));
+
+				key[l] = 0;
+				payload++;
+
+				/* value */
+				payload += strspn(payload, " \t");
+				value = payload;
+				l = strcspn(value, "\n");
+				payload += l;
+				if (*payload)
+					payload++;
+				value[l] = 0;
+
+				ret = map_add_key_value(appctx, key, value, &err);
+				if (!ret) {
+					if (err)
+						return cli_dynerr(appctx, memprintf(&err, "%s.\n", err));
+					else
+						return cli_err(appctx, "Failed to add a key.\n");
+				}
+			}
 		}
 
 		/* The add is done, send message. */
@@ -803,7 +861,7 @@ static int cli_parse_add_map(char **args, struct appctx *appctx, void *private)
 	return 0;
 }
 
-static int cli_parse_del_map(char **args, struct appctx *appctx, void *private)
+static int cli_parse_del_map(char **args, char *payload, struct appctx *appctx, void *private)
 {
 	if (args[1][0] == 'm')
 		appctx->ctx.map.display_flags = PAT_REF_MAP;
@@ -811,30 +869,18 @@ static int cli_parse_del_map(char **args, struct appctx *appctx, void *private)
 		appctx->ctx.map.display_flags = PAT_REF_ACL;
 
 	/* Expect two parameters: map name and key. */
-	if (appctx->ctx.map.display_flags == PAT_REF_MAP) {
-		if (!*args[2] || !*args[3]) {
-			appctx->ctx.cli.msg = "This command expects two parameters: map identifier and key.\n";
-			appctx->st0 = CLI_ST_PRINT;
-			return 1;
-		}
-	}
-
-	else {
-		if (!*args[2] || !*args[3]) {
-			appctx->ctx.cli.msg = "This command expects two parameters: ACL identifier and key.\n";
-			appctx->st0 = CLI_ST_PRINT;
-			return 1;
-		}
+	if (!*args[2] || !*args[3]) {
+		if (appctx->ctx.map.display_flags == PAT_REF_MAP)
+			return cli_err(appctx, "This command expects two parameters: map identifier and key.\n");
+		else
+			return cli_err(appctx, "This command expects two parameters: ACL identifier and key.\n");
 	}
 
 	/* Lookup the reference in the maps. */
 	appctx->ctx.map.ref = pat_ref_lookup_ref(args[2]);
 	if (!appctx->ctx.map.ref ||
-	    !(appctx->ctx.map.ref->flags & appctx->ctx.map.display_flags)) {
-		appctx->ctx.cli.msg = "Unknown map identifier. Please use #<id> or <file>.\n";
-		appctx->st0 = CLI_ST_PRINT;
-		return 1;
-	}
+	    !(appctx->ctx.map.ref->flags & appctx->ctx.map.display_flags))
+		return cli_err(appctx, "Unknown map identifier. Please use #<id> or <file>.\n");
 
 	/* If the entry identifier start with a '#', it is considered as
 	 * pointer id
@@ -846,38 +892,34 @@ static int cli_parse_del_map(char **args, struct appctx *appctx, void *private)
 
 		/* Convert argument to integer value. */
 		conv = strtoll(&args[3][1], &error, 16);
-		if (*error != '\0') {
-			appctx->ctx.cli.msg = "Malformed identifier. Please use #<id> or <file>.\n";
-			appctx->st0 = CLI_ST_PRINT;
-			return 1;
-		}
+		if (*error != '\0')
+			return cli_err(appctx, "Malformed identifier. Please use #<id> or <file>.\n");
 
 		/* Convert and check integer to pointer. */
 		ref = (struct pat_ref_elt *)(long)conv;
-		if ((long long int)(long)ref != conv) {
-			appctx->ctx.cli.msg = "Malformed identifier. Please use #<id> or <file>.\n";
-			appctx->st0 = CLI_ST_PRINT;
-			return 1;
-		}
+		if ((long long int)(long)ref != conv)
+			return cli_err(appctx, "Malformed identifier. Please use #<id> or <file>.\n");
 
 		/* Try to delete the entry. */
+		HA_SPIN_LOCK(PATREF_LOCK, &appctx->ctx.map.ref->lock);
 		if (!pat_ref_delete_by_id(appctx->ctx.map.ref, ref)) {
+			HA_SPIN_UNLOCK(PATREF_LOCK, &appctx->ctx.map.ref->lock);
 			/* The entry is not found, send message. */
-			appctx->ctx.cli.msg = "Key not found.\n";
-			appctx->st0 = CLI_ST_PRINT;
-			return 1;
+			return cli_err(appctx, "Key not found.\n");
 		}
+		HA_SPIN_UNLOCK(PATREF_LOCK, &appctx->ctx.map.ref->lock);
 	}
 	else {
 		/* Else, use the entry identifier as pattern
 		 * string and try to delete the entry.
 		 */
+		HA_SPIN_LOCK(PATREF_LOCK, &appctx->ctx.map.ref->lock);
 		if (!pat_ref_delete(appctx->ctx.map.ref, args[3])) {
+			HA_SPIN_UNLOCK(PATREF_LOCK, &appctx->ctx.map.ref->lock);
 			/* The entry is not found, send message. */
-			appctx->ctx.cli.msg = "Key not found.\n";
-			appctx->st0 = CLI_ST_PRINT;
-			return 1;
+			return cli_err(appctx, "Key not found.\n");
 		}
+		HA_SPIN_UNLOCK(PATREF_LOCK, &appctx->ctx.map.ref->lock);
 	}
 
 	/* The deletion is done, send message. */
@@ -886,7 +928,25 @@ static int cli_parse_del_map(char **args, struct appctx *appctx, void *private)
 }
 
 
-static int cli_parse_clear_map(char **args, struct appctx *appctx, void *private)
+/* continue to clear a map which was started in the parser */
+static int cli_io_handler_clear_map(struct appctx *appctx)
+{
+	struct stream_interface *si = appctx->owner;
+	int finished;
+
+	HA_SPIN_LOCK(PATREF_LOCK, &appctx->ctx.map.ref->lock);
+	finished = pat_ref_prune(appctx->ctx.map.ref);
+	HA_SPIN_UNLOCK(PATREF_LOCK, &appctx->ctx.map.ref->lock);
+
+	if (!finished) {
+		/* let's come back later */
+		si_rx_endp_more(si);
+		return 0;
+	}
+	return 1;
+}
+
+static int cli_parse_clear_map(char **args, char *payload, struct appctx *appctx, void *private)
 {
 	if (strcmp(args[1], "map") == 0 || strcmp(args[1], "acl") == 0) {
 		/* Set ACL or MAP flags. */
@@ -898,11 +958,9 @@ static int cli_parse_clear_map(char **args, struct appctx *appctx, void *private
 		/* no parameter */
 		if (!*args[2]) {
 			if (appctx->ctx.map.display_flags == PAT_REF_MAP)
-				appctx->ctx.cli.msg = "Missing map identifier.\n";
+				return cli_err(appctx, "Missing map identifier.\n");
 			else
-				appctx->ctx.cli.msg = "Missing ACL identifier.\n";
-			appctx->st0 = CLI_ST_PRINT;
-			return 1;
+				return cli_err(appctx, "Missing ACL identifier.\n");
 		}
 
 		/* lookup into the refs and check the map flag */
@@ -910,33 +968,27 @@ static int cli_parse_clear_map(char **args, struct appctx *appctx, void *private
 		if (!appctx->ctx.map.ref ||
 		    !(appctx->ctx.map.ref->flags & appctx->ctx.map.display_flags)) {
 			if (appctx->ctx.map.display_flags == PAT_REF_MAP)
-				appctx->ctx.cli.msg = "Unknown map identifier. Please use #<id> or <file>.\n";
+				return cli_err(appctx, "Unknown map identifier. Please use #<id> or <file>.\n");
 			else
-				appctx->ctx.cli.msg = "Unknown ACL identifier. Please use #<id> or <file>.\n";
-			appctx->st0 = CLI_ST_PRINT;
-			return 1;
+				return cli_err(appctx, "Unknown ACL identifier. Please use #<id> or <file>.\n");
 		}
 
-		/* Clear all. */
-		pat_ref_prune(appctx->ctx.map.ref);
-
-		/* return response */
-		appctx->st0 = CLI_ST_PROMPT;
-		return 1;
+		/* delegate the clearing to the I/O handler which can yield */
+		return 0;
 	}
-	return 0;
+	return 1;
 }
 
 /* register cli keywords */
 
 static struct cli_kw_list cli_kws = {{ },{
 	{ { "add",   "acl", NULL }, "add acl        : add acl entry", cli_parse_add_map, NULL },
-	{ { "clear", "acl", NULL }, "clear acl <id> : clear the content of this acl", cli_parse_clear_map, NULL },
+	{ { "clear", "acl", NULL }, "clear acl <id> : clear the content of this acl", cli_parse_clear_map, cli_io_handler_clear_map, NULL },
 	{ { "del",   "acl", NULL }, "del acl        : delete acl entry", cli_parse_del_map, NULL },
 	{ { "get",   "acl", NULL }, "get acl        : report the patterns matching a sample for an ACL", cli_parse_get_map, cli_io_handler_map_lookup, cli_release_mlook },
 	{ { "show",  "acl", NULL }, "show acl [id]  : report available acls or dump an acl's contents", cli_parse_show_map, NULL },
 	{ { "add",   "map", NULL }, "add map        : add map entry", cli_parse_add_map, NULL },
-	{ { "clear", "map", NULL }, "clear map <id> : clear the content of this map", cli_parse_clear_map, NULL },
+	{ { "clear", "map", NULL }, "clear map <id> : clear the content of this map", cli_parse_clear_map, cli_io_handler_clear_map, NULL },
 	{ { "del",   "map", NULL }, "del map        : delete map entry", cli_parse_del_map, NULL },
 	{ { "get",   "map", NULL }, "get map        : report the keys and values matching a sample for a map", cli_parse_get_map, cli_io_handler_map_lookup, cli_release_mlook },
 	{ { "set",   "map", NULL }, "set map        : modify map entry", cli_parse_set_map, NULL },
@@ -944,6 +996,7 @@ static struct cli_kw_list cli_kws = {{ },{
 	{ { NULL }, NULL, NULL, NULL }
 }};
 
+INITCALL1(STG_REGISTER, cli_register_kw, &cli_kws);
 
 /* Note: must not be declared <const> as its list will be overwritten
  *
@@ -997,10 +1050,4 @@ static struct sample_conv_kw_list sample_conv_kws = {ILH, {
 	{ /* END */ },
 }};
 
-__attribute__((constructor))
-static void __map_init(void)
-{
-	/* register format conversion keywords */
-	sample_register_convs(&sample_conv_kws);
-	cli_register_kw(&cli_kws);
-}
+INITCALL1(STG_REGISTER, sample_register_convs, &sample_conv_kws);

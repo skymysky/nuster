@@ -10,20 +10,17 @@
  *
  */
 
-#include <common/compat.h>
-#include <common/config.h>
-#include <common/debug.h>
-#include <eb32tree.h>
+#include <import/eb32tree.h>
+#include <haproxy/api.h>
+#include <haproxy/backend.h>
+#include <haproxy/lb_map.h>
+#include <haproxy/queue.h>
+#include <haproxy/server-t.h>
 
-#include <types/global.h>
-#include <types/server.h>
-
-#include <proto/backend.h>
-#include <proto/proto_http.h>
-#include <proto/proto_tcp.h>
-#include <proto/queue.h>
-
-/* this function updates the map according to server <srv>'s new state */
+/* this function updates the map according to server <srv>'s new state.
+ *
+ * The server's lock must be held. The lbprm's lock will be used.
+ */
 static void map_set_server_status_down(struct server *srv)
 {
 	struct proxy *p = srv->proxy;
@@ -31,18 +28,23 @@ static void map_set_server_status_down(struct server *srv)
 	if (!srv_lb_status_changed(srv))
 		return;
 
-	if (srv_is_usable(srv))
+	if (srv_willbe_usable(srv))
 		goto out_update_state;
 
 	/* FIXME: could be optimized since we know what changed */
+	HA_RWLOCK_WRLOCK(LBPRM_LOCK, &p->lbprm.lock);
 	recount_servers(p);
 	update_backend_weight(p);
-	p->lbprm.map.state |= LB_MAP_RECALC;
+	recalc_server_map(p);
+	HA_RWLOCK_WRUNLOCK(LBPRM_LOCK, &p->lbprm.lock);
  out_update_state:
 	srv_lb_commit_status(srv);
 }
 
-/* This function updates the map according to server <srv>'s new state */
+/* This function updates the map according to server <srv>'s new state.
+ *
+ * The server's lock must be held. The lbprm's lock will be used.
+ */
 static void map_set_server_status_up(struct server *srv)
 {
 	struct proxy *p = srv->proxy;
@@ -50,13 +52,15 @@ static void map_set_server_status_up(struct server *srv)
 	if (!srv_lb_status_changed(srv))
 		return;
 
-	if (!srv_is_usable(srv))
+	if (!srv_willbe_usable(srv))
 		goto out_update_state;
 
 	/* FIXME: could be optimized since we know what changed */
+	HA_RWLOCK_WRLOCK(LBPRM_LOCK, &p->lbprm.lock);
 	recount_servers(p);
 	update_backend_weight(p);
-	p->lbprm.map.state |= LB_MAP_RECALC;
+	recalc_server_map(p);
+	HA_RWLOCK_WRUNLOCK(LBPRM_LOCK, &p->lbprm.lock);
  out_update_state:
 	srv_lb_commit_status(srv);
 }
@@ -65,6 +69,8 @@ static void map_set_server_status_up(struct server *srv)
  * px->lbprm.tot_wact, tot_wbck, tot_used, tot_weight, so it must be
  * called after recount_servers(). It also expects px->lbprm.map.srv
  * to be allocated with the largest size needed. It updates tot_weight.
+ *
+ * The lbprm's lock must be held.
  */
 void recalc_server_map(struct proxy *px)
 {
@@ -73,7 +79,6 @@ void recalc_server_map(struct proxy *px)
 
 	switch (px->lbprm.tot_used) {
 	case 0:	/* no server */
-		px->lbprm.map.state &= ~LB_MAP_RECALC;
 		return;
 	default:
 		tot = px->lbprm.tot_weight;
@@ -89,7 +94,7 @@ void recalc_server_map(struct proxy *px)
 	/* this algorithm gives priority to the first server, which means that
 	 * it will respect the declaration order for equivalent weights, and
 	 * that whatever the weights, the first server called will always be
-	 * the first declared. This is an important asumption for the backup
+	 * the first declared. This is an important assumption for the backup
 	 * case, where we want the first server only.
 	 */
 	for (cur = px->srv; cur; cur = cur->next)
@@ -100,7 +105,7 @@ void recalc_server_map(struct proxy *px)
 		best = NULL;
 		for (cur = px->srv; cur; cur = cur->next) {
 			if ((cur->flags & SRV_F_BACKUP) == flag &&
-			    srv_is_usable(cur)) {
+			    srv_willbe_usable(cur)) {
 				int v;
 
 				/* If we are forced to return only one server, we don't want to
@@ -113,7 +118,7 @@ void recalc_server_map(struct proxy *px)
 					break;
 				}
 
-				cur->wscore += cur->eweight;
+				_HA_ATOMIC_ADD(&cur->wscore, cur->next_eweight);
 				v = (cur->wscore + tot) / tot; /* result between 0 and 3 */
 				if (best == NULL || v > max) {
 					max = v;
@@ -122,9 +127,9 @@ void recalc_server_map(struct proxy *px)
 			}
 		}
 		px->lbprm.map.srv[o] = best;
-		best->wscore -= tot;
+		if (best)
+			_HA_ATOMIC_SUB(&best->wscore, tot);
 	}
-	px->lbprm.map.state &= ~LB_MAP_RECALC;
 }
 
 /* This function is responsible of building the server MAP for map-based LB
@@ -175,13 +180,13 @@ void init_server_map(struct proxy *p)
 
 	act = bck = 0;
 	for (srv = p->srv; srv; srv = srv->next) {
-		srv->eweight = (srv->uweight * p->lbprm.wdiv + p->lbprm.wmult - 1) / p->lbprm.wmult;
-		srv_lb_commit_status(srv);
+		srv->next_eweight = (srv->uweight * p->lbprm.wdiv + p->lbprm.wmult - 1) / p->lbprm.wmult;
 
 		if (srv->flags & SRV_F_BACKUP)
-			bck += srv->eweight;
+			bck += srv->next_eweight;
 		else
-			act += srv->eweight;
+			act += srv->next_eweight;
+		srv_lb_commit_status(srv);
 	}
 
 	/* this is the largest map we will ever need for this servers list */
@@ -191,9 +196,8 @@ void init_server_map(struct proxy *p)
 	if (!act)
 		act = 1;
 
-	p->lbprm.map.srv = calloc(act, sizeof(struct server *));
+	p->lbprm.map.srv = calloc(act, sizeof(*p->lbprm.map.srv));
 	/* recounts servers and their weights */
-	p->lbprm.map.state = LB_MAP_RECALC;
 	recount_servers(p);
 	update_backend_weight(p);
 	recalc_server_map(p);
@@ -204,17 +208,19 @@ void init_server_map(struct proxy *p)
  * the proxy <px> following the round-robin method.
  * If any server is found, it will be returned and px->lbprm.map.rr_idx will be updated
  * to point to the next server. If no valid server is found, NULL is returned.
+ *
+ * The lbprm's lock will be used.
  */
 struct server *map_get_server_rr(struct proxy *px, struct server *srvtoavoid)
 {
 	int newidx, avoididx;
 	struct server *srv, *avoided;
 
-	if (px->lbprm.tot_weight == 0)
-		return NULL;
-
-	if (px->lbprm.map.state & LB_MAP_RECALC)
-		recalc_server_map(px);
+	HA_RWLOCK_SKLOCK(LBPRM_LOCK, &px->lbprm.lock);
+	if (px->lbprm.tot_weight == 0) {
+		avoided = NULL;
+		goto out;
+	}
 
 	if (px->lbprm.map.rr_idx < 0 || px->lbprm.map.rr_idx >= px->lbprm.tot_weight)
 		px->lbprm.map.rr_idx = 0;
@@ -226,13 +232,13 @@ struct server *map_get_server_rr(struct proxy *px, struct server *srvtoavoid)
 		srv = px->lbprm.map.srv[newidx++];
 		if (!srv->maxconn || (!srv->nbpend && srv->served < srv_dynamic_maxconn(srv))) {
 			/* make sure it is not the server we are try to exclude... */
+			/* ...but remember that is was selected yet avoided */
+			avoided = srv;
+			avoididx = newidx;
 			if (srv != srvtoavoid) {
 				px->lbprm.map.rr_idx = newidx;
-				return srv;
+				goto out;
 			}
-
-			avoided = srv;	/* ...but remember that is was selected yet avoided */
-			avoididx = newidx;
 		}
 		if (newidx == px->lbprm.tot_weight)
 			newidx = 0;
@@ -241,6 +247,8 @@ struct server *map_get_server_rr(struct proxy *px, struct server *srvtoavoid)
 	if (avoided)
 		px->lbprm.map.rr_idx = avoididx;
 
+  out:
+	HA_RWLOCK_SKUNLOCK(LBPRM_LOCK, &px->lbprm.lock);
 	/* return NULL or srvtoavoid if found */
 	return avoided;
 }
@@ -250,16 +258,18 @@ struct server *map_get_server_rr(struct proxy *px, struct server *srvtoavoid)
  * pointed to by the result of a modulo operation on <hash>. The server map may
  * be recomputed if required before being looked up. If any server is found, it
  * will be returned.  If no valid server is found, NULL is returned.
+ *
+ * The lbprm's lock will be used.
  */
 struct server *map_get_server_hash(struct proxy *px, unsigned int hash)
 {
-	if (px->lbprm.tot_weight == 0)
-		return NULL;
+	struct server *srv = NULL;
 
-	if (px->lbprm.map.state & LB_MAP_RECALC)
-		recalc_server_map(px);
-
-	return px->lbprm.map.srv[hash % px->lbprm.tot_weight];
+	HA_RWLOCK_RDLOCK(LBPRM_LOCK, &px->lbprm.lock);
+	if (px->lbprm.tot_weight)
+		srv = px->lbprm.map.srv[hash % px->lbprm.tot_weight];
+	HA_RWLOCK_RDUNLOCK(LBPRM_LOCK, &px->lbprm.lock);
+	return srv;
 }
 
 

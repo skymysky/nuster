@@ -16,17 +16,12 @@
  *
  */
 
-#include <common/compat.h>
-#include <common/config.h>
-#include <common/debug.h>
-#include <common/standard.h>
-#include <eb32tree.h>
-
-#include <types/global.h>
-#include <types/server.h>
-
-#include <proto/backend.h>
-#include <proto/queue.h>
+#include <import/eb32tree.h>
+#include <haproxy/api.h>
+#include <haproxy/backend.h>
+#include <haproxy/queue.h>
+#include <haproxy/server-t.h>
+#include <haproxy/tools.h>
 
 /* Return next tree node after <node> which must still be in the tree, or be
  * NULL. Lookup wraps around the end to the beginning. If the next node is the
@@ -66,10 +61,12 @@ static inline void chash_dequeue_srv(struct server *s)
  * as many times as its weight indicates it. If it's there too often, we remove
  * the last occurrences. If it's not there enough, we add more occurrences. To
  * remove a server from the tree, normally call this with eweight=0.
+ *
+ * The server's lock and the lbprm's lock must be held.
  */
 static inline void chash_queue_dequeue_srv(struct server *s)
 {
-	while (s->lb_nodes_now > s->eweight) {
+	while (s->lb_nodes_now > s->next_eweight) {
 		if (s->lb_nodes_now >= s->lb_nodes_tot) // should always be false anyway
 			s->lb_nodes_now = s->lb_nodes_tot;
 		s->lb_nodes_now--;
@@ -78,7 +75,31 @@ static inline void chash_queue_dequeue_srv(struct server *s)
 		eb32_delete(&s->lb_nodes[s->lb_nodes_now].node);
 	}
 
-	while (s->lb_nodes_now < s->eweight) {
+	/* Attempt to increase the total number of nodes, if the user
+	 * increased the weight beyond the original weight
+	 */
+	if (s->lb_nodes_tot < s->next_eweight) {
+		struct tree_occ *new_nodes;
+
+		/* First we need to remove all server's entries from its tree
+		 * because the realloc will change all nodes pointers */
+		chash_dequeue_srv(s);
+
+		new_nodes = realloc(s->lb_nodes, s->next_eweight * sizeof(*new_nodes));
+		if (new_nodes) {
+			unsigned int j;
+
+			s->lb_nodes = new_nodes;
+			memset(&s->lb_nodes[s->lb_nodes_tot], 0,
+			    (s->next_eweight - s->lb_nodes_tot) * sizeof(*s->lb_nodes));
+			for (j = s->lb_nodes_tot; j < s->next_eweight; j++) {
+				s->lb_nodes[j].server = s;
+				s->lb_nodes[j].node.key = full_hash(s->puid * SRV_EWGHT_RANGE + j);
+			}
+			s->lb_nodes_tot = s->next_eweight;
+		}
+	}
+	while (s->lb_nodes_now < s->next_eweight) {
 		if (s->lb_nodes_now >= s->lb_nodes_tot) // should always be false anyway
 			break;
 		if (s->proxy->lbprm.chash.last == &s->lb_nodes[s->lb_nodes_now].node)
@@ -93,23 +114,27 @@ static inline void chash_queue_dequeue_srv(struct server *s)
  * It is not important whether the server was already down or not. It is not
  * important either that the new state is completely down (the caller may not
  * know all the variables of a server's state).
+ *
+ * The server's lock must be held. The lbprm lock will be used.
  */
 static void chash_set_server_status_down(struct server *srv)
 {
 	struct proxy *p = srv->proxy;
 
 	if (!srv_lb_status_changed(srv))
-		return;
+               return;
 
-	if (srv_is_usable(srv))
+	HA_RWLOCK_WRLOCK(LBPRM_LOCK, &p->lbprm.lock);
+
+	if (srv_willbe_usable(srv))
 		goto out_update_state;
 
-	if (!srv_was_usable(srv))
+	if (!srv_currently_usable(srv))
 		/* server was already down */
 		goto out_update_backend;
 
 	if (srv->flags & SRV_F_BACKUP) {
-		p->lbprm.tot_wbck -= srv->prev_eweight;
+		p->lbprm.tot_wbck -= srv->cur_eweight;
 		p->srv_bck--;
 
 		if (srv == p->lbprm.fbck) {
@@ -121,11 +146,11 @@ static void chash_set_server_status_down(struct server *srv)
 				srv2 = srv2->next;
 			} while (srv2 &&
 				 !((srv2->flags & SRV_F_BACKUP) &&
-				   srv_is_usable(srv2)));
+				   srv_willbe_usable(srv2)));
 			p->lbprm.fbck = srv2;
 		}
 	} else {
-		p->lbprm.tot_wact -= srv->prev_eweight;
+		p->lbprm.tot_wact -= srv->cur_eweight;
 		p->srv_act--;
 	}
 
@@ -136,6 +161,8 @@ out_update_backend:
 	update_backend_weight(p);
  out_update_state:
 	srv_lb_commit_status(srv);
+
+	HA_RWLOCK_WRUNLOCK(LBPRM_LOCK, &p->lbprm.lock);
 }
 
 /* This function updates the server trees according to server <srv>'s new
@@ -144,23 +171,27 @@ out_update_backend:
  * important either that the new state is completely UP (the caller may not
  * know all the variables of a server's state). This function will not change
  * the weight of a server which was already up.
+ *
+ * The server's lock must be held. The lbprm lock will be used.
  */
 static void chash_set_server_status_up(struct server *srv)
 {
 	struct proxy *p = srv->proxy;
 
 	if (!srv_lb_status_changed(srv))
-		return;
+               return;
 
-	if (!srv_is_usable(srv))
+	HA_RWLOCK_WRLOCK(LBPRM_LOCK, &p->lbprm.lock);
+
+	if (!srv_willbe_usable(srv))
 		goto out_update_state;
 
-	if (srv_was_usable(srv))
+	if (srv_currently_usable(srv))
 		/* server was already up */
 		goto out_update_backend;
 
 	if (srv->flags & SRV_F_BACKUP) {
-		p->lbprm.tot_wbck += srv->eweight;
+		p->lbprm.tot_wbck += srv->next_eweight;
 		p->srv_bck++;
 
 		if (!(p->options & PR_O_USE_ALL_BK)) {
@@ -180,7 +211,7 @@ static void chash_set_server_status_up(struct server *srv)
 			}
 		}
 	} else {
-		p->lbprm.tot_wact += srv->eweight;
+		p->lbprm.tot_wact += srv->next_eweight;
 		p->srv_act++;
 	}
 
@@ -192,10 +223,14 @@ static void chash_set_server_status_up(struct server *srv)
 	update_backend_weight(p);
  out_update_state:
 	srv_lb_commit_status(srv);
+
+	HA_RWLOCK_WRUNLOCK(LBPRM_LOCK, &p->lbprm.lock);
 }
 
 /* This function must be called after an update to server <srv>'s effective
  * weight. It may be called after a state change too.
+ *
+ * The server's lock must be held. The lbprm lock may be used.
  */
 static void chash_update_server_weight(struct server *srv)
 {
@@ -213,8 +248,8 @@ static void chash_update_server_weight(struct server *srv)
 	 * possibly a new tree for this server.
 	 */
 
-	old_state = srv_was_usable(srv);
-	new_state = srv_is_usable(srv);
+	old_state = srv_currently_usable(srv);
+	new_state = srv_willbe_usable(srv);
 
 	if (!old_state && !new_state) {
 		srv_lb_commit_status(srv);
@@ -229,16 +264,20 @@ static void chash_update_server_weight(struct server *srv)
 		return;
 	}
 
+	HA_RWLOCK_WRLOCK(LBPRM_LOCK, &p->lbprm.lock);
+
 	/* only adjust the server's presence in the tree */
 	chash_queue_dequeue_srv(srv);
 
 	if (srv->flags & SRV_F_BACKUP)
-		p->lbprm.tot_wbck += srv->eweight - srv->prev_eweight;
+		p->lbprm.tot_wbck += srv->next_eweight - srv->cur_eweight;
 	else
-		p->lbprm.tot_wact += srv->eweight - srv->prev_eweight;
+		p->lbprm.tot_wact += srv->next_eweight - srv->cur_eweight;
 
 	update_backend_weight(p);
 	srv_lb_commit_status(srv);
+
+	HA_RWLOCK_WRUNLOCK(LBPRM_LOCK, &p->lbprm.lock);
 }
 
 /*
@@ -251,15 +290,15 @@ int chash_server_is_eligible(struct server *s)
 	/* The total number of slots to allocate is the total number of outstanding requests
 	 * (including the one we're about to make) times the load-balance-factor, rounded up.
 	 */
-	unsigned tot_slots = ((s->proxy->served + 1) * s->proxy->lbprm.chash.balance_factor + 99) / 100;
+	unsigned tot_slots = ((s->proxy->served + 1) * s->proxy->lbprm.hash_balance_factor + 99) / 100;
 	unsigned slots_per_weight = tot_slots / s->proxy->lbprm.tot_weight;
 	unsigned remainder = tot_slots % s->proxy->lbprm.tot_weight;
 
 	/* Allocate a whole number of slots per weight unit... */
-	unsigned slots = s->eweight * slots_per_weight;
+	unsigned slots = s->cur_eweight * slots_per_weight;
 
 	/* And then distribute the rest among servers proportionally to their weight. */
-	slots += ((s->cumulative_weight + s->eweight) * remainder) / s->proxy->lbprm.tot_weight
+	slots += ((s->cumulative_weight + s->cur_eweight) * remainder) / s->proxy->lbprm.tot_weight
 		- (s->cumulative_weight * remainder) / s->proxy->lbprm.tot_weight;
 
 	/* But never leave a server with 0. */
@@ -274,9 +313,10 @@ int chash_server_is_eligible(struct server *s)
  * the closest distance from the value of <hash>. Doing so ensures that even
  * with a well imbalanced hash, if some servers are close to each other, they
  * will still both receive traffic. If any server is found, it will be returned.
+ * It will also skip server <avoid> if the hash result ends on this one.
  * If no valid server is found, NULL is returned.
  */
-struct server *chash_get_server_hash(struct proxy *p, unsigned int hash)
+struct server *chash_get_server_hash(struct proxy *p, unsigned int hash, const struct server *avoid)
 {
 	struct eb32_node *next, *prev;
 	struct server *nsrv, *psrv;
@@ -284,21 +324,29 @@ struct server *chash_get_server_hash(struct proxy *p, unsigned int hash)
 	unsigned int dn, dp;
 	int loop;
 
+	HA_RWLOCK_RDLOCK(LBPRM_LOCK, &p->lbprm.lock);
+
 	if (p->srv_act)
 		root = &p->lbprm.chash.act;
-	else if (p->lbprm.fbck)
-		return p->lbprm.fbck;
+	else if (p->lbprm.fbck) {
+		nsrv = p->lbprm.fbck;
+		goto out;
+	}
 	else if (p->srv_bck)
 		root = &p->lbprm.chash.bck;
-	else
-		return NULL;
+	else {
+		nsrv = NULL;
+		goto out;
+	}
 
 	/* find the node after and the node before */
 	next = eb32_lookup_ge(root, hash);
 	if (!next)
 		next = eb32_first(root);
-	if (!next)
-		return NULL; /* tree is empty */
+	if (!next) {
+		nsrv = NULL; /* tree is empty */
+		goto out;
+	}
 
 	prev = eb32_prev(next);
 	if (!prev)
@@ -320,7 +368,7 @@ struct server *chash_get_server_hash(struct proxy *p, unsigned int hash)
 	}
 
 	loop = 0;
-	while (p->lbprm.chash.balance_factor && !chash_server_is_eligible(nsrv)) {
+	while (nsrv == avoid || (p->lbprm.hash_balance_factor && !chash_server_is_eligible(nsrv))) {
 		next = eb32_next(next);
 		if (!next) {
 			next = eb32_first(root);
@@ -330,6 +378,8 @@ struct server *chash_get_server_hash(struct proxy *p, unsigned int hash)
 		nsrv = eb32_entry(next, struct tree_occ, node)->server;
 	}
 
+ out:
+	HA_RWLOCK_RDUNLOCK(LBPRM_LOCK, &p->lbprm.lock);
 	return nsrv;
 }
 
@@ -345,14 +395,19 @@ struct server *chash_get_next_server(struct proxy *p, struct server *srvtoavoid)
 	srv = avoided = NULL;
 	avoided_node = NULL;
 
+	HA_RWLOCK_WRLOCK(LBPRM_LOCK, &p->lbprm.lock);
 	if (p->srv_act)
 		root = &p->lbprm.chash.act;
-	else if (p->lbprm.fbck)
-		return p->lbprm.fbck;
+	else if (p->lbprm.fbck) {
+		srv = p->lbprm.fbck;
+		goto out;
+	}
 	else if (p->srv_bck)
 		root = &p->lbprm.chash.bck;
-	else
-		return NULL;
+	else {
+		srv = NULL;
+		goto out;
+	}
 
 	stop = node = p->lbprm.chash.last;
 	do {
@@ -364,9 +419,11 @@ struct server *chash_get_next_server(struct proxy *p, struct server *srvtoavoid)
 			node = eb32_first(root);
 
 		p->lbprm.chash.last = node;
-		if (!node)
+		if (!node) {
 			/* no node is available */
-			return NULL;
+			srv = NULL;
+			goto out;
+		}
 
 		/* Note: if we came here after a down/up cycle with no last
 		 * pointer, and after a redispatch (srvtoavoid is set), we
@@ -396,6 +453,8 @@ struct server *chash_get_next_server(struct proxy *p, struct server *srvtoavoid)
 		p->lbprm.chash.last = avoided_node;
 	}
 
+ out:
+	HA_RWLOCK_WRUNLOCK(LBPRM_LOCK, &p->lbprm.lock);
 	return srv;
 }
 
@@ -418,7 +477,7 @@ void chash_init_server_tree(struct proxy *p)
 
 	p->lbprm.wdiv = BE_WEIGHT_SCALE;
 	for (srv = p->srv; srv; srv = srv->next) {
-		srv->eweight = (srv->uweight * p->lbprm.wdiv + p->lbprm.wmult - 1) / p->lbprm.wmult;
+		srv->next_eweight = (srv->uweight * p->lbprm.wdiv + p->lbprm.wmult - 1) / p->lbprm.wmult;
 		srv_lb_commit_status(srv);
 	}
 
@@ -434,14 +493,14 @@ void chash_init_server_tree(struct proxy *p)
 		srv->lb_tree = (srv->flags & SRV_F_BACKUP) ? &p->lbprm.chash.bck : &p->lbprm.chash.act;
 		srv->lb_nodes_tot = srv->uweight * BE_WEIGHT_SCALE;
 		srv->lb_nodes_now = 0;
-		srv->lb_nodes = calloc(srv->lb_nodes_tot, sizeof(struct tree_occ));
-
+		srv->lb_nodes = calloc(srv->lb_nodes_tot,
+				       sizeof(*srv->lb_nodes));
 		for (node = 0; node < srv->lb_nodes_tot; node++) {
 			srv->lb_nodes[node].server = srv;
 			srv->lb_nodes[node].node.key = full_hash(srv->puid * SRV_EWGHT_RANGE + node);
 		}
 
-		if (srv_is_usable(srv))
+		if (srv_currently_usable(srv))
 			chash_queue_dequeue_srv(srv);
 	}
 }

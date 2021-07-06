@@ -2,14 +2,14 @@
  * experimental weighted round robin scheduler - (c) 2007 willy tarreau.
  *
  * This filling algorithm is excellent at spreading the servers, as it also
- * takes care of keeping the most uniform distance between occurences of each
+ * takes care of keeping the most uniform distance between occurrences of each
  * server, by maximizing this distance. It reduces the number of variables
  * and expensive operations.
  */
 
 #include <stdio.h>
 #include <stdlib.h>
-#include "eb32tree.h"
+#include <import/eb32tree.h>
 
 struct srv {
 	struct eb32_node node;

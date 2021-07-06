@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
 # Compares multiple branches against a reference and shows which ones contain
 # each commit, and the level of backports since the origin or its own ancestors.
@@ -132,7 +132,7 @@ dump_commit_matrix() {
 		done
 		line="${line} |"
 		if [ -z "$MISSING" -o $missing -gt 0 ]; then
-			[ $((count++)) -gt 0 ] || echo $title
+			[ $((count++)) -gt 0 ] || echo "$title"
 			[ "$QUIET" != "" -o $count -lt 20 ] || count=0
 			if [ -z "$UPSTREAM" -o "$upstream" = "none" -o -z "$upstream" ]; then
 				echo "$(short $ref) $line"
@@ -235,7 +235,7 @@ dump_commit_matrix | column -t | \
 			echo "---- Subject ----"
 		else
 			# doing it this way prevents git from abusing the terminal
-			echo $(git log -1 --pretty="%s" "$1")
+			echo "$(git log -1 --pretty="%s" "$1")"
 			left_commits[${#left_commits[@]}]="$1"
 			comm=""
 			while [ -n "$1" -a "$1" != "-" -a "$1" != "|" ]; do
@@ -249,12 +249,18 @@ dump_commit_matrix | column -t | \
 		echo "No missing commit to apply."
 	elif [ -n "$MISSING" ]; then
 		echo
-		echo "In order to show and/or apply all leftmost commits to current branch :"
-		echo "   git show ${left_commits[@]}"
-		echo "   git cherry-pick -x ${left_commits[@]}"
 		echo
-		echo "In order to show and/or apply all rightmost commits to current branch :"
-		echo "   git show ${right_commits[@]}"
-		echo "   git cherry-pick -x ${right_commits[@]}"
+		echo "In order to show and/or apply all leftmost commits to current branch :"
+		echo "   git show --pretty=format:'%C(yellow)commit  %H%C(normal)%nAuthor: %an <%ae>%nDate:   %aD%n%n%C(green)%C(bold)git cherry-pick -sx %h%n%n%w(72,4,4)%B%N' ${left_commits[@]}"
+		echo
+		echo "   git cherry-pick -sx ${left_commits[@]}"
+		echo
+		if [ "${left_commits[*]}" != "${right_commits[*]}" ]; then
+			echo "In order to show and/or apply all rightmost commits to current branch :"
+			echo "   git show --pretty=format:'%C(yellow)commit  %H%C(normal)%nAuthor: %an <%ae>%nDate:   %aD%n%n%C(green)%C(bold)git cherry-pick -sx %h%n%n%w(72,4,4)%B%N' ${right_commits[@]}"
+			echo
+			echo "   git cherry-pick -sx ${right_commits[@]}"
+			echo
+		fi
 	fi
 )

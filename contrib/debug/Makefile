@@ -1,11 +1,16 @@
-INCLUDE  = -I../../include -I../../ebtree
+INCLUDE  = -I../../include
 
 CC       = gcc
 OPTIMIZE = -O2
 DEFINE   =
-OBJS     = flags
+OBJS     = flags poll
+
+all: $(OBJS)
 
 flags: flags.c
+	$(CC) $(OPTIMIZE) $(DEFINE) $(INCLUDE) -o $@ $^
+
+poll: poll.c
 	$(CC) $(OPTIMIZE) $(DEFINE) $(INCLUDE) -o $@ $^
 
 clean:

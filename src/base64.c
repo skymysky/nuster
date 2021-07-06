@@ -14,8 +14,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include <common/base64.h>
-#include <common/config.h>
+#include <haproxy/api.h>
+#include <haproxy/base64.h>
 
 #define B64BASE	'#'		/* arbitrary chosen base value */
 #define B64CMIN	'+'
@@ -83,7 +83,9 @@ int base64dec(const char *in, size_t ilen, char *out, size_t olen) {
 	if (ilen % 4)
 		return -1;
 
-	if (olen < ilen / 4 * 3)
+	if (olen < ((ilen / 4 * 3)
+	            - (in[ilen-1] == '=' ? 1 : 0)
+	            - (in[ilen-2] == '=' ? 1 : 0)))
 		return -2;
 
 	while (ilen) {
@@ -99,7 +101,7 @@ int base64dec(const char *in, size_t ilen, char *out, size_t olen) {
 		if (b < 0)
 			return -1;
 
-		/* padding has to be continous */
+		/* padding has to be continuous */
 		if (pad && b != B64PADV)
 			return -1;
 

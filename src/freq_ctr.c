@@ -10,11 +10,10 @@
  *
  */
 
-#include <common/config.h>
-#include <common/standard.h>
-#include <common/time.h>
-#include <common/tools.h>
-#include <proto/freq_ctr.h>
+#include <haproxy/api.h>
+#include <haproxy/freq_ctr.h>
+#include <haproxy/time.h>
+#include <haproxy/tools.h>
 
 /* Read a frequency counter taking history into account for missing time in
  * current period. Current second is sub-divided in 1000 chunks of one ms,
@@ -30,18 +29,35 @@
  */
 unsigned int read_freq_ctr(struct freq_ctr *ctr)
 {
-	unsigned int curr, past;
-	unsigned int age;
+	unsigned int curr, past, _curr, _past;
+	unsigned int age, curr_sec, _curr_sec;
 
-	age = now.tv_sec - ctr->curr_sec;
+	while (1) {
+		_curr = ctr->curr_ctr;
+		__ha_compiler_barrier();
+		_past = ctr->prev_ctr;
+		__ha_compiler_barrier();
+		_curr_sec = ctr->curr_sec;
+		__ha_compiler_barrier();
+		if (_curr_sec & 0x80000000)
+			continue;
+		curr = ctr->curr_ctr;
+		__ha_compiler_barrier();
+		past = ctr->prev_ctr;
+		__ha_compiler_barrier();
+		curr_sec = ctr->curr_sec;
+		__ha_compiler_barrier();
+		if (_curr == curr && _past == past && _curr_sec == curr_sec)
+			break;
+	}
+
+	age = now.tv_sec - curr_sec;
 	if (unlikely(age > 1))
 		return 0;
 
-	curr = 0;		
-	past = ctr->curr_ctr;
-	if (likely(!age)) {
-		curr = past;
-		past = ctr->prev_ctr;
+	if (unlikely(age)) {
+		past = curr;
+		curr = 0;
 	}
 
 	if (past <= 1 && !curr)
@@ -56,17 +72,35 @@ unsigned int read_freq_ctr(struct freq_ctr *ctr)
  */
 unsigned int freq_ctr_remain(struct freq_ctr *ctr, unsigned int freq, unsigned int pend)
 {
-	unsigned int curr, past;
-	unsigned int age;
+	unsigned int curr, past, _curr, _past;
+	unsigned int age, curr_sec, _curr_sec;
 
-	curr = 0;		
-	age = now.tv_sec - ctr->curr_sec;
+	while (1) {
+		_curr = ctr->curr_ctr;
+		__ha_compiler_barrier();
+		_past = ctr->prev_ctr;
+		__ha_compiler_barrier();
+		_curr_sec = ctr->curr_sec;
+		__ha_compiler_barrier();
+		if (_curr_sec & 0x80000000)
+			continue;
+		curr = ctr->curr_ctr;
+		__ha_compiler_barrier();
+		past = ctr->prev_ctr;
+		__ha_compiler_barrier();
+		curr_sec = ctr->curr_sec;
+		__ha_compiler_barrier();
+		if (_curr == curr && _past == past && _curr_sec == curr_sec)
+			break;
+	}
 
-	if (likely(age <= 1)) {
-		past = ctr->curr_ctr;
-		if (likely(!age)) {
-			curr = past;
-			past = ctr->prev_ctr;
+	age = now.tv_sec - curr_sec;
+	if (unlikely(age > 1))
+		curr = 0;
+	else {
+		if (unlikely(age == 1)) {
+			past = curr;
+			curr = 0;
 		}
 		curr += mul32hi(past, ms_left_scaled);
 	}
@@ -85,18 +119,35 @@ unsigned int freq_ctr_remain(struct freq_ctr *ctr, unsigned int freq, unsigned i
  */
 unsigned int next_event_delay(struct freq_ctr *ctr, unsigned int freq, unsigned int pend)
 {
-	unsigned int curr, past;
-	unsigned int wait, age;
+	unsigned int curr, past, _curr, _past;
+	unsigned int wait, age, curr_sec, _curr_sec;
 
-	past = 0;
-	curr = 0;		
-	age = now.tv_sec - ctr->curr_sec;
+	while (1) {
+		_curr = ctr->curr_ctr;
+		__ha_compiler_barrier();
+		_past = ctr->prev_ctr;
+		__ha_compiler_barrier();
+		_curr_sec = ctr->curr_sec;
+		__ha_compiler_barrier();
+		if (_curr_sec & 0x80000000)
+			continue;
+		curr = ctr->curr_ctr;
+		__ha_compiler_barrier();
+		past = ctr->prev_ctr;
+		__ha_compiler_barrier();
+		curr_sec = ctr->curr_sec;
+		__ha_compiler_barrier();
+		if (_curr == curr && _past == past && _curr_sec == curr_sec)
+			break;
+	}
 
-	if (likely(age <= 1)) {
-		past = ctr->curr_ctr;
-		if (likely(!age)) {
-			curr = past;
-			past = ctr->prev_ctr;
+	age = now.tv_sec - curr_sec;
+	if (unlikely(age > 1))
+		curr = 0;
+	else {
+		if (unlikely(age == 1)) {
+			past = curr;
+			curr = 0;
 		}
 		curr += mul32hi(past, ms_left_scaled);
 	}
@@ -127,13 +178,29 @@ unsigned int next_event_delay(struct freq_ctr *ctr, unsigned int freq, unsigned 
  */
 unsigned int read_freq_ctr_period(struct freq_ctr_period *ctr, unsigned int period)
 {
-	unsigned int curr, past;
-	unsigned int remain;
+	unsigned int _curr, _past, curr, past;
+	unsigned int remain, _curr_tick, curr_tick;
 
-	curr = ctr->curr_ctr;
-	past = ctr->prev_ctr;
+	while (1) {
+		_curr = ctr->curr_ctr;
+		__ha_compiler_barrier();
+		_past = ctr->prev_ctr;
+		__ha_compiler_barrier();
+		_curr_tick = ctr->curr_tick;
+		__ha_compiler_barrier();
+		if (_curr_tick & 0x1)
+			continue;
+		curr = ctr->curr_ctr;
+		__ha_compiler_barrier();
+		past = ctr->prev_ctr;
+		__ha_compiler_barrier();
+		curr_tick = ctr->curr_tick;
+		__ha_compiler_barrier();
+		if (_curr == curr && _past == past && _curr_tick == curr_tick)
+			break;
+	};
 
-	remain = ctr->curr_tick + period - now_ms;
+	remain = curr_tick + period - now_ms;
 	if (unlikely((int)remain < 0)) {
 		/* We're past the first period, check if we can still report a
 		 * part of last period or if we're too far away.
@@ -158,13 +225,29 @@ unsigned int read_freq_ctr_period(struct freq_ctr_period *ctr, unsigned int peri
 unsigned int freq_ctr_remain_period(struct freq_ctr_period *ctr, unsigned int period,
 				    unsigned int freq, unsigned int pend)
 {
-	unsigned int curr, past;
-	unsigned int remain;
+	unsigned int _curr, _past, curr, past;
+	unsigned int remain, _curr_tick, curr_tick;
 
-	curr = ctr->curr_ctr;
-	past = ctr->prev_ctr;
+	while (1) {
+		_curr = ctr->curr_ctr;
+		__ha_compiler_barrier();
+		_past = ctr->prev_ctr;
+		__ha_compiler_barrier();
+		_curr_tick = ctr->curr_tick;
+		__ha_compiler_barrier();
+		if (_curr_tick & 0x1)
+			continue;
+		curr = ctr->curr_ctr;
+		__ha_compiler_barrier();
+		past = ctr->prev_ctr;
+		__ha_compiler_barrier();
+		curr_tick = ctr->curr_tick;
+		__ha_compiler_barrier();
+		if (_curr == curr && _past == past && _curr_tick == curr_tick)
+			break;
+	};
 
-	remain = ctr->curr_tick + period - now_ms;
+	remain = curr_tick + period - now_ms;
 	if (likely((int)remain < 0)) {
 		/* We're past the first period, check if we can still report a
 		 * part of last period or if we're too far away.

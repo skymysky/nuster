@@ -12,20 +12,21 @@
 
 #include <ctype.h>
 #include <stdio.h>
+#include <errno.h>
 
-#include <common/config.h>
-#include <common/standard.h>
-
-#include <types/global.h>
-#include <types/pattern.h>
-
-#include <proto/log.h>
-#include <proto/pattern.h>
-#include <proto/sample.h>
-
-#include <ebsttree.h>
+#include <import/ebsttree.h>
 #include <import/lru.h>
 #include <import/xxhash.h>
+
+#include <haproxy/api.h>
+#include <haproxy/global.h>
+#include <haproxy/log.h>
+#include <haproxy/net_helper.h>
+#include <haproxy/pattern.h>
+#include <haproxy/regex.h>
+#include <haproxy/sample.h>
+#include <haproxy/tools.h>
+
 
 char *pat_match_names[PAT_MATCH_NUM] = {
 	[PAT_MATCH_FOUND] = "found",
@@ -78,38 +79,21 @@ int (*pat_index_fcts[PAT_MATCH_NUM])(struct pattern_expr *, struct pattern *, ch
 	[PAT_MATCH_REGM]  = pat_idx_list_regm,
 };
 
-void (*pat_delete_fcts[PAT_MATCH_NUM])(struct pattern_expr *, struct pat_ref_elt *) = {
-	[PAT_MATCH_FOUND] = pat_del_list_val,
-	[PAT_MATCH_BOOL]  = pat_del_list_val,
-	[PAT_MATCH_INT]   = pat_del_list_val,
-	[PAT_MATCH_IP]    = pat_del_tree_ip,
-	[PAT_MATCH_BIN]   = pat_del_list_ptr,
-	[PAT_MATCH_LEN]   = pat_del_list_val,
-	[PAT_MATCH_STR]   = pat_del_tree_str,
-	[PAT_MATCH_BEG]   = pat_del_tree_str,
-	[PAT_MATCH_SUB]   = pat_del_list_ptr,
-	[PAT_MATCH_DIR]   = pat_del_list_ptr,
-	[PAT_MATCH_DOM]   = pat_del_list_ptr,
-	[PAT_MATCH_END]   = pat_del_list_ptr,
-	[PAT_MATCH_REG]   = pat_del_list_reg,
-	[PAT_MATCH_REGM]  = pat_del_list_reg,
-};
-
 void (*pat_prune_fcts[PAT_MATCH_NUM])(struct pattern_expr *) = {
-	[PAT_MATCH_FOUND] = pat_prune_val,
-	[PAT_MATCH_BOOL]  = pat_prune_val,
-	[PAT_MATCH_INT]   = pat_prune_val,
-	[PAT_MATCH_IP]    = pat_prune_val,
-	[PAT_MATCH_BIN]   = pat_prune_ptr,
-	[PAT_MATCH_LEN]   = pat_prune_val,
-	[PAT_MATCH_STR]   = pat_prune_ptr,
-	[PAT_MATCH_BEG]   = pat_prune_ptr,
-	[PAT_MATCH_SUB]   = pat_prune_ptr,
-	[PAT_MATCH_DIR]   = pat_prune_ptr,
-	[PAT_MATCH_DOM]   = pat_prune_ptr,
-	[PAT_MATCH_END]   = pat_prune_ptr,
-	[PAT_MATCH_REG]   = pat_prune_reg,
-	[PAT_MATCH_REGM]  = pat_prune_reg,
+	[PAT_MATCH_FOUND] = pat_prune_gen,
+	[PAT_MATCH_BOOL]  = pat_prune_gen,
+	[PAT_MATCH_INT]   = pat_prune_gen,
+	[PAT_MATCH_IP]    = pat_prune_gen,
+	[PAT_MATCH_BIN]   = pat_prune_gen,
+	[PAT_MATCH_LEN]   = pat_prune_gen,
+	[PAT_MATCH_STR]   = pat_prune_gen,
+	[PAT_MATCH_BEG]   = pat_prune_gen,
+	[PAT_MATCH_SUB]   = pat_prune_gen,
+	[PAT_MATCH_DIR]   = pat_prune_gen,
+	[PAT_MATCH_DOM]   = pat_prune_gen,
+	[PAT_MATCH_END]   = pat_prune_gen,
+	[PAT_MATCH_REG]   = pat_prune_gen,
+	[PAT_MATCH_REGM]  = pat_prune_gen,
 };
 
 struct pattern *(*pat_match_fcts[PAT_MATCH_NUM])(struct sample *, struct pattern_expr *, int) = {
@@ -148,12 +132,13 @@ int pat_match_types[PAT_MATCH_NUM] = {
 };
 
 /* this struct is used to return information */
-static struct pattern static_pattern;
+static THREAD_LOCAL struct pattern static_pattern;
+static THREAD_LOCAL struct sample_data static_sample_data;
 
 /* This is the root of the list of all pattern_ref avalaibles. */
 struct list pattern_reference = LIST_HEAD_INIT(pattern_reference);
 
-static struct lru64_head *pat_lru_tree;
+static THREAD_LOCAL struct lru64_head *pat_lru_tree;
 static unsigned long long pat_lru_seed;
 
 /*
@@ -219,12 +204,12 @@ int pat_parse_str(const char *text, struct pattern *pattern, int mflags, char **
 /* Parse a binary written in hexa. It is allocated. */
 int pat_parse_bin(const char *text, struct pattern *pattern, int mflags, char **err)
 {
-	struct chunk *trash;
+	struct buffer *trash;
 
 	pattern->type = SMP_T_BIN;
 	trash = get_trash_chunk();
 	pattern->len = trash->size;
-	pattern->ptr.str = trash->str;
+	pattern->ptr.str = trash->area;
 	return !!parse_binary(text, &pattern->ptr.str, &pattern->len, err);
 }
 
@@ -423,8 +408,8 @@ int pat_parse_ip(const char *text, struct pattern *pattern, int mflags, char **e
  *
  * These functions are exported and may be used by any other component.
  *
- * This fucntion just take a sample <smp> and check if this sample match
- * with the pattern <pattern>. This fucntion return just PAT_MATCH or
+ * This function just takes a sample <smp> and checks if this sample matches
+ * with the pattern <pattern>. This function returns only PAT_MATCH or
  * PAT_NOMATCH.
  *
  */
@@ -446,12 +431,11 @@ struct pattern *pat_match_nothing(struct sample *smp, struct pattern_expr *expr,
 }
 
 
-/* NB: For two strings to be identical, it is required that their lengths match */
+/* NB: For two strings to be identical, it is required that their length match */
 struct pattern *pat_match_str(struct sample *smp, struct pattern_expr *expr, int fill)
 {
 	int icase;
 	struct ebmb_node *node;
-	char prev;
 	struct pattern_tree *elt;
 	struct pattern_list *lst;
 	struct pattern *pattern;
@@ -460,17 +444,42 @@ struct pattern *pat_match_str(struct sample *smp, struct pattern_expr *expr, int
 
 	/* Lookup a string in the expression's pattern tree. */
 	if (!eb_is_empty(&expr->pattern_tree)) {
-		/* we may have to force a trailing zero on the test pattern */
-		prev = smp->data.u.str.str[smp->data.u.str.len];
-		if (prev)
-			smp->data.u.str.str[smp->data.u.str.len] = '\0';
-		node = ebst_lookup(&expr->pattern_tree, smp->data.u.str.str);
-		if (prev)
-			smp->data.u.str.str[smp->data.u.str.len] = prev;
+		char prev = 0;
 
-		if (node) {
+		if (smp->data.u.str.data < smp->data.u.str.size) {
+			/* we may have to force a trailing zero on the test pattern and
+			 * the buffer is large enough to accommodate it. If the flag
+			 * CONST is set, duplicate the string
+			 */
+			prev = smp->data.u.str.area[smp->data.u.str.data];
+			if (prev) {
+				if (smp->flags & SMP_F_CONST) {
+					if (!smp_dup(smp))
+						return NULL;
+				} else {
+					smp->data.u.str.area[smp->data.u.str.data] = '\0';
+				}
+			}
+		}
+		else {
+			/* Otherwise, the sample is duplicated. A trailing zero
+			 * is automatically added to the string.
+			 */
+			if (!smp_dup(smp))
+				return NULL;
+		}
+
+		node = ebst_lookup(&expr->pattern_tree, smp->data.u.str.area);
+		if (prev)
+			smp->data.u.str.area[smp->data.u.str.data] = prev;
+
+		while (node) {
+			elt = ebmb_entry(node, struct pattern_tree, node);
+			if (elt->ref->gen_id != expr->ref->curr_gen) {
+				node = ebmb_next(node);
+				continue;
+			}
 			if (fill) {
-				elt = ebmb_entry(node, struct pattern_tree, node);
 				static_pattern.data = elt->data;
 				static_pattern.ref = elt->ref;
 				static_pattern.sflags = PAT_SF_TREE;
@@ -485,28 +494,34 @@ struct pattern *pat_match_str(struct sample *smp, struct pattern_expr *expr, int
 	if (pat_lru_tree) {
 		unsigned long long seed = pat_lru_seed ^ (long)expr;
 
-		lru = lru64_get(XXH64(smp->data.u.str.str, smp->data.u.str.len, seed),
-				pat_lru_tree, expr, expr->revision);
-		if (lru && lru->domain)
-			return lru->data;
+		lru = lru64_get(XXH3(smp->data.u.str.area, smp->data.u.str.data, seed),
+				pat_lru_tree, expr, expr->ref->revision);
+		if (lru && lru->domain) {
+			ret = lru->data;
+			return ret;
+		}
 	}
+
 
 	list_for_each_entry(lst, &expr->patterns, list) {
 		pattern = &lst->pat;
 
-		if (pattern->len != smp->data.u.str.len)
+		if (pattern->ref->gen_id != expr->ref->curr_gen)
+			continue;
+
+		if (pattern->len != smp->data.u.str.data)
 			continue;
 
 		icase = expr->mflags & PAT_MF_IGNORE_CASE;
-		if ((icase && strncasecmp(pattern->ptr.str, smp->data.u.str.str, smp->data.u.str.len) == 0) ||
-		    (!icase && strncmp(pattern->ptr.str, smp->data.u.str.str, smp->data.u.str.len) == 0)) {
+		if ((icase && strncasecmp(pattern->ptr.str, smp->data.u.str.area, smp->data.u.str.data) == 0) ||
+		    (!icase && strncmp(pattern->ptr.str, smp->data.u.str.area, smp->data.u.str.data) == 0)) {
 			ret = pattern;
 			break;
 		}
 	}
 
 	if (lru)
-	    lru64_commit(lru, ret, expr, expr->revision, NULL);
+		lru64_commit(lru, ret, expr, expr->ref->revision, NULL);
 
 	return ret;
 }
@@ -522,26 +537,31 @@ struct pattern *pat_match_bin(struct sample *smp, struct pattern_expr *expr, int
 	if (pat_lru_tree) {
 		unsigned long long seed = pat_lru_seed ^ (long)expr;
 
-		lru = lru64_get(XXH64(smp->data.u.str.str, smp->data.u.str.len, seed),
-				pat_lru_tree, expr, expr->revision);
-		if (lru && lru->domain)
-			return lru->data;
+		lru = lru64_get(XXH3(smp->data.u.str.area, smp->data.u.str.data, seed),
+				pat_lru_tree, expr, expr->ref->revision);
+		if (lru && lru->domain) {
+			ret = lru->data;
+			return ret;
+		}
 	}
 
 	list_for_each_entry(lst, &expr->patterns, list) {
 		pattern = &lst->pat;
 
-		if (pattern->len != smp->data.u.str.len)
+		if (pattern->ref->gen_id != expr->ref->curr_gen)
 			continue;
 
-		if (memcmp(pattern->ptr.str, smp->data.u.str.str, smp->data.u.str.len) == 0) {
+		if (pattern->len != smp->data.u.str.data)
+			continue;
+
+		if (memcmp(pattern->ptr.str, smp->data.u.str.area, smp->data.u.str.data) == 0) {
 			ret = pattern;
 			break;
 		}
 	}
 
 	if (lru)
-	    lru64_commit(lru, ret, expr, expr->revision, NULL);
+		lru64_commit(lru, ret, expr, expr->ref->revision, NULL);
 
 	return ret;
 }
@@ -559,7 +579,10 @@ struct pattern *pat_match_regm(struct sample *smp, struct pattern_expr *expr, in
 	list_for_each_entry(lst, &expr->patterns, list) {
 		pattern = &lst->pat;
 
-		if (regex_exec_match2(pattern->ptr.reg, smp->data.u.str.str, smp->data.u.str.len,
+		if (pattern->ref->gen_id != expr->ref->curr_gen)
+			continue;
+
+		if (regex_exec_match2(pattern->ptr.reg, smp->data.u.str.area, smp->data.u.str.data,
 		                      MAX_MATCH, pmatch, 0)) {
 			ret = pattern;
 			smp->ctx.a[0] = pmatch;
@@ -583,23 +606,28 @@ struct pattern *pat_match_reg(struct sample *smp, struct pattern_expr *expr, int
 	if (pat_lru_tree) {
 		unsigned long long seed = pat_lru_seed ^ (long)expr;
 
-		lru = lru64_get(XXH64(smp->data.u.str.str, smp->data.u.str.len, seed),
-				pat_lru_tree, expr, expr->revision);
-		if (lru && lru->domain)
-			return lru->data;
+		lru = lru64_get(XXH3(smp->data.u.str.area, smp->data.u.str.data, seed),
+				pat_lru_tree, expr, expr->ref->revision);
+		if (lru && lru->domain) {
+			ret = lru->data;
+			return ret;
+		}
 	}
 
 	list_for_each_entry(lst, &expr->patterns, list) {
 		pattern = &lst->pat;
 
-		if (regex_exec2(pattern->ptr.reg, smp->data.u.str.str, smp->data.u.str.len)) {
+		if (pattern->ref->gen_id != expr->ref->curr_gen)
+			continue;
+
+		if (regex_exec2(pattern->ptr.reg, smp->data.u.str.area, smp->data.u.str.data)) {
 			ret = pattern;
 			break;
 		}
 	}
 
 	if (lru)
-	    lru64_commit(lru, ret, expr, expr->revision, NULL);
+		lru64_commit(lru, ret, expr, expr->ref->revision, NULL);
 
 	return ret;
 }
@@ -609,7 +637,6 @@ struct pattern *pat_match_beg(struct sample *smp, struct pattern_expr *expr, int
 {
 	int icase;
 	struct ebmb_node *node;
-	char prev;
 	struct pattern_tree *elt;
 	struct pattern_list *lst;
 	struct pattern *pattern;
@@ -618,17 +645,36 @@ struct pattern *pat_match_beg(struct sample *smp, struct pattern_expr *expr, int
 
 	/* Lookup a string in the expression's pattern tree. */
 	if (!eb_is_empty(&expr->pattern_tree)) {
-		/* we may have to force a trailing zero on the test pattern */
-		prev = smp->data.u.str.str[smp->data.u.str.len];
-		if (prev)
-			smp->data.u.str.str[smp->data.u.str.len] = '\0';
-		node = ebmb_lookup_longest(&expr->pattern_tree, smp->data.u.str.str);
-		if (prev)
-			smp->data.u.str.str[smp->data.u.str.len] = prev;
+		char prev = 0;
 
-		if (node) {
+		if (smp->data.u.str.data < smp->data.u.str.size) {
+			/* we may have to force a trailing zero on the test pattern and
+			 * the buffer is large enough to accommodate it.
+			 */
+			prev = smp->data.u.str.area[smp->data.u.str.data];
+			if (prev)
+				smp->data.u.str.area[smp->data.u.str.data] = '\0';
+		}
+		else {
+			/* Otherwise, the sample is duplicated. A trailing zero
+			 * is automatically added to the string.
+			 */
+			if (!smp_dup(smp))
+				return NULL;
+		}
+
+		node = ebmb_lookup_longest(&expr->pattern_tree,
+					   smp->data.u.str.area);
+		if (prev)
+			smp->data.u.str.area[smp->data.u.str.data] = prev;
+
+		while (node) {
+			elt = ebmb_entry(node, struct pattern_tree, node);
+			if (elt->ref->gen_id != expr->ref->curr_gen) {
+				node = ebmb_next(node);
+				continue;
+			}
 			if (fill) {
-				elt = ebmb_entry(node, struct pattern_tree, node);
 				static_pattern.data = elt->data;
 				static_pattern.ref = elt->ref;
 				static_pattern.sflags = PAT_SF_TREE;
@@ -643,21 +689,26 @@ struct pattern *pat_match_beg(struct sample *smp, struct pattern_expr *expr, int
 	if (pat_lru_tree) {
 		unsigned long long seed = pat_lru_seed ^ (long)expr;
 
-		lru = lru64_get(XXH64(smp->data.u.str.str, smp->data.u.str.len, seed),
-				pat_lru_tree, expr, expr->revision);
-		if (lru && lru->domain)
-			return lru->data;
+		lru = lru64_get(XXH3(smp->data.u.str.area, smp->data.u.str.data, seed),
+				pat_lru_tree, expr, expr->ref->revision);
+		if (lru && lru->domain) {
+			ret = lru->data;
+			return ret;
+		}
 	}
 
 	list_for_each_entry(lst, &expr->patterns, list) {
 		pattern = &lst->pat;
 
-		if (pattern->len > smp->data.u.str.len)
+		if (pattern->ref->gen_id != expr->ref->curr_gen)
+			continue;
+
+		if (pattern->len > smp->data.u.str.data)
 			continue;
 
 		icase = expr->mflags & PAT_MF_IGNORE_CASE;
-		if ((icase && strncasecmp(pattern->ptr.str, smp->data.u.str.str, pattern->len) != 0) ||
-		    (!icase && strncmp(pattern->ptr.str, smp->data.u.str.str, pattern->len) != 0))
+		if ((icase && strncasecmp(pattern->ptr.str, smp->data.u.str.area, pattern->len) != 0) ||
+		    (!icase && strncmp(pattern->ptr.str, smp->data.u.str.area, pattern->len) != 0))
 			continue;
 
 		ret = pattern;
@@ -665,7 +716,7 @@ struct pattern *pat_match_beg(struct sample *smp, struct pattern_expr *expr, int
 	}
 
 	if (lru)
-	    lru64_commit(lru, ret, expr, expr->revision, NULL);
+		lru64_commit(lru, ret, expr, expr->ref->revision, NULL);
 
 	return ret;
 }
@@ -682,21 +733,26 @@ struct pattern *pat_match_end(struct sample *smp, struct pattern_expr *expr, int
 	if (pat_lru_tree) {
 		unsigned long long seed = pat_lru_seed ^ (long)expr;
 
-		lru = lru64_get(XXH64(smp->data.u.str.str, smp->data.u.str.len, seed),
-				pat_lru_tree, expr, expr->revision);
-		if (lru && lru->domain)
-			return lru->data;
+		lru = lru64_get(XXH3(smp->data.u.str.area, smp->data.u.str.data, seed),
+				pat_lru_tree, expr, expr->ref->revision);
+		if (lru && lru->domain) {
+			ret = lru->data;
+			return ret;
+		}
 	}
 
 	list_for_each_entry(lst, &expr->patterns, list) {
 		pattern = &lst->pat;
 
-		if (pattern->len > smp->data.u.str.len)
+		if (pattern->ref->gen_id != expr->ref->curr_gen)
+			continue;
+
+		if (pattern->len > smp->data.u.str.data)
 			continue;
 
 		icase = expr->mflags & PAT_MF_IGNORE_CASE;
-		if ((icase && strncasecmp(pattern->ptr.str, smp->data.u.str.str + smp->data.u.str.len - pattern->len, pattern->len) != 0) ||
-		    (!icase && strncmp(pattern->ptr.str, smp->data.u.str.str + smp->data.u.str.len - pattern->len, pattern->len) != 0))
+		if ((icase && strncasecmp(pattern->ptr.str, smp->data.u.str.area + smp->data.u.str.data - pattern->len, pattern->len) != 0) ||
+		    (!icase && strncmp(pattern->ptr.str, smp->data.u.str.area + smp->data.u.str.data - pattern->len, pattern->len) != 0))
 			continue;
 
 		ret = pattern;
@@ -704,7 +760,7 @@ struct pattern *pat_match_end(struct sample *smp, struct pattern_expr *expr, int
 	}
 
 	if (lru)
-	    lru64_commit(lru, ret, expr, expr->revision, NULL);
+		lru64_commit(lru, ret, expr, expr->ref->revision, NULL);
 
 	return ret;
 }
@@ -725,23 +781,28 @@ struct pattern *pat_match_sub(struct sample *smp, struct pattern_expr *expr, int
 	if (pat_lru_tree) {
 		unsigned long long seed = pat_lru_seed ^ (long)expr;
 
-		lru = lru64_get(XXH64(smp->data.u.str.str, smp->data.u.str.len, seed),
-				pat_lru_tree, expr, expr->revision);
-		if (lru && lru->domain)
-			return lru->data;
+		lru = lru64_get(XXH3(smp->data.u.str.area, smp->data.u.str.data, seed),
+				pat_lru_tree, expr, expr->ref->revision);
+		if (lru && lru->domain) {
+			ret = lru->data;
+			return ret;
+		}
 	}
 
 	list_for_each_entry(lst, &expr->patterns, list) {
 		pattern = &lst->pat;
 
-		if (pattern->len > smp->data.u.str.len)
+		if (pattern->ref->gen_id != expr->ref->curr_gen)
 			continue;
 
-		end = smp->data.u.str.str + smp->data.u.str.len - pattern->len;
+		if (pattern->len > smp->data.u.str.data)
+			continue;
+
+		end = smp->data.u.str.area + smp->data.u.str.data - pattern->len;
 		icase = expr->mflags & PAT_MF_IGNORE_CASE;
 		if (icase) {
-			for (c = smp->data.u.str.str; c <= end; c++) {
-				if (tolower(*c) != tolower(*pattern->ptr.str))
+			for (c = smp->data.u.str.area; c <= end; c++) {
+				if (tolower((unsigned char)*c) != tolower((unsigned char)*pattern->ptr.str))
 					continue;
 				if (strncasecmp(pattern->ptr.str, c, pattern->len) == 0) {
 					ret = pattern;
@@ -749,7 +810,7 @@ struct pattern *pat_match_sub(struct sample *smp, struct pattern_expr *expr, int
 				}
 			}
 		} else {
-			for (c = smp->data.u.str.str; c <= end; c++) {
+			for (c = smp->data.u.str.area; c <= end; c++) {
 				if (*c != *pattern->ptr.str)
 					continue;
 				if (strncmp(pattern->ptr.str, c, pattern->len) == 0) {
@@ -761,7 +822,7 @@ struct pattern *pat_match_sub(struct sample *smp, struct pattern_expr *expr, int
 	}
  leave:
 	if (lru)
-	    lru64_commit(lru, ret, expr, expr->revision, NULL);
+		lru64_commit(lru, ret, expr, expr->ref->revision, NULL);
 
 	return ret;
 }
@@ -790,13 +851,13 @@ static int match_word(struct sample *smp, struct pattern *pattern, int mflags, u
 	while (pl > 0 && is_delimiter(ps[pl - 1], delimiters))
 		pl--;
 
-	if (pl > smp->data.u.str.len)
+	if (pl > smp->data.u.str.data)
 		return PAT_NOMATCH;
 
 	may_match = 1;
 	icase = mflags & PAT_MF_IGNORE_CASE;
-	end = smp->data.u.str.str + smp->data.u.str.len - pl;
-	for (c = smp->data.u.str.str; c <= end; c++) {
+	end = smp->data.u.str.area + smp->data.u.str.data - pl;
+	for (c = smp->data.u.str.area; c <= end; c++) {
 		if (is_delimiter(*c, delimiters)) {
 			may_match = 1;
 			continue;
@@ -806,7 +867,7 @@ static int match_word(struct sample *smp, struct pattern *pattern, int mflags, u
 			continue;
 
 		if (icase) {
-			if ((tolower(*c) == tolower(*ps)) &&
+			if ((tolower((unsigned char)*c) == tolower((unsigned char)*ps)) &&
 			    (strncasecmp(ps, c, pl) == 0) &&
 			    (c == end || is_delimiter(c[pl], delimiters)))
 				return PAT_MATCH;
@@ -832,6 +893,10 @@ struct pattern *pat_match_dir(struct sample *smp, struct pattern_expr *expr, int
 
 	list_for_each_entry(lst, &expr->patterns, list) {
 		pattern = &lst->pat;
+
+		if (pattern->ref->gen_id != expr->ref->curr_gen)
+			continue;
+
 		if (match_word(smp, pattern, expr->mflags, make_4delim('/', '?', '?', '?')))
 			return pattern;
 	}
@@ -849,6 +914,10 @@ struct pattern *pat_match_dom(struct sample *smp, struct pattern_expr *expr, int
 
 	list_for_each_entry(lst, &expr->patterns, list) {
 		pattern = &lst->pat;
+
+		if (pattern->ref->gen_id != expr->ref->curr_gen)
+			continue;
+
 		if (match_word(smp, pattern, expr->mflags, make_4delim('/', '?', '.', ':')))
 			return pattern;
 	}
@@ -863,6 +932,10 @@ struct pattern *pat_match_int(struct sample *smp, struct pattern_expr *expr, int
 
 	list_for_each_entry(lst, &expr->patterns, list) {
 		pattern = &lst->pat;
+
+		if (pattern->ref->gen_id != expr->ref->curr_gen)
+			continue;
+
 		if ((!pattern->val.range.min_set || pattern->val.range.min <= smp->data.u.sint) &&
 		    (!pattern->val.range.max_set || smp->data.u.sint <= pattern->val.range.max))
 			return pattern;
@@ -878,8 +951,12 @@ struct pattern *pat_match_len(struct sample *smp, struct pattern_expr *expr, int
 
 	list_for_each_entry(lst, &expr->patterns, list) {
 		pattern = &lst->pat;
-		if ((!pattern->val.range.min_set || pattern->val.range.min <= smp->data.u.str.len) &&
-		    (!pattern->val.range.max_set || smp->data.u.str.len <= pattern->val.range.max))
+
+		if (pattern->ref->gen_id != expr->ref->curr_gen)
+			continue;
+
+		if ((!pattern->val.range.min_set || pattern->val.range.min <= smp->data.u.str.data) &&
+		    (!pattern->val.range.max_set || smp->data.u.str.data <= pattern->val.range.max))
 			return pattern;
 	}
 	return NULL;
@@ -902,14 +979,18 @@ struct pattern *pat_match_ip(struct sample *smp, struct pattern_expr *expr, int 
 		 */
 		s = &smp->data.u.ipv4;
 		node = ebmb_lookup_longest(&expr->pattern_tree, &s->s_addr);
-		if (node) {
+		while (node) {
+			elt = ebmb_entry(node, struct pattern_tree, node);
+			if (elt->ref->gen_id != expr->ref->curr_gen) {
+				node = ebmb_next(node);
+				continue;
+			}
 			if (fill) {
-				elt = ebmb_entry(node, struct pattern_tree, node);
 				static_pattern.data = elt->data;
 				static_pattern.ref = elt->ref;
 				static_pattern.sflags = PAT_SF_TREE;
 				static_pattern.type = SMP_T_IPV4;
-				memcpy(&static_pattern.val.ipv4.addr.s_addr, elt->node.key, 4);
+				static_pattern.val.ipv4.addr.s_addr = read_u32(elt->node.key);
 				if (!cidr2dotted(elt->node.node.pfx, &static_pattern.val.ipv4.mask))
 					return NULL;
 			}
@@ -921,12 +1002,16 @@ struct pattern *pat_match_ip(struct sample *smp, struct pattern_expr *expr, int 
 		 * prefix, and try to lookup in the IPv6 tree.
 		 */
 		memset(&tmp6, 0, 10);
-		*(uint16_t*)&tmp6.s6_addr[10] = htons(0xffff);
-		*(uint32_t*)&tmp6.s6_addr[12] = smp->data.u.ipv4.s_addr;
+		write_u16(&tmp6.s6_addr[10], htons(0xffff));
+		write_u32(&tmp6.s6_addr[12], smp->data.u.ipv4.s_addr);
 		node = ebmb_lookup_longest(&expr->pattern_tree_2, &tmp6);
-		if (node) {
+		while (node) {
+			elt = ebmb_entry(node, struct pattern_tree, node);
+			if (elt->ref->gen_id != expr->ref->curr_gen) {
+				node = ebmb_next(node);
+				continue;
+			}
 			if (fill) {
-				elt = ebmb_entry(node, struct pattern_tree, node);
 				static_pattern.data = elt->data;
 				static_pattern.ref = elt->ref;
 				static_pattern.sflags = PAT_SF_TREE;
@@ -944,9 +1029,13 @@ struct pattern *pat_match_ip(struct sample *smp, struct pattern_expr *expr, int 
 		 * the longest match method.
 		 */
 		node = ebmb_lookup_longest(&expr->pattern_tree_2, &smp->data.u.ipv6);
-		if (node) {
+		while (node) {
+			elt = ebmb_entry(node, struct pattern_tree, node);
+			if (elt->ref->gen_id != expr->ref->curr_gen) {
+				node = ebmb_next(node);
+				continue;
+			}
 			if (fill) {
-				elt = ebmb_entry(node, struct pattern_tree, node);
 				static_pattern.data = elt->data;
 				static_pattern.ref = elt->ref;
 				static_pattern.sflags = PAT_SF_TREE;
@@ -963,29 +1052,32 @@ struct pattern *pat_match_ip(struct sample *smp, struct pattern_expr *expr, int 
 		 *   - ::0000:ip:v4 (old ipv4 mapped)
 		 *   - 2002:ip:v4:: (6to4)
 		 */
-		if ((*(uint32_t*)&smp->data.u.ipv6.s6_addr[0] == 0 &&
-		     *(uint32_t*)&smp->data.u.ipv6.s6_addr[4]  == 0 &&
-		     (*(uint32_t*)&smp->data.u.ipv6.s6_addr[8] == 0 ||
-		      *(uint32_t*)&smp->data.u.ipv6.s6_addr[8] == htonl(0xFFFF))) ||
-		    *(uint16_t*)&smp->data.u.ipv6.s6_addr[0] == htons(0x2002)) {
-			if (*(uint32_t*)&smp->data.u.ipv6.s6_addr[0] == 0)
-				v4 = *(uint32_t*)&smp->data.u.ipv6.s6_addr[12];
+		if ((read_u64(&smp->data.u.ipv6.s6_addr[0]) == 0 &&
+		     (read_u32(&smp->data.u.ipv6.s6_addr[8]) == 0 ||
+		      read_u32(&smp->data.u.ipv6.s6_addr[8]) == htonl(0xFFFF))) ||
+		    read_u16(&smp->data.u.ipv6.s6_addr[0]) == htons(0x2002)) {
+			if (read_u32(&smp->data.u.ipv6.s6_addr[0]) == 0)
+				v4 = read_u32(&smp->data.u.ipv6.s6_addr[12]);
 			else
-				v4 = htonl((ntohs(*(uint16_t*)&smp->data.u.ipv6.s6_addr[2]) << 16) +
-				            ntohs(*(uint16_t*)&smp->data.u.ipv6.s6_addr[4]));
+				v4 = htonl((ntohs(read_u16(&smp->data.u.ipv6.s6_addr[2])) << 16) +
+				           ntohs(read_u16(&smp->data.u.ipv6.s6_addr[4])));
 
 			/* Lookup an IPv4 address in the expression's pattern tree using the longest
 			 * match method.
 			 */
 			node = ebmb_lookup_longest(&expr->pattern_tree, &v4);
-			if (node) {
+			while (node) {
+				elt = ebmb_entry(node, struct pattern_tree, node);
+				if (elt->ref->gen_id != expr->ref->curr_gen) {
+					node = ebmb_next(node);
+					continue;
+				}
 				if (fill) {
-					elt = ebmb_entry(node, struct pattern_tree, node);
 					static_pattern.data = elt->data;
 					static_pattern.ref = elt->ref;
 					static_pattern.sflags = PAT_SF_TREE;
 					static_pattern.type = SMP_T_IPV4;
-					memcpy(&static_pattern.val.ipv4.addr.s_addr, elt->node.key, 4);
+					static_pattern.val.ipv4.addr.s_addr = read_u32(elt->node.key);
 					if (!cidr2dotted(elt->node.node.pfx, &static_pattern.val.ipv4.mask))
 						return NULL;
 				}
@@ -998,6 +1090,9 @@ struct pattern *pat_match_ip(struct sample *smp, struct pattern_expr *expr, int 
 	list_for_each_entry(lst, &expr->patterns, list) {
 		pattern = &lst->pat;
 
+		if (pattern->ref->gen_id != expr->ref->curr_gen)
+			continue;
+
 		/* The input sample is IPv4, use it as is. */
 		if (smp->data.type == SMP_T_IPV4) {
 			v4 = smp->data.u.ipv4.s_addr;
@@ -1009,15 +1104,14 @@ struct pattern *pat_match_ip(struct sample *smp, struct pattern_expr *expr, int 
 			 *   - ::0000:ip:v4 (old ipv4 mapped)
 			 *   - 2002:ip:v4:: (6to4)
 			 */
-			if (*(uint32_t*)&smp->data.u.ipv6.s6_addr[0] == 0 &&
-			    *(uint32_t*)&smp->data.u.ipv6.s6_addr[4]  == 0 &&
-			    (*(uint32_t*)&smp->data.u.ipv6.s6_addr[8] == 0 ||
-			     *(uint32_t*)&smp->data.u.ipv6.s6_addr[8] == htonl(0xFFFF))) {
-				v4 = *(uint32_t*)&smp->data.u.ipv6.s6_addr[12];
+			if (read_u64(&smp->data.u.ipv6.s6_addr[0]) == 0 &&
+			    (read_u32(&smp->data.u.ipv6.s6_addr[8]) == 0 ||
+			     read_u32(&smp->data.u.ipv6.s6_addr[8]) == htonl(0xFFFF))) {
+				v4 = read_u32(&smp->data.u.ipv6.s6_addr[12]);
 			}
-			else if (*(uint16_t*)&smp->data.u.ipv6.s6_addr[0] == htons(0x2002)) {
-				v4 = htonl((ntohs(*(uint16_t*)&smp->data.u.ipv6.s6_addr[2]) << 16) +
-				            ntohs(*(uint16_t*)&smp->data.u.ipv6.s6_addr[4]));
+			else if (read_u16(&smp->data.u.ipv6.s6_addr[0]) == htons(0x2002)) {
+				v4 = htonl((ntohs(read_u16(&smp->data.u.ipv6.s6_addr[2])) << 16) +
+				           ntohs(read_u16(&smp->data.u.ipv6.s6_addr[4])));
 			}
 			else
 				continue;
@@ -1033,6 +1127,20 @@ struct pattern *pat_match_ip(struct sample *smp, struct pattern_expr *expr, int 
 	return NULL;
 }
 
+/* finds the pattern holding <list> from list head <head> and deletes it.
+ * This is made for use for pattern removal within an expression.
+ */
+static void pat_unlink_from_head(void **head, void **list)
+{
+	while (*head) {
+		if (*head == list) {
+			*head = *list;
+			return;
+		}
+		head = *head;
+	}
+}
+
 void free_pattern_tree(struct eb_root *root)
 {
 	struct eb_node *node, *next;
@@ -1043,17 +1151,24 @@ void free_pattern_tree(struct eb_root *root)
 		next = eb_next(node);
 		eb_delete(node);
 		elt = container_of(node, struct pattern_tree, node);
+		pat_unlink_from_head(&elt->ref->tree_head, &elt->from_ref);
 		free(elt->data);
 		free(elt);
 		node = next;
 	}
 }
 
-void pat_prune_val(struct pattern_expr *expr)
+void pat_prune_gen(struct pattern_expr *expr)
 {
 	struct pattern_list *pat, *tmp;
 
 	list_for_each_entry_safe(pat, tmp, &expr->patterns, list) {
+		LIST_DEL(&pat->list);
+		pat_unlink_from_head(&pat->pat.ref->list_head, &pat->from_ref);
+		if (pat->pat.sflags & PAT_SF_REGFREE)
+			regex_free(pat->pat.ptr.ptr);
+		else
+			free(pat->pat.ptr.ptr);
 		free(pat->pat.data);
 		free(pat);
 	}
@@ -1061,36 +1176,7 @@ void pat_prune_val(struct pattern_expr *expr)
 	free_pattern_tree(&expr->pattern_tree);
 	free_pattern_tree(&expr->pattern_tree_2);
 	LIST_INIT(&expr->patterns);
-}
-
-void pat_prune_ptr(struct pattern_expr *expr)
-{
-	struct pattern_list *pat, *tmp;
-
-	list_for_each_entry_safe(pat, tmp, &expr->patterns, list) {
-		free(pat->pat.ptr.ptr);
-		free(pat->pat.data);
-		free(pat);
-	}
-
-	free_pattern_tree(&expr->pattern_tree);
-	free_pattern_tree(&expr->pattern_tree_2);
-	LIST_INIT(&expr->patterns);
-}
-
-void pat_prune_reg(struct pattern_expr *expr)
-{
-	struct pattern_list *pat, *tmp;
-
-	list_for_each_entry_safe(pat, tmp, &expr->patterns, list) {
-		regex_free(pat->pat.ptr.ptr);
-		free(pat->pat.data);
-		free(pat);
-	}
-
-	free_pattern_tree(&expr->pattern_tree);
-	free_pattern_tree(&expr->pattern_tree_2);
-	LIST_INIT(&expr->patterns);
+	expr->ref->revision = rdtsc();
 }
 
 /*
@@ -1115,7 +1201,10 @@ int pat_idx_list_val(struct pattern_expr *expr, struct pattern *pat, char **err)
 
 	/* chain pattern in the expression */
 	LIST_ADDQ(&expr->patterns, &patl->list);
-	expr->revision = rdtsc();
+	/* and from the reference */
+	patl->from_ref = pat->ref->list_head;
+	pat->ref->list_head = &patl->from_ref;
+	expr->ref->revision = rdtsc();
 
 	/* that's ok */
 	return 1;
@@ -1144,7 +1233,10 @@ int pat_idx_list_ptr(struct pattern_expr *expr, struct pattern *pat, char **err)
 
 	/* chain pattern in the expression */
 	LIST_ADDQ(&expr->patterns, &patl->list);
-	expr->revision = rdtsc();
+	/* and from the reference */
+	patl->from_ref = pat->ref->list_head;
+	pat->ref->list_head = &patl->from_ref;
+	expr->ref->revision = rdtsc();
 
 	/* that's ok */
 	return 1;
@@ -1174,7 +1266,10 @@ int pat_idx_list_str(struct pattern_expr *expr, struct pattern *pat, char **err)
 
 	/* chain pattern in the expression */
 	LIST_ADDQ(&expr->patterns, &patl->list);
-	expr->revision = rdtsc();
+	/* and from the reference */
+	patl->from_ref = pat->ref->list_head;
+	pat->ref->list_head = &patl->from_ref;
+	expr->ref->revision = rdtsc();
 
 	/* that's ok */
 	return 1;
@@ -1194,25 +1289,20 @@ int pat_idx_list_reg_cap(struct pattern_expr *expr, struct pattern *pat, int cap
 	/* duplicate pattern */
 	memcpy(&patl->pat, pat, sizeof(*pat));
 
-	/* allocate regex */
-	patl->pat.ptr.reg = calloc(1, sizeof(*patl->pat.ptr.reg));
-	if (!patl->pat.ptr.reg) {
-		free(patl);
-		memprintf(err, "out of memory while indexing pattern");
-		return 0;
-	}
-
 	/* compile regex */
-	if (!regex_comp(pat->ptr.str, patl->pat.ptr.reg,
-	                !(expr->mflags & PAT_MF_IGNORE_CASE), cap, err)) {
-		free(patl->pat.ptr.reg);
+	patl->pat.sflags |= PAT_SF_REGFREE;
+	if (!(patl->pat.ptr.reg = regex_comp(pat->ptr.str, !(expr->mflags & PAT_MF_IGNORE_CASE),
+	                                     cap, err))) {
 		free(patl);
 		return 0;
 	}
 
 	/* chain pattern in the expression */
 	LIST_ADDQ(&expr->patterns, &patl->list);
-	expr->revision = rdtsc();
+	/* and from the reference */
+	patl->from_ref = pat->ref->list_head;
+	pat->ref->list_head = &patl->from_ref;
+	expr->ref->revision = rdtsc();
 
 	/* that's ok */
 	return 1;
@@ -1261,7 +1351,9 @@ int pat_idx_tree_ip(struct pattern_expr *expr, struct pattern *pat, char **err)
 
 			/* Insert the entry. */
 			ebmb_insert_prefix(&expr->pattern_tree, &node->node, 4);
-			expr->revision = rdtsc();
+			node->from_ref = pat->ref->tree_head;
+			pat->ref->tree_head = &node->from_ref;
+			expr->ref->revision = rdtsc();
 
 			/* that's ok */
 			return 1;
@@ -1289,7 +1381,9 @@ int pat_idx_tree_ip(struct pattern_expr *expr, struct pattern *pat, char **err)
 
 		/* Insert the entry. */
 		ebmb_insert_prefix(&expr->pattern_tree_2, &node->node, 16);
-		expr->revision = rdtsc();
+		node->from_ref = pat->ref->tree_head;
+		pat->ref->tree_head = &node->from_ref;
+		expr->ref->revision = rdtsc();
 
 		/* that's ok */
 		return 1;
@@ -1333,7 +1427,9 @@ int pat_idx_tree_str(struct pattern_expr *expr, struct pattern *pat, char **err)
 
 	/* index the new node */
 	ebst_insert(&expr->pattern_tree, &node->node);
-	expr->revision = rdtsc();
+	node->from_ref = pat->ref->tree_head;
+	pat->ref->tree_head = &node->from_ref;
+	expr->ref->revision = rdtsc();
 
 	/* that's ok */
 	return 1;
@@ -1375,144 +1471,59 @@ int pat_idx_tree_pfx(struct pattern_expr *expr, struct pattern *pat, char **err)
 
 	/* index the new node */
 	ebmb_insert_prefix(&expr->pattern_tree, &node->node, len);
-	expr->revision = rdtsc();
+	node->from_ref = pat->ref->tree_head;
+	pat->ref->tree_head = &node->from_ref;
+	expr->ref->revision = rdtsc();
 
 	/* that's ok */
 	return 1;
 }
 
-void pat_del_list_val(struct pattern_expr *expr, struct pat_ref_elt *ref)
+/* Deletes all patterns from reference <elt>. Note that all of their
+ * expressions must be locked, and the pattern lock must be held as well.
+ */
+void pat_delete_gen(struct pat_ref *ref, struct pat_ref_elt *elt)
 {
+	struct pattern_tree *tree;
 	struct pattern_list *pat;
-	struct pattern_list *safe;
+	void **node;
 
-	list_for_each_entry_safe(pat, safe, &expr->patterns, list) {
-		/* Check equality. */
-		if (pat->pat.ref != ref)
-			continue;
+	/* delete all known tree nodes. They are all allocated inline */
+	for (node = elt->tree_head; node;) {
+		tree = container_of(node, struct pattern_tree, from_ref);
+		node = *node;
+		BUG_ON(tree->ref != elt);
+
+		ebmb_delete(&tree->node);
+		free(tree->data);
+		free(tree);
+	}
+
+	/* delete all list nodes and free their pattern entries (str/reg) */
+	for (node = elt->list_head; node;) {
+		pat = container_of(node, struct pattern_list, from_ref);
+		node = *node;
+		BUG_ON(pat->pat.ref != elt);
 
 		/* Delete and free entry. */
 		LIST_DEL(&pat->list);
+		if (pat->pat.sflags & PAT_SF_REGFREE)
+			regex_free(pat->pat.ptr.reg);
+		else
+			free(pat->pat.ptr.ptr);
 		free(pat->pat.data);
 		free(pat);
 	}
-	expr->revision = rdtsc();
-}
 
-void pat_del_tree_ip(struct pattern_expr *expr, struct pat_ref_elt *ref)
-{
-	struct ebmb_node *node, *next_node;
-	struct pattern_tree *elt;
-
-	/* browse each node of the tree for IPv4 addresses. */
-	for (node = ebmb_first(&expr->pattern_tree), next_node = node ? ebmb_next(node) : NULL;
-	     node;
-	     node = next_node, next_node = node ? ebmb_next(node) : NULL) {
-		/* Extract container of the tree node. */
-		elt = container_of(node, struct pattern_tree, node);
-
-		/* Check equality. */
-		if (elt->ref != ref)
-			continue;
-
-		/* Delete and free entry. */
-		ebmb_delete(node);
-		free(elt->data);
-		free(elt);
-	}
-
-	/* Browse each node of the list for IPv4 addresses. */
-	pat_del_list_val(expr, ref);
-
-	/* browse each node of the tree for IPv6 addresses. */
-	for (node = ebmb_first(&expr->pattern_tree_2), next_node = node ? ebmb_next(node) : NULL;
-	     node;
-	     node = next_node, next_node = node ? ebmb_next(node) : NULL) {
-		/* Extract container of the tree node. */
-		elt = container_of(node, struct pattern_tree, node);
-
-		/* Check equality. */
-		if (elt->ref != ref)
-			continue;
-
-		/* Delete and free entry. */
-		ebmb_delete(node);
-		free(elt->data);
-		free(elt);
-	}
-	expr->revision = rdtsc();
-}
-
-void pat_del_list_ptr(struct pattern_expr *expr, struct pat_ref_elt *ref)
-{
-	struct pattern_list *pat;
-	struct pattern_list *safe;
-
-	list_for_each_entry_safe(pat, safe, &expr->patterns, list) {
-		/* Check equality. */
-		if (pat->pat.ref != ref)
-			continue;
-
-		/* Delete and free entry. */
-		LIST_DEL(&pat->list);
-		free(pat->pat.ptr.ptr);
-		free(pat->pat.data);
-		free(pat);
-	}
-	expr->revision = rdtsc();
-}
-
-void pat_del_tree_str(struct pattern_expr *expr, struct pat_ref_elt *ref)
-{
-	struct ebmb_node *node, *next_node;
-	struct pattern_tree *elt;
-
-	/* If the flag PAT_F_IGNORE_CASE is set, we cannot use trees */
-	if (expr->mflags & PAT_MF_IGNORE_CASE)
-		return pat_del_list_ptr(expr, ref);
-
-	/* browse each node of the tree. */
-	for (node = ebmb_first(&expr->pattern_tree), next_node = node ? ebmb_next(node) : NULL;
-	     node;
-	     node = next_node, next_node = node ? ebmb_next(node) : NULL) {
-		/* Extract container of the tree node. */
-		elt = container_of(node, struct pattern_tree, node);
-
-		/* Check equality. */
-		if (elt->ref != ref)
-			continue;
-
-		/* Delete and free entry. */
-		ebmb_delete(node);
-		free(elt->data);
-		free(elt);
-	}
-	expr->revision = rdtsc();
-}
-
-void pat_del_list_reg(struct pattern_expr *expr, struct pat_ref_elt *ref)
-{
-	struct pattern_list *pat;
-	struct pattern_list *safe;
-
-	list_for_each_entry_safe(pat, safe, &expr->patterns, list) {
-		/* Check equality. */
-		if (pat->pat.ref != ref)
-			continue;
-
-		/* Delete and free entry. */
-		LIST_DEL(&pat->list);
-		regex_free(pat->pat.ptr.ptr);
-		free(pat->pat.data);
-		free(pat);
-	}
-	expr->revision = rdtsc();
+	/* update revision number to refresh the cache */
+	ref->revision = rdtsc();
+	elt->tree_head = NULL;
+	elt->list_head = NULL;
 }
 
 void pattern_init_expr(struct pattern_expr *expr)
 {
 	LIST_INIT(&expr->patterns);
-	expr->revision = 0;
 	expr->pattern_tree = EB_ROOT;
 	expr->pattern_tree_2 = EB_ROOT;
 }
@@ -1546,8 +1557,8 @@ void pattern_init_head(struct pattern_head *head)
  *
  */
 
-/* This function lookup for reference. If the reference is found, they return
- * pointer to the struct pat_ref, else return NULL.
+/* This function looks up a reference by name. If the reference is found, a
+ * pointer to the struct pat_ref is returned, otherwise NULL is returned.
  */
 struct pat_ref *pat_ref_lookup(const char *reference)
 {
@@ -1559,8 +1570,8 @@ struct pat_ref *pat_ref_lookup(const char *reference)
 	return NULL;
 }
 
-/* This function lookup for unique id. If the reference is found, they return
- * pointer to the struct pat_ref, else return NULL.
+/* This function looks up a reference's unique id. If the reference is found, a
+ * pointer to the struct pat_ref is returned, otherwise NULL is returned.
  */
 struct pat_ref *pat_ref_lookupid(int unique_id)
 {
@@ -1572,84 +1583,78 @@ struct pat_ref *pat_ref_lookupid(int unique_id)
 	return NULL;
 }
 
-/* This function remove all pattern matching the pointer <refelt> from
- * the the reference and from each expr member of the reference. This
- * function returns 1 if the deletion is done and return 0 is the entry
- * is not found.
+/* This function removes from the pattern reference <ref> all the patterns
+ * attached to the reference element <elt>, and the element itself. The
+ * reference must be locked.
+ */
+void pat_ref_delete_by_ptr(struct pat_ref *ref, struct pat_ref_elt *elt)
+{
+	struct pattern_expr *expr;
+	struct bref *bref, *back;
+
+	/*
+	 * we have to unlink all watchers from this reference pattern. We must
+	 * not relink them if this elt was the last one in the list.
+	 */
+	list_for_each_entry_safe(bref, back, &elt->back_refs, users) {
+		LIST_DEL(&bref->users);
+		LIST_INIT(&bref->users);
+		if (elt->list.n != &ref->head)
+			LIST_ADDQ(&LIST_ELEM(elt->list.n, typeof(elt), list)->back_refs, &bref->users);
+		bref->ref = elt->list.n;
+	}
+
+	/* delete all entries from all expressions for this pattern */
+	list_for_each_entry(expr, &ref->pat, list)
+		HA_RWLOCK_WRLOCK(PATEXP_LOCK, &expr->lock);
+
+	pat_delete_gen(ref, elt);
+
+	list_for_each_entry(expr, &ref->pat, list)
+		HA_RWLOCK_WRUNLOCK(PATEXP_LOCK, &expr->lock);
+
+	LIST_DEL(&elt->list);
+	free(elt->sample);
+	free(elt->pattern);
+	free(elt);
+}
+
+/* This function removes all the patterns matching the pointer <refelt> from
+ * the reference and from each expr member of this reference. This function
+ * returns 1 if the entry was found and deleted, otherwise zero.
  */
 int pat_ref_delete_by_id(struct pat_ref *ref, struct pat_ref_elt *refelt)
 {
-	struct pattern_expr *expr;
 	struct pat_ref_elt *elt, *safe;
-	struct bref *bref, *back;
 
 	/* delete pattern from reference */
 	list_for_each_entry_safe(elt, safe, &ref->head, list) {
 		if (elt == refelt) {
-			list_for_each_entry_safe(bref, back, &elt->back_refs, users) {
-				/*
-				 * we have to unlink all watchers. We must not relink them if
-				 * this elt  was the last one in the list.
-				 */
-				LIST_DEL(&bref->users);
-				LIST_INIT(&bref->users);
-				if (elt->list.n != &ref->head)
-					LIST_ADDQ(&LIST_ELEM(elt->list.n, struct stream *, list)->back_refs, &bref->users);
-				bref->ref = elt->list.n;
-			}
-			list_for_each_entry(expr, &ref->pat, list)
-				pattern_delete(expr, elt);
-
-			LIST_DEL(&elt->list);
-			free(elt->sample);
-			free(elt->pattern);
-			free(elt);
+			pat_ref_delete_by_ptr(ref, elt);
 			return 1;
 		}
 	}
 	return 0;
 }
 
-/* This function remove all pattern match <key> from the the reference
- * and from each expr member of the reference. This fucntion returns 1
- * if the deletion is done and return 0 is the entry is not found.
+/* This function removes all patterns matching <key> from the reference
+ * and from each expr member of the reference. This function returns 1
+ * if the deletion is done and returns 0 is the entry is not found.
  */
 int pat_ref_delete(struct pat_ref *ref, const char *key)
 {
-	struct pattern_expr *expr;
 	struct pat_ref_elt *elt, *safe;
-	struct bref *bref, *back;
 	int found = 0;
 
 	/* delete pattern from reference */
 	list_for_each_entry_safe(elt, safe, &ref->head, list) {
 		if (strcmp(key, elt->pattern) == 0) {
-			list_for_each_entry_safe(bref, back, &elt->back_refs, users) {
-				/*
-				 * we have to unlink all watchers. We must not relink them if
-				 * this elt was the last one in the list.
-				 */
-				LIST_DEL(&bref->users);
-				LIST_INIT(&bref->users);
-				if (elt->list.n != &ref->head)
-					LIST_ADDQ(&LIST_ELEM(elt->list.n, struct stream *, list)->back_refs, &bref->users);
-				bref->ref = elt->list.n;
-			}
-			list_for_each_entry(expr, &ref->pat, list)
-				pattern_delete(expr, elt);
-
-			LIST_DEL(&elt->list);
-			free(elt->sample);
-			free(elt->pattern);
-			free(elt);
-
+			pat_ref_delete_by_ptr(ref, elt);
 			found = 1;
 		}
 	}
 
-	if (!found)
-		return 0;
-	return 1;
+	return found;
 }
 
 /*
@@ -1669,7 +1674,10 @@ struct pat_ref_elt *pat_ref_find_elt(struct pat_ref *ref, const char *key)
 }
 
 
-  /* This function modify the sample of the first pattern that match the <key>. */
+/* This function modifies the sample of pat_ref_elt <elt> in all expressions
+ * found under <ref> to become <value>. It is assumed that the caller has
+ * already verified that <elt> belongs to <ref>.
+ */
 static inline int pat_ref_set_elt(struct pat_ref *ref, struct pat_ref_elt *elt,
                                   const char *value, char **err)
 {
@@ -1695,25 +1703,32 @@ static inline int pat_ref_set_elt(struct pat_ref *ref, struct pat_ref_elt *elt,
 		memprintf(err, "out of memory error");
 		return 0;
 	}
-	free(elt->sample);
-	elt->sample = sample;
-
-	/* Load sample in each reference. All the conversion are tested
-	 * below, normally these calls dosn't fail.
+	/* Load sample in each reference. All the conversions are tested
+	 * below, normally these calls don't fail.
 	 */
 	list_for_each_entry(expr, &ref->pat, list) {
 		if (!expr->pat_head->parse_smp)
 			continue;
 
+		HA_RWLOCK_WRLOCK(PATEXP_LOCK, &expr->lock);
 		data = pattern_find_smp(expr, elt);
 		if (data && *data && !expr->pat_head->parse_smp(sample, *data))
 			*data = NULL;
+		HA_RWLOCK_WRUNLOCK(PATEXP_LOCK, &expr->lock);
 	}
+
+	/* free old sample only when all exprs are updated */
+	free(elt->sample);
+	elt->sample = sample;
+
 
 	return 1;
 }
 
-/* This function modify the sample of the first pattern that match the <key>. */
+/* This function modifies the sample of pat_ref_elt <refelt> in all expressions
+ * found under <ref> to become <value>, after checking that <refelt> really
+ * belongs to <ref>.
+ */
 int pat_ref_set_by_id(struct pat_ref *ref, struct pat_ref_elt *refelt, const char *value, char **err)
 {
 	struct pat_ref_elt *elt;
@@ -1731,7 +1746,9 @@ int pat_ref_set_by_id(struct pat_ref *ref, struct pat_ref_elt *refelt, const cha
 	return 0;
 }
 
-/* This function modify the sample of the first pattern that match the <key>. */
+/* This function modifies to <value> the sample of all patterns matching <key>
+ * under <ref>.
+ */
 int pat_ref_set(struct pat_ref *ref, const char *key, const char *value, char **err)
 {
 	struct pat_ref_elt *elt;
@@ -1750,12 +1767,14 @@ int pat_ref_set(struct pat_ref *ref, const char *key, const char *value, char **
 	list_for_each_entry(elt, &ref->head, list) {
 		if (strcmp(key, elt->pattern) == 0) {
 			if (!pat_ref_set_elt(ref, elt, value, merr)) {
-				if (!found)
-					*err = *merr;
-				else {
-					memprintf(err, "%s, %s", *err, *merr);
-					free(*merr);
-					*merr = NULL;
+				if (err && merr) {
+					if (!found) {
+						*err = *merr;
+					} else {
+						memprintf(err, "%s, %s", *err, *merr);
+						free(*merr);
+						*merr = NULL;
+					}
 				}
 			}
 			found = 1;
@@ -1769,17 +1788,17 @@ int pat_ref_set(struct pat_ref *ref, const char *key, const char *value, char **
 	return 1;
 }
 
-/* This function create new reference. <ref> is the reference name.
+/* This function creates a new reference. <ref> is the reference name.
  * <flags> are PAT_REF_*. /!\ The reference is not checked, and must
  * be unique. The user must check the reference with "pat_ref_lookup()"
- * before calling this function. If the fucntion fail, it return NULL,
- * else return new struct pat_ref.
+ * before calling this function. If the function fails, it returns NULL,
+ * otherwise it returns the new struct pat_ref.
  */
 struct pat_ref *pat_ref_new(const char *reference, const char *display, unsigned int flags)
 {
 	struct pat_ref *ref;
 
-	ref = malloc(sizeof(*ref));
+	ref = calloc(1, sizeof(*ref));
 	if (!ref)
 		return NULL;
 
@@ -1790,8 +1809,6 @@ struct pat_ref *pat_ref_new(const char *reference, const char *display, unsigned
 			return NULL;
 		}
 	}
-	else
-		ref->display = NULL;
 
 	ref->reference = strdup(reference);
 	if (!ref->reference) {
@@ -1802,27 +1819,28 @@ struct pat_ref *pat_ref_new(const char *reference, const char *display, unsigned
 
 	ref->flags = flags;
 	ref->unique_id = -1;
+	ref->revision = 0;
 
 	LIST_INIT(&ref->head);
 	LIST_INIT(&ref->pat);
-
+	HA_SPIN_INIT(&ref->lock);
 	LIST_ADDQ(&pattern_reference, &ref->list);
 
 	return ref;
 }
 
-/* This function create new reference. <unique_id> is the unique id. If
+/* This function creates a new reference. <unique_id> is the unique id. If
  * the value of <unique_id> is -1, the unique id is calculated later.
  * <flags> are PAT_REF_*. /!\ The reference is not checked, and must
  * be unique. The user must check the reference with "pat_ref_lookup()"
  * or pat_ref_lookupid before calling this function. If the function
- * fail, it return NULL, else return new struct pat_ref.
+ * fails, it returns NULL, otherwise it returns the new struct pat_ref.
  */
 struct pat_ref *pat_ref_newid(int unique_id, const char *display, unsigned int flags)
 {
 	struct pat_ref *ref;
 
-	ref = malloc(sizeof(*ref));
+	ref = calloc(1, sizeof(*ref));
 	if (!ref)
 		return NULL;
 
@@ -1833,62 +1851,63 @@ struct pat_ref *pat_ref_newid(int unique_id, const char *display, unsigned int f
 			return NULL;
 		}
 	}
-	else
-		ref->display = NULL;
 
 	ref->reference = NULL;
 	ref->flags = flags;
+	ref->curr_gen = 0;
+	ref->next_gen = 0;
 	ref->unique_id = unique_id;
 	LIST_INIT(&ref->head);
 	LIST_INIT(&ref->pat);
-
+	HA_SPIN_INIT(&ref->lock);
 	LIST_ADDQ(&pattern_reference, &ref->list);
 
 	return ref;
 }
 
-/* This function adds entry to <ref>. It can failed with memory error.
- * If the function fails, it returns 0.
+/* This function adds entry to <ref>. It can fail on memory error. It returns
+ * the newly added element on success, or NULL on failure. The PATREF_LOCK on
+ * <ref> must be held. It sets the newly created pattern's generation number
+ * to the same value as the reference's.
  */
-int pat_ref_append(struct pat_ref *ref, char *pattern, char *sample, int line)
+struct pat_ref_elt *pat_ref_append(struct pat_ref *ref, const char *pattern, const char *sample, int line)
 {
 	struct pat_ref_elt *elt;
 
-	elt = malloc(sizeof(*elt));
+	elt = calloc(1, sizeof(*elt));
 	if (!elt)
-		return 0;
+		goto fail;
 
+	elt->gen_id = ref->curr_gen;
 	elt->line = line;
 
 	elt->pattern = strdup(pattern);
-	if (!elt->pattern) {
-		free(elt);
-		return 0;
-	}
+	if (!elt->pattern)
+		goto fail;
 
 	if (sample) {
 		elt->sample = strdup(sample);
-		if (!elt->sample) {
-			free(elt->pattern);
-			free(elt);
-			return 0;
-		}
+		if (!elt->sample)
+			goto fail;
 	}
-	else
-		elt->sample = NULL;
 
 	LIST_INIT(&elt->back_refs);
+	elt->list_head = NULL;
+	elt->tree_head = NULL;
 	LIST_ADDQ(&ref->head, &elt->list);
-
-	return 1;
+	return elt;
+ fail:
+	if (elt)
+		free(elt->pattern);
+	free(elt);
+	return NULL;
 }
 
-/* This function create sample found in <elt>, parse the pattern also
- * found in <elt> and insert it in <expr>. The function copy <patflags>
- * in <expr>. If the function fails, it returns0 and <err> is filled.
- * In succes case, the function returns 1.
+/* This function creates sample found in <elt>, parses the pattern also
+ * found in <elt> and inserts it in <expr>. The function copies <patflags>
+ * into <expr>. If the function fails, it returns 0 and <err> is filled.
+ * In success case, the function returns 1.
  */
-static inline
 int pat_ref_push(struct pat_ref_elt *elt, struct pattern_expr *expr,
                  int patflags, char **err)
 {
@@ -1924,18 +1943,70 @@ int pat_ref_push(struct pat_ref_elt *elt, struct pattern_expr *expr,
 		return 0;
 	}
 
+	HA_RWLOCK_WRLOCK(PATEXP_LOCK, &expr->lock);
 	/* index pattern */
 	if (!expr->pat_head->index(expr, &pattern, err)) {
+		HA_RWLOCK_WRUNLOCK(PATEXP_LOCK, &expr->lock);
 		free(data);
 		return 0;
 	}
+	HA_RWLOCK_WRUNLOCK(PATEXP_LOCK, &expr->lock);
 
 	return 1;
 }
 
-/* This function adds entry to <ref>. It can failed with memory error. The new
+/* This function tries to commit entry <elt> into <ref>. The new entry must
+ * have already been inserted using pat_ref_append(), and its generation number
+ * may have been adjusted as it will not be changed. <err> must point to a NULL
+ * pointer. The PATREF lock on <ref> must be held. All the pattern_expr for
+ * this reference will be updated (parsing, indexing). On success, non-zero is
+ * returned. On failure, all the operation is rolled back (the element is
+ * deleted from all expressions and is freed), zero is returned and the error
+ * pointer <err> may have been updated (and the caller must free it). Failure
+ * causes include memory allocation, parsing error or indexing error.
+ */
+int pat_ref_commit(struct pat_ref *ref, struct pat_ref_elt *elt, char **err)
+{
+	struct pattern_expr *expr;
+
+	list_for_each_entry(expr, &ref->pat, list) {
+		if (!pat_ref_push(elt, expr, 0, err)) {
+			pat_ref_delete_by_ptr(ref, elt);
+			return 0;
+		}
+	}
+	return 1;
+}
+
+/* Loads <pattern>:<sample> into <ref> for generation <gen>. <sample> may be
+ * NULL if none exists (e.g. ACL). If not needed, the generation number should
+ * be set to ref->curr_gen. The error pointer must initially point to NULL. The
+ * new entry will be propagated to all use places, involving allocation, parsing
+ * and indexing. On error (parsing, allocation), the operation will be rolled
+ * back, an error may be reported, and NULL will be reported. On success, the
+ * freshly allocated element will be returned. The PATREF lock on <ref> must be
+ * held during the operation.
+ */
+struct pat_ref_elt *pat_ref_load(struct pat_ref *ref, unsigned int gen,
+                                 const char *pattern, const char *sample,
+                                 int line, char **err)
+{
+	struct pat_ref_elt *elt;
+
+	elt = pat_ref_append(ref, pattern, sample, line);
+	if (elt) {
+		elt->gen_id = gen;
+		if (!pat_ref_commit(ref, elt, err))
+			elt = NULL;
+	} else
+		memprintf(err, "out of memory error");
+
+	return elt;
+}
+
+/* This function adds entry to <ref>. It can fail on memory error. The new
  * entry is added at all the pattern_expr registered in this reference. The
- * function stop on the first error encountered. It returns 0 and err is
+ * function stops on the first error encountered. It returns 0 and <err> is
  * filled. If an error is encountered, the complete add operation is cancelled.
  * If the insertion is a success the function returns 1.
  */
@@ -1943,98 +2014,55 @@ int pat_ref_add(struct pat_ref *ref,
                 const char *pattern, const char *sample,
                 char **err)
 {
-	struct pat_ref_elt *elt;
-	struct pattern_expr *expr;
-
-	elt = malloc(sizeof(*elt));
-	if (!elt) {
-		memprintf(err, "out of memory error");
-		return 0;
-	}
-
-	elt->line = -1;
-
-	elt->pattern = strdup(pattern);
-	if (!elt->pattern) {
-		free(elt);
-		memprintf(err, "out of memory error");
-		return 0;
-	}
-
-	if (sample) {
-		elt->sample = strdup(sample);
-		if (!elt->sample) {
-			free(elt->pattern);
-			free(elt);
-			memprintf(err, "out of memory error");
-			return 0;
-		}
-	}
-	else
-		elt->sample = NULL;
-
-	LIST_INIT(&elt->back_refs);
-	LIST_ADDQ(&ref->head, &elt->list);
-
-	list_for_each_entry(expr, &ref->pat, list) {
-		if (!pat_ref_push(elt, expr, 0, err)) {
-			/* If the insertion fails, try to delete all the added entries. */
-			pat_ref_delete_by_id(ref, elt);
-			return 0;
-		}
-	}
-	return 1;
+	return !!pat_ref_load(ref, ref->curr_gen, pattern, sample, -1, err);
 }
 
-/* This function prune <ref>, replace all reference by the references
- * of <replace>, and reindex all the news values.
- *
- * The pattern are loaded in best effort and the errors are ignored,
- * but writed in the logs.
+/* This function purges all elements from <ref> that are older than generation
+ * <oldest>. It will not purge more than <budget> entries at once, in order to
+ * remain responsive. If budget is negative, no limit is applied.
+ * The caller must already hold the PATREF_LOCK on <ref>. The function will
+ * take the PATEXP_LOCK on all expressions of the pattern as needed. It returns
+ * non-zero on completion, or zero if it had to stop before the end after
+ * <budget> was depleted.
  */
-void pat_ref_reload(struct pat_ref *ref, struct pat_ref *replace)
+int pat_ref_purge_older(struct pat_ref *ref, unsigned int oldest, int budget)
 {
+	struct pat_ref_elt *elt, *elt_bck;
+	struct bref *bref, *bref_bck;
 	struct pattern_expr *expr;
-	struct pat_ref_elt *elt;
-	char *err = NULL;
+	int done;
 
-	pat_ref_prune(ref);
+	list_for_each_entry(expr, &ref->pat, list)
+		HA_RWLOCK_WRLOCK(PATEXP_LOCK, &expr->lock);
 
-	LIST_ADD(&replace->head, &ref->head);
-	LIST_DEL(&replace->head);
+	/* all expr are locked, we can safely remove all pat_ref */
 
-	list_for_each_entry(elt, &ref->head, list) {
-		list_for_each_entry(expr, &ref->pat, list) {
-			if (!pat_ref_push(elt, expr, 0, &err)) {
-				send_log(NULL, LOG_NOTICE, "%s", err);
-				free(err);
-				err = NULL;
-			}
+	/* assume completion for e.g. empty lists */
+	done = 1;
+	list_for_each_entry_safe(elt, elt_bck, &ref->head, list) {
+		if ((int)(elt->gen_id - oldest) >= 0)
+			continue;
+
+		if (budget >= 0 && !budget--) {
+			done = 0;
+			break;
 		}
-	}
-}
 
-/* This function prune all entries of <ref>. This function
- * prune the associated pattern_expr.
- */
-void pat_ref_prune(struct pat_ref *ref)
-{
-	struct pat_ref_elt *elt, *safe;
-	struct pattern_expr *expr;
-	struct bref *bref, *back;
-
-	list_for_each_entry_safe(elt, safe, &ref->head, list) {
-		list_for_each_entry_safe(bref, back, &elt->back_refs, users) {
-			/*
-			 * we have to unlink all watchers. We must not relink them if
-			 * this elt  was the last one in the list.
-			 */
+		/*
+		 * we have to unlink all watchers from this reference pattern. We must
+		 * not relink them if this elt was the last one in the list.
+		 */
+		list_for_each_entry_safe(bref, bref_bck, &elt->back_refs, users) {
 			LIST_DEL(&bref->users);
 			LIST_INIT(&bref->users);
 			if (elt->list.n != &ref->head)
-				LIST_ADDQ(&LIST_ELEM(elt->list.n, struct stream *, list)->back_refs, &bref->users);
+				LIST_ADDQ(&LIST_ELEM(elt->list.n, typeof(elt), list)->back_refs, &bref->users);
 			bref->ref = elt->list.n;
 		}
+
+		/* delete the storage for all representations of this pattern. */
+		pat_delete_gen(ref, elt);
+
 		LIST_DEL(&elt->list);
 		free(elt->pattern);
 		free(elt->sample);
@@ -2042,10 +2070,122 @@ void pat_ref_prune(struct pat_ref *ref)
 	}
 
 	list_for_each_entry(expr, &ref->pat, list)
-		expr->pat_head->prune(expr);
+		HA_RWLOCK_WRUNLOCK(PATEXP_LOCK, &expr->lock);
+
+#if defined(HA_HAVE_MALLOC_TRIM)
+	if (done) {
+		malloc_trim(0);
+	}
+#endif
+
+	return done;
 }
 
-/* This function lookup for existing reference <ref> in pattern_head <head>. */
+/* This function prunes <ref>, replaces all references by the references
+ * of <replace>, and reindexes all the news values.
+ *
+ * The patterns are loaded in best effort and the errors are ignored,
+ * but written in the logs.
+ */
+void pat_ref_reload(struct pat_ref *ref, struct pat_ref *replace)
+{
+	struct pattern_expr *expr;
+	struct pat_ref_elt *elt, *safe;
+	struct bref *bref, *back;
+	struct pattern pattern;
+
+
+	HA_SPIN_LOCK(PATREF_LOCK, &ref->lock);
+	list_for_each_entry(expr, &ref->pat, list) {
+		HA_RWLOCK_WRLOCK(PATEXP_LOCK, &expr->lock);
+	}
+
+	/* all expr are locked, we can safely remove all pat_ref */
+	list_for_each_entry_safe(elt, safe, &ref->head, list) {
+		list_for_each_entry_safe(bref, back, &elt->back_refs, users) {
+			/* we have to unlink all watchers. */
+			LIST_DEL_INIT(&bref->users);
+			bref->ref = NULL;
+		}
+		pat_delete_gen(ref, elt);
+		LIST_DEL(&elt->list);
+		free(elt->pattern);
+		free(elt->sample);
+		free(elt);
+	}
+
+	/* switch pat_ret_elt lists */
+	LIST_ADD(&replace->head, &ref->head);
+	LIST_DEL(&replace->head);
+
+	list_for_each_entry(expr, &ref->pat, list) {
+		list_for_each_entry(elt, &ref->head, list) {
+			char *err = NULL;
+			struct sample_data *data = NULL;
+
+			/* Create sample */
+			if (elt->sample && expr->pat_head->parse_smp) {
+				/* New sample. */
+				data = malloc(sizeof(*data));
+				if (!data)
+					continue;
+
+				/* Parse value. */
+				if (!expr->pat_head->parse_smp(elt->sample, data)) {
+					memprintf(&err, "unable to parse '%s'", elt->sample);
+					send_log(NULL, LOG_NOTICE, "%s", err);
+					free(err);
+					free(data);
+					continue;
+				}
+
+			}
+
+			/* initialise pattern */
+			memset(&pattern, 0, sizeof(pattern));
+			pattern.data = data;
+			pattern.ref = elt;
+
+			/* parse pattern */
+			if (!expr->pat_head->parse(elt->pattern, &pattern, expr->mflags, &err)) {
+				send_log(NULL, LOG_NOTICE, "%s", err);
+				free(err);
+				free(data);
+				continue;
+			}
+
+			/* index pattern */
+			if (!expr->pat_head->index(expr, &pattern, &err)) {
+				send_log(NULL, LOG_NOTICE, "%s", err);
+				free(err);
+				free(data);
+				continue;
+			}
+		}
+		HA_RWLOCK_WRUNLOCK(PATEXP_LOCK, &expr->lock);
+	}
+	HA_SPIN_UNLOCK(PATREF_LOCK, &ref->lock);
+
+#if defined(HA_HAVE_MALLOC_TRIM)
+	malloc_trim(0);
+#endif
+}
+
+/* This function prunes all entries of <ref> and all their associated
+ * pattern_expr. It may return before the end of the list is reached,
+ * returning 0, to yield, indicating to the caller that it must call it again.
+ * until it returns non-zero. All patterns are purged, both current ones and
+ * future or incomplete ones. This is used by "clear map" or "clear acl".
+ */
+int pat_ref_prune(struct pat_ref *ref)
+{
+	return pat_ref_purge_older(ref, ref->curr_gen + 1, 100) &&
+	       pat_ref_purge_older(ref, ref->next_gen + 1, 100);
+}
+
+/* This function looks up any existing reference <ref> in pattern_head <head>, and
+ * returns the associated pattern_expr pointer if found, otherwise NULL.
+ */
 struct pattern_expr *pattern_lookup_expr(struct pattern_head *head, struct pat_ref *ref)
 {
 	struct pattern_expr_list *expr;
@@ -2056,12 +2196,12 @@ struct pattern_expr *pattern_lookup_expr(struct pattern_head *head, struct pat_r
 	return NULL;
 }
 
-/* This function create new pattern_expr associated to the reference <ref>.
- * <ref> can be NULL. If an error is occured, the function returns NULL and
+/* This function creates new pattern_expr associated to the reference <ref>.
+ * <ref> can be NULL. If an error occurs, the function returns NULL and
  * <err> is filled. Otherwise, the function returns new pattern_expr linked
  * with <head> and <ref>.
  *
- * The returned value can be a alredy filled pattern list, in this case the
+ * The returned value can be an already filled pattern list, in this case the
  * flag <reuse> is set.
  */
 struct pattern_expr *pattern_new_expr(struct pattern_head *head, struct pat_ref *ref,
@@ -2074,7 +2214,7 @@ struct pattern_expr *pattern_new_expr(struct pattern_head *head, struct pat_ref 
 		*reuse = 0;
 
 	/* Memory and initialization of the chain element. */
-	list = malloc(sizeof(*list));
+	list = calloc(1, sizeof(*list));
 	if (!list) {
 		memprintf(err, "out of memory");
 		return NULL;
@@ -2082,7 +2222,7 @@ struct pattern_expr *pattern_new_expr(struct pattern_head *head, struct pat_ref 
 
 	/* Look for existing similar expr. No that only the index, parse and
 	 * parse_smp function must be identical for having similar pattern.
-	 * The other function depends of theses first.
+	 * The other function depends of these first.
 	 */
 	if (ref) {
 		list_for_each_entry(expr, &ref->pat, list)
@@ -2100,7 +2240,7 @@ struct pattern_expr *pattern_new_expr(struct pattern_head *head, struct pat_ref 
 	/* If no similar expr was found, we create new expr. */
 	if (!expr) {
 		/* Get a lot of memory for the expr struct. */
-		expr = malloc(sizeof(*expr));
+		expr = calloc(1, sizeof(*expr));
 		if (!expr) {
 			free(list);
 			memprintf(err, "out of memory");
@@ -2123,6 +2263,8 @@ struct pattern_expr *pattern_new_expr(struct pattern_head *head, struct pat_ref 
 			LIST_INIT(&expr->list);
 
 		expr->ref = ref;
+
+		HA_RWLOCK_INIT(&expr->lock);
 
 		/* We must free this pattern if it is no more used. */
 		list->do_free = 1;
@@ -2164,7 +2306,7 @@ struct pattern_expr *pattern_new_expr(struct pattern_head *head, struct pat_ref 
  *      |       `------------------------ key
  *      `-------------------------------- leading spaces ignored
  *
- * Return non-zero in case of succes, otherwise 0.
+ * Return non-zero in case of success, otherwise 0.
  */
 int pat_ref_read_from_file_smp(struct pat_ref *ref, const char *filename, char **err)
 {
@@ -2187,9 +2329,9 @@ int pat_ref_read_from_file_smp(struct pat_ref *ref, const char *filename, char *
 	 * followed by one value per line. The start spaces, separator spaces
 	 * and and spaces are stripped. Each can contain comment started by '#'
 	 */
-	while (fgets(trash.str, trash.size, file) != NULL) {
+	while (fgets(trash.area, trash.size, file) != NULL) {
 		line++;
-		c = trash.str;
+		c = trash.area;
 
 		/* ignore lines beginning with a dash */
 		if (*c == '#')
@@ -2235,7 +2377,12 @@ int pat_ref_read_from_file_smp(struct pat_ref *ref, const char *filename, char *
 		}
 	}
 
-	/* succes */
+	if (ferror(file)) {
+		memprintf(err, "error encountered while reading  <%s> : %s",
+				filename, strerror(errno));
+		goto out_close;
+	}
+	/* success */
 	ret = 1;
 
  out_close:
@@ -2264,9 +2411,9 @@ int pat_ref_read_from_file(struct pat_ref *ref, const char *filename, char **err
 	 * line. If the line contains spaces, they will be part of the pattern.
 	 * The pattern stops at the first CR, LF or EOF encountered.
 	 */
-	while (fgets(trash.str, trash.size, file) != NULL) {
+	while (fgets(trash.area, trash.size, file) != NULL) {
 		line++;
-		c = trash.str;
+		c = trash.area;
 
 		/* ignore lines beginning with a dash */
 		if (*c == '#')
@@ -2292,6 +2439,11 @@ int pat_ref_read_from_file(struct pat_ref *ref, const char *filename, char **err
 		}
 	}
 
+	if (ferror(file)) {
+		memprintf(err, "error encountered while reading  <%s> : %s",
+				filename, strerror(errno));
+		goto out_close;
+	}
 	ret = 1; /* success */
 
  out_close:
@@ -2317,7 +2469,7 @@ int pattern_read_from_file(struct pattern_head *head, unsigned int refflags,
 		             "pattern loaded from file '%s' used by %s at file '%s' line %d",
 		             filename, refflags & PAT_REF_MAP ? "map" : "acl", file, line);
 
-		ref = pat_ref_new(filename, trash.str, refflags);
+		ref = pat_ref_new(filename, trash.area, refflags);
 		if (!ref) {
 			memprintf(err, "out of memory");
 			return 0;
@@ -2364,7 +2516,7 @@ int pattern_read_from_file(struct pattern_head *head, unsigned int refflags,
 		chunk_appendf(&trash, ", by %s at file '%s' line %d",
 		              refflags & PAT_REF_MAP ? "map" : "acl", file, line);
 		free(ref->display);
-		ref->display = strdup(trash.str);
+		ref->display = strdup(trash.area);
 		if (!ref->display) {
 			memprintf(err, "out of memory");
 			return 0;
@@ -2434,14 +2586,53 @@ struct pattern *pattern_exec_match(struct pattern_head *head, struct sample *smp
 		return NULL;
 
 	list_for_each_entry(list, &head->head, list) {
+		HA_RWLOCK_RDLOCK(PATEXP_LOCK, &list->expr->lock);
 		pat = head->match(smp, list->expr, fill);
-		if (pat)
+		if (pat) {
+			/* We duplicate the pattern cause it could be modified
+			   by another thread */
+			if (pat != &static_pattern) {
+				memcpy(&static_pattern, pat, sizeof(struct pattern));
+				pat = &static_pattern;
+			}
+
+			/* We also duplicate the sample data for
+			   same reason */
+			if (pat->data && (pat->data != &static_sample_data)) {
+				switch(pat->data->type) {
+					case SMP_T_STR:
+						static_sample_data.type = SMP_T_STR;
+						static_sample_data.u.str = *get_trash_chunk();
+						static_sample_data.u.str.data = pat->data->u.str.data;
+						if (static_sample_data.u.str.data >= static_sample_data.u.str.size)
+							static_sample_data.u.str.data = static_sample_data.u.str.size - 1;
+						memcpy(static_sample_data.u.str.area,
+						       pat->data->u.str.area, static_sample_data.u.str.data);
+						static_sample_data.u.str.area[static_sample_data.u.str.data] = 0;
+						pat->data = &static_sample_data;
+						break;
+
+					case SMP_T_IPV4:
+					case SMP_T_IPV6:
+					case SMP_T_SINT:
+						memcpy(&static_sample_data, pat->data, sizeof(struct sample_data));
+						pat->data = &static_sample_data;
+						break;
+					default:
+						/* unimplemented pattern type */
+						pat->data = NULL;
+						break;
+				}
+			}
+			HA_RWLOCK_RDUNLOCK(PATEXP_LOCK, &list->expr->lock);
 			return pat;
+		}
+		HA_RWLOCK_RDUNLOCK(PATEXP_LOCK, &list->expr->lock);
 	}
 	return NULL;
 }
 
-/* This function prune the pattern expression. */
+/* This function prunes the pattern expressions starting at pattern_head <head>. */
 void pattern_prune(struct pattern_head *head)
 {
 	struct pattern_expr_list *list, *safe;
@@ -2450,17 +2641,18 @@ void pattern_prune(struct pattern_head *head)
 		LIST_DEL(&list->list);
 		if (list->do_free) {
 			LIST_DEL(&list->expr->list);
+			HA_RWLOCK_WRLOCK(PATEXP_LOCK, &list->expr->lock);
 			head->prune(list->expr);
+			HA_RWLOCK_WRUNLOCK(PATEXP_LOCK, &list->expr->lock);
 			free(list->expr);
 		}
 		free(list);
 	}
 }
 
-/* This function lookup for a pattern matching the <key> and return a
- * pointer to a pointer of the sample stoarge. If the <key> dont match,
- * the function returns NULL. If the key cannot be parsed, the function
- * fill <err>.
+/* This function searches occurrences of pattern reference element <ref> in
+ * expression <expr> and returns a pointer to a pointer of the sample storage.
+ * If <ref> is not found, NULL is returned.
  */
 struct sample_data **pattern_find_smp(struct pattern_expr *expr, struct pat_ref_elt *ref)
 {
@@ -2491,63 +2683,100 @@ struct sample_data **pattern_find_smp(struct pattern_expr *expr, struct pat_ref_
 	return NULL;
 }
 
-/* This function search all the pattern matching the <key> and delete it.
- * If the parsing of the input key fails, the function returns 0 and the
- * <err> is filled, else return 1;
+/* This function compares two pat_ref** on their unique_id, and returns -1/0/1
+ * depending on their order (suitable for sorting).
  */
-int pattern_delete(struct pattern_expr *expr, struct pat_ref_elt *ref)
+static int cmp_pat_ref(const void *_a, const void *_b)
 {
-	expr->pat_head->delete(expr, ref);
-	return 1;
+	struct pat_ref * const *a = _a;
+	struct pat_ref * const *b = _b;
+
+	if ((*a)->unique_id < (*b)->unique_id)
+		return -1;
+	else if ((*a)->unique_id > (*b)->unique_id)
+		return 1;
+	return 0;
 }
 
-/* This function finalize the configuration parsing. Its set all the
- * automatic ids
+/* This function finalizes the configuration parsing. It sets all the
+ * automatic ids.
  */
-void pattern_finalize_config(void)
+int pattern_finalize_config(void)
 {
-	int i = 0;
-	struct pat_ref *ref, *ref2, *ref3;
+	size_t len = 0;
+	size_t unassigned_pos = 0;
+	int next_unique_id = 0;
+	size_t i, j;
+	struct pat_ref *ref, **arr;
 	struct list pr = LIST_HEAD_INIT(pr);
 
-	pat_lru_seed = random();
-	if (global.tune.pattern_cache)
-		pat_lru_tree = lru64_new(global.tune.pattern_cache);
+	pat_lru_seed = ha_random();
 
+	/* Count pat_refs with user defined unique_id and totalt count */
 	list_for_each_entry(ref, &pattern_reference, list) {
-		if (ref->unique_id == -1) {
-			/* Look for the first free id. */
-			while (1) {
-				list_for_each_entry(ref2, &pattern_reference, list) {
-					if (ref2->unique_id == i) {
-						i++;
-						break;
-					}
-				}
-				if (&ref2->list == &pattern_reference)
-					break;
-			}
-
-			/* Uses the unique id and increment it for the next entry. */
-			ref->unique_id = i;
-			i++;
-		}
+		len++;
+		if (ref->unique_id != -1)
+			unassigned_pos++;
 	}
 
-	/* This sort the reference list by id. */
-	list_for_each_entry_safe(ref, ref2, &pattern_reference, list) {
-		LIST_DEL(&ref->list);
-		list_for_each_entry(ref3, &pr, list) {
-			if (ref->unique_id < ref3->unique_id) {
-				LIST_ADDQ(&ref3->list, &ref->list);
-				break;
-			}
-		}
-		if (&ref3->list == &pr)
-			LIST_ADDQ(&pr, &ref->list);
+	if (len == 0) {
+		return 0;
 	}
+
+	arr = calloc(len, sizeof(*arr));
+	if (arr == NULL) {
+		ha_alert("Out of memory error.\n");
+		return ERR_ALERT | ERR_FATAL;
+	}
+
+	i = 0;
+	j = unassigned_pos;
+	list_for_each_entry(ref, &pattern_reference, list) {
+		if (ref->unique_id != -1)
+			arr[i++] = ref;
+		else
+			arr[j++] = ref;
+	}
+
+	/* Sort first segment of array with user-defined unique ids for
+	 * fast lookup when generating unique ids
+	 */
+	qsort(arr, unassigned_pos, sizeof(*arr), cmp_pat_ref);
+
+	/* Assign unique ids to the rest of the elements */
+	for (i = unassigned_pos; i < len; i++) {
+		do {
+			arr[i]->unique_id = next_unique_id++;
+		} while (bsearch(&arr[i], arr, unassigned_pos, sizeof(*arr), cmp_pat_ref));
+	}
+
+	/* Sort complete array */
+	qsort(arr, len, sizeof(*arr), cmp_pat_ref);
+
+	/* Convert back to linked list */
+	for (i = 0; i < len; i++)
+		LIST_ADDQ(&pr, &arr[i]->list);
 
 	/* swap root */
 	LIST_ADD(&pr, &pattern_reference);
 	LIST_DEL(&pr);
+
+	free(arr);
+	return 0;
 }
+
+static int pattern_per_thread_lru_alloc()
+{
+	if (!global.tune.pattern_cache)
+		return 1;
+	pat_lru_tree = lru64_new(global.tune.pattern_cache);
+	return !!pat_lru_tree;
+}
+
+static void pattern_per_thread_lru_free()
+{
+	lru64_destroy(pat_lru_tree);
+}
+
+REGISTER_PER_THREAD_ALLOC(pattern_per_thread_lru_alloc);
+REGISTER_PER_THREAD_FREE(pattern_per_thread_lru_free);

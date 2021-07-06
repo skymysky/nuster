@@ -14,14 +14,14 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include <common/config.h>
-#include <common/defaults.h>
-#include <common/regex.h>
-#include <common/standard.h>
-#include <proto/log.h>
+#include <haproxy/api.h>
+#include <haproxy/errors.h>
+#include <haproxy/global.h>
+#include <haproxy/regex.h>
+#include <haproxy/tools.h>
 
 /* regex trash buffer used by various regex tests */
-regmatch_t pmatch[MAX_MATCH];  /* rm_so, rm_eo for regular expressions */
+THREAD_LOCAL regmatch_t pmatch[MAX_MATCH];  /* rm_so, rm_eo for regular expressions */
 
 int exp_replace(char *dst, unsigned int dst_size, char *src, const char *str, const regmatch_t *matches)
 {
@@ -57,12 +57,12 @@ int exp_replace(char *dst, unsigned int dst_size, char *src, const char *str, co
 				if (!*str)
 					return -1;
 
-				hex1 = toupper(*str++) - '0';
+				hex1 = toupper((unsigned char)*str++) - '0';
 
 				if (!*str)
 					return -1;
 
-				hex2 = toupper(*str++) - '0';
+				hex2 = toupper((unsigned char)*str++) - '0';
 
 				if (hex1 > 9) hex1 -= 'A' - '9' - 1;
 				if (hex2 > 9) hex2 -= 'A' - '9' - 1;
@@ -113,7 +113,7 @@ const char *check_replace_string(const char *str)
 				err = NULL;
 			}
 			else {
-				Warning("'\\%c' : deprecated use of a backslash before something not '\\','x' or a digit.\n", *str);
+				ha_warning("'\\%c' : deprecated use of a backslash before something not '\\','x' or a digit.\n", *str);
 				err = NULL;
 			}
 		}
@@ -123,33 +123,6 @@ const char *check_replace_string(const char *str)
 }
 
 
-/* returns the pointer to an error in the replacement string, or NULL if OK */
-const char *chain_regex(struct hdr_exp **head, struct my_regex *preg,
-			int action, const char *replace, void *cond)
-{
-	struct hdr_exp *exp;
-
-	if (replace != NULL) {
-		const char *err;
-		err = check_replace_string(replace);
-		if (err)
-			return err;
-	}
-
-	while (*head != NULL)
-		head = &(*head)->next;
-
-	exp = calloc(1, sizeof(*exp));
-
-	exp->preg = preg;
-	exp->replace = replace;
-	exp->action = action;
-	exp->cond = cond;
-	*head = exp;
-
-	return NULL;
-}
-
 /* This function apply regex. It take const null terminated char as input.
  * If the function doesn't match, it returns false, else it returns true.
  * When it is compiled with JIT, this function execute strlen on the subject.
@@ -157,37 +130,60 @@ const char *chain_regex(struct hdr_exp **head, struct my_regex *preg,
  */
 int regex_exec_match(const struct my_regex *preg, const char *subject,
                      size_t nmatch, regmatch_t pmatch[], int flags) {
-#if defined(USE_PCRE) || defined(USE_PCRE_JIT)
+#if defined(USE_PCRE) || defined(USE_PCRE_JIT) || defined(USE_PCRE2) || defined(USE_PCRE2_JIT)
 	int ret;
+#ifdef USE_PCRE2
+	PCRE2_SIZE *matches;
+	pcre2_match_data *pm;
+#else
 	int matches[MAX_MATCH * 3];
+#endif
 	int enmatch;
 	int i;
 	int options;
 
 	/* Silently limit the number of allowed matches. max
 	 * match i the maximum value for match, in fact this
-	 * limit is not applyied.
+	 * limit is not applied.
 	 */
+
 	enmatch = nmatch;
 	if (enmatch > MAX_MATCH)
 		enmatch = MAX_MATCH;
 
 	options = 0;
 	if (flags & REG_NOTBOL)
+#ifdef USE_PCRE2
+		options |= PCRE2_NOTBOL;
+#else
 		options |= PCRE_NOTBOL;
+#endif
 
-	/* The value returned by pcre_exec() is one more than the highest numbered
+	/* The value returned by pcre_exec()/pcre2_match() is one more than the highest numbered
 	 * pair that has been set. For example, if two substrings have been captured,
 	 * the returned value is 3. If there are no capturing subpatterns, the return
 	 * value from a successful match is 1, indicating that just the first pair of
 	 * offsets has been set.
 	 *
-	 * It seems that this function returns 0 if it detect more matches than avalaible
+	 * It seems that this function returns 0 if it detects more matches than available
 	 * space in the matches array.
 	 */
+#ifdef USE_PCRE2
+	pm = pcre2_match_data_create_from_pattern(preg->reg, NULL);
+	ret = preg->mfn(preg->reg, (PCRE2_SPTR)subject, (PCRE2_SIZE)strlen(subject), 0, options, pm, NULL);
+
+	if (ret < 0) {
+		pcre2_match_data_free(pm);
+		return 0;
+	}
+
+	matches = pcre2_get_ovector_pointer(pm);
+#else
 	ret = pcre_exec(preg->reg, preg->extra, subject, strlen(subject), 0, options, matches, enmatch * 3);
+
 	if (ret < 0)
 		return 0;
+#endif
 
 	if (ret == 0)
 		ret = enmatch;
@@ -203,6 +199,9 @@ int regex_exec_match(const struct my_regex *preg, const char *subject,
 		pmatch[i].rm_so = -1;
 		pmatch[i].rm_eo = -1;
 	}
+#ifdef USE_PCRE2
+	pcre2_match_data_free(pm);
+#endif
 	return 1;
 #else
 	int match;
@@ -219,22 +218,27 @@ int regex_exec_match(const struct my_regex *preg, const char *subject,
  * <subject> can be modified during the processing. If the function doesn't
  * match, it returns false, else it returns true.
  * When it is compiled with standard POSIX regex or PCRE, this function add
- * a temporary null chracters at the end of the <subject>. The <subject> must
+ * a temporary null characters at the end of the <subject>. The <subject> must
  * have a real length of <length> + 1. Currently the only supported flag is
  * REG_NOTBOL.
  */
 int regex_exec_match2(const struct my_regex *preg, char *subject, int length,
                       size_t nmatch, regmatch_t pmatch[], int flags) {
-#if defined(USE_PCRE) || defined(USE_PCRE_JIT)
+#if defined(USE_PCRE) || defined(USE_PCRE_JIT) || defined(USE_PCRE2) || defined(USE_PCRE2_JIT)
 	int ret;
+#ifdef USE_PCRE2
+	PCRE2_SIZE *matches;
+	pcre2_match_data *pm;
+#else
 	int matches[MAX_MATCH * 3];
+#endif
 	int enmatch;
 	int i;
 	int options;
 
 	/* Silently limit the number of allowed matches. max
 	 * match i the maximum value for match, in fact this
-	 * limit is not applyied.
+	 * limit is not applied.
 	 */
 	enmatch = nmatch;
 	if (enmatch > MAX_MATCH)
@@ -242,20 +246,36 @@ int regex_exec_match2(const struct my_regex *preg, char *subject, int length,
 
 	options = 0;
 	if (flags & REG_NOTBOL)
+#ifdef USE_PCRE2
+		options |= PCRE2_NOTBOL;
+#else
 		options |= PCRE_NOTBOL;
+#endif
 
-	/* The value returned by pcre_exec() is one more than the highest numbered
+	/* The value returned by pcre_exec()/pcre2_(jit)_match() is one more than the highest numbered
 	 * pair that has been set. For example, if two substrings have been captured,
 	 * the returned value is 3. If there are no capturing subpatterns, the return
 	 * value from a successful match is 1, indicating that just the first pair of
 	 * offsets has been set.
 	 *
-	 * It seems that this function returns 0 if it detect more matches than avalaible
+	 * It seems that this function returns 0 if it detects more matches than available
 	 * space in the matches array.
 	 */
+#ifdef USE_PCRE2
+	pm = pcre2_match_data_create_from_pattern(preg->reg, NULL);
+	ret = preg->mfn(preg->reg, (PCRE2_SPTR)subject, (PCRE2_SIZE)length, 0, options, pm, NULL);
+
+	if (ret < 0) {
+		pcre2_match_data_free(pm);
+		return 0;
+	}
+
+	matches = pcre2_get_ovector_pointer(pm);
+#else
 	ret = pcre_exec(preg->reg, preg->extra, subject, length, 0, options, matches, enmatch * 3);
 	if (ret < 0)
 		return 0;
+#endif
 
 	if (ret == 0)
 		ret = enmatch;
@@ -271,6 +291,9 @@ int regex_exec_match2(const struct my_regex *preg, char *subject, int length,
 		pmatch[i].rm_so = -1;
 		pmatch[i].rm_eo = -1;
 	}
+#ifdef USE_PCRE2
+	pcre2_match_data_free(pm);
+#endif
 	return 1;
 #else
 	char old_char = subject[length];
@@ -286,13 +309,32 @@ int regex_exec_match2(const struct my_regex *preg, char *subject, int length,
 #endif
 }
 
-int regex_comp(const char *str, struct my_regex *regex, int cs, int cap, char **err)
+struct my_regex *regex_comp(const char *str, int cs, int cap, char **err)
 {
+	struct my_regex *regex = NULL;
 #if defined(USE_PCRE) || defined(USE_PCRE_JIT)
 	int flags = 0;
 	const char *error;
 	int erroffset;
+#elif defined(USE_PCRE2) || defined(USE_PCRE2_JIT)
+	int flags = 0;
+	int errn;
+#if defined(USE_PCRE2_JIT)
+	int jit;
+#endif
+	PCRE2_UCHAR error[256];
+	PCRE2_SIZE erroffset;
+#else
+	int flags = REG_EXTENDED;
+#endif
 
+	regex = calloc(1, sizeof(*regex));
+	if (!regex) {
+		memprintf(err, "not enough memory to build regex");
+		goto out_fail_alloc;
+	}
+
+#if defined(USE_PCRE) || defined(USE_PCRE_JIT)
 	if (!cs)
 		flags |= PCRE_CASELESS;
 	if (!cap)
@@ -301,18 +343,45 @@ int regex_comp(const char *str, struct my_regex *regex, int cs, int cap, char **
 	regex->reg = pcre_compile(str, flags, &error, &erroffset, NULL);
 	if (!regex->reg) {
 		memprintf(err, "regex '%s' is invalid (error=%s, erroffset=%d)", str, error, erroffset);
-		return 0;
+		goto out_fail_alloc;
 	}
 
 	regex->extra = pcre_study(regex->reg, PCRE_STUDY_JIT_COMPILE, &error);
 	if (!regex->extra && error != NULL) {
 		pcre_free(regex->reg);
 		memprintf(err, "failed to compile regex '%s' (error=%s)", str, error);
-		return 0;
+		goto out_fail_alloc;
 	}
-#else
-	int flags = REG_EXTENDED;
+#elif defined(USE_PCRE2) || defined(USE_PCRE2_JIT)
+	if (!cs)
+		flags |= PCRE2_CASELESS;
+	if (!cap)
+		flags |= PCRE2_NO_AUTO_CAPTURE;
 
+	regex->reg = pcre2_compile((PCRE2_SPTR)str, PCRE2_ZERO_TERMINATED, flags, &errn, &erroffset, NULL);
+	if (!regex->reg) {
+		pcre2_get_error_message(errn, error, sizeof(error));
+		memprintf(err, "regex '%s' is invalid (error=%s, erroffset=%zu)", str, error, erroffset);
+		goto out_fail_alloc;
+	}
+
+	regex->mfn = &pcre2_match;
+#if defined(USE_PCRE2_JIT)
+	jit = pcre2_jit_compile(regex->reg, PCRE2_JIT_COMPLETE);
+	/*
+	 * We end if it is an error not related to lack of JIT support
+	 * in a case of JIT support missing pcre2_jit_compile is "no-op"
+	 */
+	if (jit < 0 && jit != PCRE2_ERROR_JIT_BADOPTION) {
+		pcre2_code_free(regex->reg);
+		memprintf(err, "regex '%s' jit compilation failed", str);
+		goto out_fail_alloc;
+	} else {
+		regex->mfn = &pcre2_jit_match;
+	}
+#endif
+
+#else
 	if (!cs)
 		flags |= REG_ICASE;
 	if (!cap)
@@ -320,11 +389,63 @@ int regex_comp(const char *str, struct my_regex *regex, int cs, int cap, char **
 
 	if (regcomp(&regex->regex, str, flags) != 0) {
 		memprintf(err, "regex '%s' is invalid", str);
-		return 0;
+		goto out_fail_alloc;
 	}
 #endif
-	return 1;
+	return regex;
+
+  out_fail_alloc:
+	free(regex);
+	return NULL;
 }
+
+static void regex_register_build_options(void)
+{
+	char *ptr = NULL;
+
+#ifdef USE_PCRE
+	memprintf(&ptr, "Built with PCRE version : %s", (HAP_XSTRING(Z PCRE_PRERELEASE)[1] == 0)?
+		HAP_XSTRING(PCRE_MAJOR.PCRE_MINOR PCRE_DATE) :
+		HAP_XSTRING(PCRE_MAJOR.PCRE_MINOR) HAP_XSTRING(PCRE_PRERELEASE PCRE_DATE));
+	memprintf(&ptr, "%s\nRunning on PCRE version : %s", ptr, pcre_version());
+
+	memprintf(&ptr, "%s\nPCRE library supports JIT : %s", ptr,
+#ifdef USE_PCRE_JIT
+		  ({
+			  int r;
+			  pcre_config(PCRE_CONFIG_JIT, &r);
+			  r ? "yes" : "no (libpcre build without JIT?)";
+		  })
+#else
+		  "no (USE_PCRE_JIT not set)"
+#endif
+		  );
+#endif /* USE_PCRE */
+
+#ifdef USE_PCRE2
+	memprintf(&ptr, "Built with PCRE2 version : %s", (HAP_XSTRING(Z PCRE2_PRERELEASE)[1] == 0) ?
+	          HAP_XSTRING(PCRE2_MAJOR.PCRE2_MINOR PCRE2_DATE) :
+	          HAP_XSTRING(PCRE2_MAJOR.PCRE2_MINOR) HAP_XSTRING(PCRE2_PRERELEASE PCRE2_DATE));
+	memprintf(&ptr, "%s\nPCRE2 library supports JIT : %s", ptr,
+#ifdef USE_PCRE2_JIT
+		  ({
+			  int r;
+			  pcre2_config(PCRE2_CONFIG_JIT, &r);
+			  r ? "yes" : "no (libpcre2 build without JIT?)";
+		  })
+#else
+		  "no (USE_PCRE2_JIT not set)"
+#endif
+		  );
+#endif /* USE_PCRE2 */
+
+#if !defined(USE_PCRE) && !defined(USE_PCRE2)
+	memprintf(&ptr, "Built without PCRE or PCRE2 support (using libc's regex instead)");
+#endif
+	hap_register_build_opts(ptr, 1);
+}
+
+INITCALL0(STG_REGISTER, regex_register_build_options);
 
 /*
  * Local variables:

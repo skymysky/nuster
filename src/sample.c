@@ -16,22 +16,32 @@
 #include <arpa/inet.h>
 #include <stdio.h>
 
-#include <types/global.h>
+#include <import/sha1.h>
+#include <import/xxhash.h>
 
-#include <common/chunk.h>
-#include <common/hash.h>
-#include <common/standard.h>
-#include <common/uri_auth.h>
-#include <common/base64.h>
-
-#include <proto/arg.h>
-#include <proto/auth.h>
-#include <proto/log.h>
-#include <proto/proto_http.h>
-#include <proto/proxy.h>
-#include <proto/sample.h>
-#include <proto/stick_table.h>
-#include <proto/vars.h>
+#include <haproxy/api.h>
+#include <haproxy/arg.h>
+#include <haproxy/auth.h>
+#include <haproxy/base64.h>
+#include <haproxy/buf.h>
+#include <haproxy/chunk.h>
+#include <haproxy/errors.h>
+#include <haproxy/fix.h>
+#include <haproxy/global.h>
+#include <haproxy/hash.h>
+#include <haproxy/http.h>
+#include <haproxy/istbuf.h>
+#include <haproxy/mqtt.h>
+#include <haproxy/net_helper.h>
+#include <haproxy/protobuf.h>
+#include <haproxy/proxy.h>
+#include <haproxy/regex.h>
+#include <haproxy/sample.h>
+#include <haproxy/sink.h>
+#include <haproxy/stick_table.h>
+#include <haproxy/tools.h>
+#include <haproxy/uri_auth-t.h>
+#include <haproxy/vars.h>
 
 /* sample type names */
 const char *smp_to_type[SMP_TYPES] = {
@@ -47,7 +57,7 @@ const char *smp_to_type[SMP_TYPES] = {
 };
 
 /* static sample used in sample_process() when <p> is NULL */
-static struct sample temp_smp;
+static THREAD_LOCAL struct sample temp_smp;
 
 /* list head of all known sample fetch keywords */
 static struct sample_fetch_kw_list sample_fetches = {
@@ -66,7 +76,7 @@ const unsigned int fetch_cap[SMP_SRC_ENTRIES] = {
 	                   SMP_VAL_BE_SET_SRV | SMP_VAL_BE_SRV_CON | SMP_VAL_BE_RES_CNT |
 	                   SMP_VAL_BE_HRS_HDR | SMP_VAL_BE_HRS_BDY | SMP_VAL_BE_STO_RUL |
 	                   SMP_VAL_FE_RES_CNT | SMP_VAL_FE_HRS_HDR | SMP_VAL_FE_HRS_BDY |
-	                   SMP_VAL_FE_LOG_END),
+	                   SMP_VAL_FE_LOG_END | SMP_VAL_BE_CHK_RUL),
 
 	[SMP_SRC_LISTN] = (SMP_VAL_FE_CON_ACC | SMP_VAL_FE_SES_ACC | SMP_VAL_FE_REQ_CNT |
 	                   SMP_VAL_FE_HRQ_HDR | SMP_VAL_FE_HRQ_BDY | SMP_VAL_FE_SET_BCK |
@@ -74,7 +84,7 @@ const unsigned int fetch_cap[SMP_SRC_ENTRIES] = {
 	                   SMP_VAL_BE_SET_SRV | SMP_VAL_BE_SRV_CON | SMP_VAL_BE_RES_CNT |
 	                   SMP_VAL_BE_HRS_HDR | SMP_VAL_BE_HRS_BDY | SMP_VAL_BE_STO_RUL |
 	                   SMP_VAL_FE_RES_CNT | SMP_VAL_FE_HRS_HDR | SMP_VAL_FE_HRS_BDY |
-	                   SMP_VAL_FE_LOG_END),
+	                   SMP_VAL_FE_LOG_END | SMP_VAL___________),
 
 	[SMP_SRC_FTEND] = (SMP_VAL_FE_CON_ACC | SMP_VAL_FE_SES_ACC | SMP_VAL_FE_REQ_CNT |
 	                   SMP_VAL_FE_HRQ_HDR | SMP_VAL_FE_HRQ_BDY | SMP_VAL_FE_SET_BCK |
@@ -82,7 +92,7 @@ const unsigned int fetch_cap[SMP_SRC_ENTRIES] = {
 	                   SMP_VAL_BE_SET_SRV | SMP_VAL_BE_SRV_CON | SMP_VAL_BE_RES_CNT |
 	                   SMP_VAL_BE_HRS_HDR | SMP_VAL_BE_HRS_BDY | SMP_VAL_BE_STO_RUL |
 	                   SMP_VAL_FE_RES_CNT | SMP_VAL_FE_HRS_HDR | SMP_VAL_FE_HRS_BDY |
-	                   SMP_VAL_FE_LOG_END),
+	                   SMP_VAL_FE_LOG_END | SMP_VAL___________),
 
 	[SMP_SRC_L4CLI] = (SMP_VAL_FE_CON_ACC | SMP_VAL_FE_SES_ACC | SMP_VAL_FE_REQ_CNT |
 	                   SMP_VAL_FE_HRQ_HDR | SMP_VAL_FE_HRQ_BDY | SMP_VAL_FE_SET_BCK |
@@ -90,7 +100,7 @@ const unsigned int fetch_cap[SMP_SRC_ENTRIES] = {
 	                   SMP_VAL_BE_SET_SRV | SMP_VAL_BE_SRV_CON | SMP_VAL_BE_RES_CNT |
 	                   SMP_VAL_BE_HRS_HDR | SMP_VAL_BE_HRS_BDY | SMP_VAL_BE_STO_RUL |
 	                   SMP_VAL_FE_RES_CNT | SMP_VAL_FE_HRS_HDR | SMP_VAL_FE_HRS_BDY |
-	                   SMP_VAL_FE_LOG_END),
+	                   SMP_VAL_FE_LOG_END | SMP_VAL_BE_CHK_RUL),
 
 	[SMP_SRC_L5CLI] = (SMP_VAL___________ | SMP_VAL_FE_SES_ACC | SMP_VAL_FE_REQ_CNT |
 	                   SMP_VAL_FE_HRQ_HDR | SMP_VAL_FE_HRQ_BDY | SMP_VAL_FE_SET_BCK |
@@ -98,7 +108,7 @@ const unsigned int fetch_cap[SMP_SRC_ENTRIES] = {
 	                   SMP_VAL_BE_SET_SRV | SMP_VAL_BE_SRV_CON | SMP_VAL_BE_RES_CNT |
 	                   SMP_VAL_BE_HRS_HDR | SMP_VAL_BE_HRS_BDY | SMP_VAL_BE_STO_RUL |
 	                   SMP_VAL_FE_RES_CNT | SMP_VAL_FE_HRS_HDR | SMP_VAL_FE_HRS_BDY |
-	                   SMP_VAL_FE_LOG_END),
+	                   SMP_VAL_FE_LOG_END | SMP_VAL___________),
 
 	[SMP_SRC_TRACK] = (SMP_VAL_FE_CON_ACC | SMP_VAL_FE_SES_ACC | SMP_VAL_FE_REQ_CNT |
 	                   SMP_VAL_FE_HRQ_HDR | SMP_VAL_FE_HRQ_BDY | SMP_VAL_FE_SET_BCK |
@@ -106,7 +116,7 @@ const unsigned int fetch_cap[SMP_SRC_ENTRIES] = {
 	                   SMP_VAL_BE_SET_SRV | SMP_VAL_BE_SRV_CON | SMP_VAL_BE_RES_CNT |
 	                   SMP_VAL_BE_HRS_HDR | SMP_VAL_BE_HRS_BDY | SMP_VAL_BE_STO_RUL |
 	                   SMP_VAL_FE_RES_CNT | SMP_VAL_FE_HRS_HDR | SMP_VAL_FE_HRS_BDY |
-	                   SMP_VAL_FE_LOG_END),
+	                   SMP_VAL_FE_LOG_END | SMP_VAL___________),
 
 	[SMP_SRC_L6REQ] = (SMP_VAL___________ | SMP_VAL___________ | SMP_VAL_FE_REQ_CNT |
 	                   SMP_VAL_FE_HRQ_HDR | SMP_VAL_FE_HRQ_BDY | SMP_VAL_FE_SET_BCK |
@@ -114,7 +124,7 @@ const unsigned int fetch_cap[SMP_SRC_ENTRIES] = {
 	                   SMP_VAL_BE_SET_SRV | SMP_VAL_BE_SRV_CON | SMP_VAL___________ |
 	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
 	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
-	                   SMP_VAL___________),
+	                   SMP_VAL___________ | SMP_VAL___________),
 
 	[SMP_SRC_HRQHV] = (SMP_VAL___________ | SMP_VAL___________ | SMP_VAL_FE_REQ_CNT |
 	                   SMP_VAL_FE_HRQ_HDR | SMP_VAL_FE_HRQ_BDY | SMP_VAL_FE_SET_BCK |
@@ -122,7 +132,7 @@ const unsigned int fetch_cap[SMP_SRC_ENTRIES] = {
 	                   SMP_VAL_BE_SET_SRV | SMP_VAL_BE_SRV_CON | SMP_VAL___________ |
 	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
 	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
-	                   SMP_VAL___________),
+	                   SMP_VAL___________ | SMP_VAL___________),
 
 	[SMP_SRC_HRQHP] = (SMP_VAL___________ | SMP_VAL___________ | SMP_VAL_FE_REQ_CNT |
 	                   SMP_VAL_FE_HRQ_HDR | SMP_VAL_FE_HRQ_BDY | SMP_VAL_FE_SET_BCK |
@@ -130,7 +140,7 @@ const unsigned int fetch_cap[SMP_SRC_ENTRIES] = {
 	                   SMP_VAL_BE_SET_SRV | SMP_VAL_BE_SRV_CON | SMP_VAL_BE_RES_CNT |
 	                   SMP_VAL_BE_HRS_HDR | SMP_VAL_BE_HRS_BDY | SMP_VAL_BE_STO_RUL |
 	                   SMP_VAL_FE_RES_CNT | SMP_VAL_FE_HRS_HDR | SMP_VAL_FE_HRS_BDY |
-	                   SMP_VAL_FE_LOG_END),
+	                   SMP_VAL_FE_LOG_END | SMP_VAL___________),
 
 	[SMP_SRC_HRQBO] = (SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
 	                   SMP_VAL___________ | SMP_VAL_FE_HRQ_BDY | SMP_VAL_FE_SET_BCK |
@@ -138,7 +148,7 @@ const unsigned int fetch_cap[SMP_SRC_ENTRIES] = {
 	                   SMP_VAL_BE_SET_SRV | SMP_VAL_BE_SRV_CON | SMP_VAL___________ |
 	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
 	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
-	                   SMP_VAL___________),
+	                   SMP_VAL___________ | SMP_VAL___________),
 
 	[SMP_SRC_BKEND] = (SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
 	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
@@ -146,7 +156,7 @@ const unsigned int fetch_cap[SMP_SRC_ENTRIES] = {
 	                   SMP_VAL_BE_SET_SRV | SMP_VAL_BE_SRV_CON | SMP_VAL_BE_RES_CNT |
 	                   SMP_VAL_BE_HRS_HDR | SMP_VAL_BE_HRS_BDY | SMP_VAL_BE_STO_RUL |
 	                   SMP_VAL_FE_RES_CNT | SMP_VAL_FE_HRS_HDR | SMP_VAL_FE_HRS_BDY |
-	                   SMP_VAL_FE_LOG_END),
+	                   SMP_VAL_FE_LOG_END | SMP_VAL_BE_CHK_RUL),
 
 	[SMP_SRC_SERVR] = (SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
 	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
@@ -154,7 +164,7 @@ const unsigned int fetch_cap[SMP_SRC_ENTRIES] = {
 	                   SMP_VAL___________ | SMP_VAL_BE_SRV_CON | SMP_VAL_BE_RES_CNT |
 	                   SMP_VAL_BE_HRS_HDR | SMP_VAL_BE_HRS_BDY | SMP_VAL_BE_STO_RUL |
 	                   SMP_VAL_FE_RES_CNT | SMP_VAL_FE_HRS_HDR | SMP_VAL_FE_HRS_BDY |
-	                   SMP_VAL_FE_LOG_END),
+	                   SMP_VAL_FE_LOG_END | SMP_VAL_BE_CHK_RUL),
 
 	[SMP_SRC_L4SRV] = (SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
 	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
@@ -162,7 +172,7 @@ const unsigned int fetch_cap[SMP_SRC_ENTRIES] = {
 	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL_BE_RES_CNT |
 	                   SMP_VAL_BE_HRS_HDR | SMP_VAL_BE_HRS_BDY | SMP_VAL_BE_STO_RUL |
 	                   SMP_VAL_FE_RES_CNT | SMP_VAL_FE_HRS_HDR | SMP_VAL_FE_HRS_BDY |
-	                   SMP_VAL_FE_LOG_END),
+	                   SMP_VAL_FE_LOG_END | SMP_VAL_BE_CHK_RUL),
 
 	[SMP_SRC_L5SRV] = (SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
 	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
@@ -170,7 +180,7 @@ const unsigned int fetch_cap[SMP_SRC_ENTRIES] = {
 	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL_BE_RES_CNT |
 	                   SMP_VAL_BE_HRS_HDR | SMP_VAL_BE_HRS_BDY | SMP_VAL_BE_STO_RUL |
 	                   SMP_VAL_FE_RES_CNT | SMP_VAL_FE_HRS_HDR | SMP_VAL_FE_HRS_BDY |
-	                   SMP_VAL_FE_LOG_END),
+	                   SMP_VAL_FE_LOG_END | SMP_VAL_BE_CHK_RUL),
 
 	[SMP_SRC_L6RES] = (SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
 	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
@@ -178,7 +188,7 @@ const unsigned int fetch_cap[SMP_SRC_ENTRIES] = {
 	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL_BE_RES_CNT |
 	                   SMP_VAL_BE_HRS_HDR | SMP_VAL_BE_HRS_BDY | SMP_VAL_BE_STO_RUL |
 	                   SMP_VAL_FE_RES_CNT | SMP_VAL_FE_HRS_HDR | SMP_VAL_FE_HRS_BDY |
-	                   SMP_VAL___________),
+	                   SMP_VAL___________ | SMP_VAL_BE_CHK_RUL),
 
 	[SMP_SRC_HRSHV] = (SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
 	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
@@ -186,7 +196,7 @@ const unsigned int fetch_cap[SMP_SRC_ENTRIES] = {
 	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL_BE_RES_CNT |
 	                   SMP_VAL_BE_HRS_HDR | SMP_VAL_BE_HRS_BDY | SMP_VAL_BE_STO_RUL |
 	                   SMP_VAL_FE_RES_CNT | SMP_VAL_FE_HRS_HDR | SMP_VAL_FE_HRS_BDY |
-	                   SMP_VAL___________),
+	                   SMP_VAL___________ | SMP_VAL_BE_CHK_RUL),
 
 	[SMP_SRC_HRSHP] = (SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
 	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
@@ -194,7 +204,7 @@ const unsigned int fetch_cap[SMP_SRC_ENTRIES] = {
 	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL_BE_RES_CNT |
 	                   SMP_VAL_BE_HRS_HDR | SMP_VAL_BE_HRS_BDY | SMP_VAL_BE_STO_RUL |
 	                   SMP_VAL_FE_RES_CNT | SMP_VAL_FE_HRS_HDR | SMP_VAL_FE_HRS_BDY |
-	                   SMP_VAL_FE_LOG_END),
+	                   SMP_VAL_FE_LOG_END | SMP_VAL_BE_CHK_RUL),
 
 	[SMP_SRC_HRSBO] = (SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
 	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
@@ -202,7 +212,7 @@ const unsigned int fetch_cap[SMP_SRC_ENTRIES] = {
 	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
 	                   SMP_VAL___________ | SMP_VAL_BE_HRS_BDY | SMP_VAL_BE_STO_RUL |
 	                   SMP_VAL_FE_RES_CNT | SMP_VAL_FE_HRS_HDR | SMP_VAL_FE_HRS_BDY |
-	                   SMP_VAL___________),
+	                   SMP_VAL___________ | SMP_VAL_BE_CHK_RUL),
 
 	[SMP_SRC_RQFIN] = (SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
 	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
@@ -210,7 +220,7 @@ const unsigned int fetch_cap[SMP_SRC_ENTRIES] = {
 	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
 	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
 	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
-	                   SMP_VAL_FE_LOG_END),
+	                   SMP_VAL_FE_LOG_END | SMP_VAL___________),
 
 	[SMP_SRC_RSFIN] = (SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
 	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
@@ -218,7 +228,7 @@ const unsigned int fetch_cap[SMP_SRC_ENTRIES] = {
 	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
 	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
 	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
-	                   SMP_VAL_FE_LOG_END),
+	                   SMP_VAL_FE_LOG_END | SMP_VAL___________),
 
 	[SMP_SRC_TXFIN] = (SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
 	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
@@ -226,7 +236,7 @@ const unsigned int fetch_cap[SMP_SRC_ENTRIES] = {
 	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
 	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
 	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
-	                   SMP_VAL_FE_LOG_END),
+	                   SMP_VAL_FE_LOG_END | SMP_VAL___________),
 
 	[SMP_SRC_SSFIN] = (SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
 	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
@@ -234,7 +244,7 @@ const unsigned int fetch_cap[SMP_SRC_ENTRIES] = {
 	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
 	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
 	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
-	                   SMP_VAL_FE_LOG_END),
+	                   SMP_VAL_FE_LOG_END | SMP_VAL___________),
 };
 
 static const char *fetch_src_names[SMP_SRC_ENTRIES] = {
@@ -282,6 +292,7 @@ static const char *fetch_ckp_names[SMP_CKP_ENTRIES] = {
 	[SMP_CKP_FE_HRS_HDR] = "frontend http-response header rule",
 	[SMP_CKP_FE_HRS_BDY] = "frontend http-response body rule",
 	[SMP_CKP_FE_LOG_END] = "logs",
+	[SMP_CKP_BE_CHK_RUL] = "backend tcp-check rule",
 };
 
 /* This function returns the type of the data returned by the sample_expr.
@@ -309,8 +320,8 @@ const char *sample_src_names(unsigned int use)
 {
 	int bit;
 
-	trash.len = 0;
-	trash.str[0] = '\0';
+	trash.data = 0;
+	trash.area[0] = '\0';
 	for (bit = 0; bit < SMP_SRC_ENTRIES; bit++) {
 		if (!(use & ~((1 << bit) - 1)))
 			break; /* no more bits */
@@ -318,11 +329,12 @@ const char *sample_src_names(unsigned int use)
 		if (!(use & (1 << bit)))
 			continue; /* bit not set */
 
-		trash.len += snprintf(trash.str + trash.len, trash.size - trash.len, "%s%s",
-				      (use & ((1 << bit) - 1)) ? "," : "",
-		                      fetch_src_names[bit]);
+		trash.data += snprintf(trash.area + trash.data,
+				       trash.size - trash.data, "%s%s",
+				       (use & ((1 << bit) - 1)) ? "," : "",
+				       fetch_src_names[bit]);
 	}
-	return trash.str;
+	return trash.area;
 }
 
 /* return a pointer to the correct sample checkpoint name, or "unknown" when
@@ -386,12 +398,12 @@ struct sample_fetch *find_sample_fetch(const char *kw, int len)
 	return NULL;
 }
 
-/* This fucntion browse the list of available saple fetch. <current> is
+/* This function browses the list of available sample fetches. <current> is
  * the last used sample fetch. If it is the first call, it must set to NULL.
- * <idx> is the index of the next sampleèfetch entry. It is used as private
- * value. It is useles to initiate it.
+ * <idx> is the index of the next sample fetch entry. It is used as private
+ * value. It is useless to initiate it.
  *
- * It returns always the newt fetch_sample entry, and NULL when the end of
+ * It returns always the new fetch_sample entry, and NULL when the end of
  * the list is reached.
  */
 struct sample_fetch *sample_fetch_getnext(struct sample_fetch *current, int *idx)
@@ -493,8 +505,6 @@ struct sample_conv *find_sample_conv(const char *kw, int len)
 
 /******************************************************************/
 /*          Sample casts functions                                */
-/*   Note: these functions do *NOT* set the output type on the    */
-/*   sample, the caller is responsible for doing this on return.  */
 /******************************************************************/
 
 static int c_ip2int(struct sample *smp)
@@ -506,12 +516,12 @@ static int c_ip2int(struct sample *smp)
 
 static int c_ip2str(struct sample *smp)
 {
-	struct chunk *trash = get_trash_chunk();
+	struct buffer *trash = get_trash_chunk();
 
-	if (!inet_ntop(AF_INET, (void *)&smp->data.u.ipv4, trash->str, trash->size))
+	if (!inet_ntop(AF_INET, (void *)&smp->data.u.ipv4, trash->area, trash->size))
 		return 0;
 
-	trash->len = strlen(trash->str);
+	trash->data = strlen(trash->area);
 	smp->data.u.str = *trash;
 	smp->data.type = SMP_T_STR;
 	smp->flags &= ~SMP_F_CONST;
@@ -530,18 +540,18 @@ static int c_ipv62ip(struct sample *smp)
 {
 	if (!v6tov4(&smp->data.u.ipv4, &smp->data.u.ipv6))
 		return 0;
-	smp->data.type = SMP_T_IPV6;
+	smp->data.type = SMP_T_IPV4;
 	return 1;
 }
 
 static int c_ipv62str(struct sample *smp)
 {
-	struct chunk *trash = get_trash_chunk();
+	struct buffer *trash = get_trash_chunk();
 
-	if (!inet_ntop(AF_INET6, (void *)&smp->data.u.ipv6, trash->str, trash->size))
+	if (!inet_ntop(AF_INET6, (void *)&smp->data.u.ipv6, trash->area, trash->size))
 		return 0;
 
-	trash->len = strlen(trash->str);
+	trash->data = strlen(trash->area);
 	smp->data.u.str = *trash;
 	smp->data.type = SMP_T_STR;
 	smp->flags &= ~SMP_F_CONST;
@@ -572,8 +582,8 @@ static int c_int2ipv6(struct sample *smp)
 
 static int c_str2addr(struct sample *smp)
 {
-	if (!buf2ip(smp->data.u.str.str, smp->data.u.str.len, &smp->data.u.ipv4)) {
-		if (!buf2ip6(smp->data.u.str.str, smp->data.u.str.len, &smp->data.u.ipv6))
+	if (!buf2ip(smp->data.u.str.area, smp->data.u.str.data, &smp->data.u.ipv4)) {
+		if (!buf2ip6(smp->data.u.str.area, smp->data.u.str.data, &smp->data.u.ipv6))
 			return 0;
 		smp->data.type = SMP_T_IPV6;
 		smp->flags &= ~SMP_F_CONST;
@@ -586,7 +596,7 @@ static int c_str2addr(struct sample *smp)
 
 static int c_str2ip(struct sample *smp)
 {
-	if (!buf2ip(smp->data.u.str.str, smp->data.u.str.len, &smp->data.u.ipv4))
+	if (!buf2ip(smp->data.u.str.area, smp->data.u.str.data, &smp->data.u.ipv4))
 		return 0;
 	smp->data.type = SMP_T_IPV4;
 	smp->flags &= ~SMP_F_CONST;
@@ -595,7 +605,7 @@ static int c_str2ip(struct sample *smp)
 
 static int c_str2ipv6(struct sample *smp)
 {
-	if (!buf2ip6(smp->data.u.str.str, smp->data.u.str.len, &smp->data.u.ipv6))
+	if (!buf2ip6(smp->data.u.str.area, smp->data.u.str.data, &smp->data.u.ipv6))
 		return 0;
 	smp->data.type = SMP_T_IPV6;
 	smp->flags &= ~SMP_F_CONST;
@@ -610,34 +620,35 @@ static int c_bin2str(struct sample *smp)
 {
 	int i;
 
-	for (i = 0; i < smp->data.u.str.len; i++) {
-		if (!smp->data.u.str.str[i]) {
-			smp->data.u.str.len = i;
+	for (i = 0; i < smp->data.u.str.data; i++) {
+		if (!smp->data.u.str.area[i]) {
+			smp->data.u.str.data = i;
 			break;
 		}
 	}
+	smp->data.type = SMP_T_STR;
 	return 1;
 }
 
 static int c_int2str(struct sample *smp)
 {
-	struct chunk *trash = get_trash_chunk();
+	struct buffer *trash = get_trash_chunk();
 	char *pos;
 
-	pos = lltoa_r(smp->data.u.sint, trash->str, trash->size);
+	pos = lltoa_r(smp->data.u.sint, trash->area, trash->size);
 	if (!pos)
 		return 0;
 
-	trash->size = trash->size - (pos - trash->str);
-	trash->str = pos;
-	trash->len = strlen(pos);
+	trash->size = trash->size - (pos - trash->area);
+	trash->area = pos;
+	trash->data = strlen(pos);
 	smp->data.u.str = *trash;
 	smp->data.type = SMP_T_STR;
 	smp->flags &= ~SMP_F_CONST;
 	return 1;
 }
 
-/* This function inconditionally duplicates data and removes the "const" flag.
+/* This function unconditionally duplicates data and removes the "const" flag.
  * For strings and binary blocks, it also provides a known allocated size with
  * a length that is capped to the size, and ensures a trailing zero is always
  * appended for strings. This is necessary for some operations which may
@@ -645,11 +656,7 @@ static int c_int2str(struct sample *smp)
  */
 int smp_dup(struct sample *smp)
 {
-	struct chunk *trash;
-
-	/* If the const flag is not set, we don't need to duplicate the
-	 * pattern as it can be modified in place.
-	 */
+	struct buffer *trash;
 
 	switch (smp->data.type) {
 	case SMP_T_BOOL:
@@ -660,26 +667,35 @@ int smp_dup(struct sample *smp)
 		/* These type are not const. */
 		break;
 
+	case SMP_T_METH:
+		if (smp->data.u.meth.meth != HTTP_METH_OTHER)
+			break;
+		/* Fall through */
+
 	case SMP_T_STR:
 		trash = get_trash_chunk();
-		trash->len = smp->data.u.str.len;
-		if (trash->len > trash->size - 1)
-			trash->len = trash->size - 1;
+		trash->data = smp->data.type == SMP_T_STR ?
+		    smp->data.u.str.data : smp->data.u.meth.str.data;
+		if (trash->data > trash->size - 1)
+			trash->data = trash->size - 1;
 
-		memcpy(trash->str, smp->data.u.str.str, trash->len);
-		trash->str[trash->len] = 0;
+		memcpy(trash->area, smp->data.type == SMP_T_STR ?
+		    smp->data.u.str.area : smp->data.u.meth.str.area,
+		    trash->data);
+		trash->area[trash->data] = 0;
 		smp->data.u.str = *trash;
 		break;
 
 	case SMP_T_BIN:
 		trash = get_trash_chunk();
-		trash->len = smp->data.u.str.len;
-		if (trash->len > trash->size)
-			trash->len = trash->size;
+		trash->data = smp->data.u.str.data;
+		if (trash->data > trash->size)
+			trash->data = trash->size;
 
-		memcpy(trash->str, smp->data.u.str.str, trash->len);
+		memcpy(trash->area, smp->data.u.str.area, trash->data);
 		smp->data.u.str = *trash;
 		break;
+
 	default:
 		/* Other cases are unexpected. */
 		return 0;
@@ -700,11 +716,11 @@ static int c_str2int(struct sample *smp)
 	const char *str;
 	const char *end;
 
-	if (smp->data.u.str.len == 0)
+	if (smp->data.u.str.data == 0)
 		return 0;
 
-	str = smp->data.u.str.str;
-	end = smp->data.u.str.str + smp->data.u.str.len;
+	str = smp->data.u.str.area;
+	end = smp->data.u.str.area + smp->data.u.str.data;
 
 	smp->data.u.sint = read_int64(&str, end);
 	smp->data.type = SMP_T_SINT;
@@ -717,11 +733,11 @@ static int c_str2meth(struct sample *smp)
 	enum http_meth_t meth;
 	int len;
 
-	meth = find_http_meth(smp->data.u.str.str, smp->data.u.str.len);
+	meth = find_http_meth(smp->data.u.str.area, smp->data.u.str.data);
 	if (meth == HTTP_METH_OTHER) {
-		len = smp->data.u.str.len;
-		smp->data.u.meth.str.str = smp->data.u.str.str;
-		smp->data.u.meth.str.len = len;
+		len = smp->data.u.str.data;
+		smp->data.u.meth.str.area = smp->data.u.str.area;
+		smp->data.u.meth.str.data = len;
 	}
 	else
 		smp->flags &= ~SMP_F_CONST;
@@ -737,16 +753,16 @@ static int c_meth2str(struct sample *smp)
 
 	if (smp->data.u.meth.meth == HTTP_METH_OTHER) {
 		/* The method is unknown. Copy the original pointer. */
-		len = smp->data.u.meth.str.len;
-		smp->data.u.str.str = smp->data.u.meth.str.str;
-		smp->data.u.str.len = len;
+		len = smp->data.u.meth.str.data;
+		smp->data.u.str.area = smp->data.u.meth.str.area;
+		smp->data.u.str.data = len;
 		smp->data.type = SMP_T_STR;
 	}
 	else if (smp->data.u.meth.meth < HTTP_METH_OTHER) {
 		/* The method is known, copy the pointer containing the string. */
 		meth = smp->data.u.meth.meth;
-		smp->data.u.str.str = http_known_methods[meth].name;
-		smp->data.u.str.len = http_known_methods[meth].len;
+		smp->data.u.str.area = http_known_methods[meth].ptr;
+		smp->data.u.str.data = http_known_methods[meth].len;
 		smp->flags |= SMP_F_CONST;
 		smp->data.type = SMP_T_STR;
 	}
@@ -759,15 +775,15 @@ static int c_meth2str(struct sample *smp)
 
 static int c_addr2bin(struct sample *smp)
 {
-	struct chunk *chk = get_trash_chunk();
+	struct buffer *chk = get_trash_chunk();
 
 	if (smp->data.type == SMP_T_IPV4) {
-		chk->len = 4;
-		memcpy(chk->str, &smp->data.u.ipv4, chk->len);
+		chk->data = 4;
+		memcpy(chk->area, &smp->data.u.ipv4, chk->data);
 	}
 	else if (smp->data.type == SMP_T_IPV6) {
-		chk->len = 16;
-		memcpy(chk->str, &smp->data.u.ipv6, chk->len);
+		chk->data = 16;
+		memcpy(chk->area, &smp->data.u.ipv6, chk->data);
 	}
 	else
 		return 0;
@@ -779,10 +795,10 @@ static int c_addr2bin(struct sample *smp)
 
 static int c_int2bin(struct sample *smp)
 {
-	struct chunk *chk = get_trash_chunk();
+	struct buffer *chk = get_trash_chunk();
 
-	*(unsigned long long int *)chk->str = my_htonll(smp->data.u.sint);
-	chk->len = 8;
+	*(unsigned long long int *) chk->area = my_htonll(smp->data.u.sint);
+	chk->data = 8;
 
 	smp->data.u.str = *chk;
 	smp->data.type = SMP_T_BIN;
@@ -814,8 +830,11 @@ sample_cast_fct sample_casts[SMP_TYPES][SMP_TYPES] = {
  *        fetch keyword followed by format conversion keywords.
  * Returns a pointer on allocated sample expression structure.
  * The caller must have set al->ctx.
+ * If <endptr> is non-nul, it will be set to the first unparsed character
+ * (which may be the final '\0') on success. If it is nul, the expression
+ * must be properly terminated by a '\0' otherwise an error is reported.
  */
-struct sample_expr *sample_parse_expr(char **str, int *idx, const char *file, int line, char **err_msg, struct arg_list *al)
+struct sample_expr *sample_parse_expr(char **str, int *idx, const char *file, int line, char **err_msg, struct arg_list *al, char **endptr)
 {
 	const char *begw; /* beginning of word */
 	const char *endw; /* end of word */
@@ -829,7 +848,8 @@ struct sample_expr *sample_parse_expr(char **str, int *idx, const char *file, in
 	int err_arg;
 
 	begw = str[*idx];
-	for (endw = begw; *endw && *endw != '(' && *endw != ','; endw++);
+	for (endw = begw; is_idchar(*endw); endw++)
+		;
 
 	if (endw == begw) {
 		memprintf(err_msg, "missing fetch method");
@@ -845,24 +865,9 @@ struct sample_expr *sample_parse_expr(char **str, int *idx, const char *file, in
 		goto out_error;
 	}
 
-	endt = endw;
-	if (*endt == '(') {
-		/* look for the end of this term and skip the opening parenthesis */
-		endt = ++endw;
-		while (*endt && *endt != ')')
-			endt++;
-		if (*endt != ')') {
-			memprintf(err_msg, "missing closing ')' after arguments to fetch keyword '%s'", fkw);
-			goto out_error;
-		}
-	}
-
 	/* At this point, we have :
 	 *   - begw : beginning of the keyword
 	 *   - endw : end of the keyword, first character not part of keyword
-	 *            nor the opening parenthesis (so first character of args
-	 *            if present).
-	 *   - endt : end of the term (=endw or last parenthesis if args are present)
 	 */
 
 	if (fetch->out_type >= SMP_TYPES) {
@@ -885,10 +890,15 @@ struct sample_expr *sample_parse_expr(char **str, int *idx, const char *file, in
 	 */
 	al->kw = expr->fetch->kw;
 	al->conv = NULL;
-	if (make_arg_list(endw, endt - endw, fetch->arg_mask, &expr->arg_p, err_msg, NULL, &err_arg, al) < 0) {
+	if (make_arg_list(endw, -1, fetch->arg_mask, &expr->arg_p, err_msg, &endt, &err_arg, al) < 0) {
 		memprintf(err_msg, "fetch method '%s' : %s", fkw, *err_msg);
 		goto out_error;
 	}
+
+	/* now endt is our first char not part of the arg list, typically the
+	 * comma after the sample fetch name or after the closing parenthesis,
+	 * or the NUL char.
+	 */
 
 	if (!expr->arg_p) {
 		expr->arg_p = empty_arg_list;
@@ -912,11 +922,14 @@ struct sample_expr *sample_parse_expr(char **str, int *idx, const char *file, in
 
 	while (1) {
 		struct sample_conv_expr *conv_expr;
-
-		if (*endt == ')') /* skip last closing parenthesis */
-			endt++;
+		int err_arg;
+		int argcnt;
 
 		if (*endt && *endt != ',') {
+			if (endptr) {
+				/* end found, let's stop here */
+				break;
+			}
 			if (ckw)
 				memprintf(err_msg, "missing comma after converter '%s'", ckw);
 			else
@@ -924,6 +937,9 @@ struct sample_expr *sample_parse_expr(char **str, int *idx, const char *file, in
 			goto out_error;
 		}
 
+		/* FIXME: how long should we support such idiocies ? Maybe we
+		 * should already warn ?
+		 */
 		while (*endt == ',') /* then trailing commas */
 			endt++;
 
@@ -937,7 +953,8 @@ struct sample_expr *sample_parse_expr(char **str, int *idx, const char *file, in
 				break;
 		}
 
-		for (endw = begw; *endw && *endw != '(' && *endw != ','; endw++);
+		for (endw = begw; is_idchar(*endw); endw++)
+			;
 
 		free(ckw);
 		ckw = my_strndup(begw, endw - begw);
@@ -945,21 +962,12 @@ struct sample_expr *sample_parse_expr(char **str, int *idx, const char *file, in
 		conv = find_sample_conv(begw, endw - begw);
 		if (!conv) {
 			/* we found an isolated keyword that we don't know, it's not ours */
-			if (begw == str[*idx])
+			if (begw == str[*idx]) {
+				endt = begw;
 				break;
+			}
 			memprintf(err_msg, "unknown converter '%s'", ckw);
 			goto out_error;
-		}
-
-		endt = endw;
-		if (*endt == '(') {
-			/* look for the end of this term */
-			while (*endt && *endt != ')')
-				endt++;
-			if (*endt != ')') {
-				memprintf(err_msg, "syntax error: missing ')' after converter '%s'", ckw);
-				goto out_error;
-			}
 		}
 
 		if (conv->in_type >= SMP_TYPES || conv->out_type >= SMP_TYPES) {
@@ -981,33 +989,31 @@ struct sample_expr *sample_parse_expr(char **str, int *idx, const char *file, in
 		LIST_ADDQ(&(expr->conv_exprs), &(conv_expr->list));
 		conv_expr->conv = conv;
 
-		if (endt != endw) {
-			int err_arg;
-
-			if (!conv->arg_mask) {
-				memprintf(err_msg, "converter '%s' does not support any args", ckw);
-				goto out_error;
-			}
-
-			al->kw = expr->fetch->kw;
-			al->conv = conv_expr->conv->kw;
-			if (make_arg_list(endw + 1, endt - endw - 1, conv->arg_mask, &conv_expr->arg_p, err_msg, NULL, &err_arg, al) < 0) {
-				memprintf(err_msg, "invalid arg %d in converter '%s' : %s", err_arg+1, ckw, *err_msg);
-				goto out_error;
-			}
-
-			if (!conv_expr->arg_p)
-				conv_expr->arg_p = empty_arg_list;
-
-			if (conv->val_args && !conv->val_args(conv_expr->arg_p, conv, file, line, err_msg)) {
-				memprintf(err_msg, "invalid args in converter '%s' : %s", ckw, *err_msg);
-				goto out_error;
-			}
-		}
-		else if (ARGM(conv->arg_mask)) {
-			memprintf(err_msg, "missing args for converter '%s'", ckw);
+		al->kw = expr->fetch->kw;
+		al->conv = conv_expr->conv->kw;
+		argcnt = make_arg_list(endw, -1, conv->arg_mask, &conv_expr->arg_p, err_msg, &endt, &err_arg, al);
+		if (argcnt < 0) {
+			memprintf(err_msg, "invalid arg %d in converter '%s' : %s", err_arg+1, ckw, *err_msg);
 			goto out_error;
 		}
+
+		if (argcnt && !conv->arg_mask) {
+			memprintf(err_msg, "converter '%s' does not support any args", ckw);
+			goto out_error;
+		}
+
+		if (!conv_expr->arg_p)
+			conv_expr->arg_p = empty_arg_list;
+
+		if (conv->val_args && !conv->val_args(conv_expr->arg_p, conv, file, line, err_msg)) {
+			memprintf(err_msg, "invalid args in converter '%s' : %s", ckw, *err_msg);
+			goto out_error;
+		}
+	}
+
+	if (endptr) {
+		/* end found, let's stop here */
+		*endptr = (char *)endt;
 	}
 
  out:
@@ -1031,7 +1037,7 @@ out_error:
  *
  * Note: the fetch functions are required to properly set the return type. The
  * conversion functions must do so too. However the cast functions do not need
- * to since they're made to cast mutiple types according to what is required.
+ * to since they're made to cast multiple types according to what is required.
  *
  * The caller may indicate in <opt> if it considers the result final or not.
  * The caller needs to check the SMP_F_MAY_CHANGE flag in p->flags to verify
@@ -1100,7 +1106,8 @@ int smp_resolve_args(struct proxy *p)
 	list_for_each_entry_safe(cur, bak, &p->conf.args.list, list) {
 		struct proxy *px;
 		struct server *srv;
-		char *pname, *sname;
+		struct stktable *t;
+		char *pname, *sname, *stktname;
 		char *err;
 
 		arg = cur->arg;
@@ -1128,6 +1135,8 @@ int smp_resolve_args(struct proxy *p)
 		case ARGC_ACL:   ctx = "ACL keyword"; break;
 		case ARGC_SRV:   where = "in server directive in"; break;
 		case ARGC_SPOE:  where = "in spoe-message directive in"; break;
+		case ARGC_HERR:  where = "in http-error directive in"; break;
+		case ARGC_OT:    where = "in ot-scope directive in"; break;
 		}
 
 		/* set a few default settings */
@@ -1136,175 +1145,175 @@ int smp_resolve_args(struct proxy *p)
 
 		switch (arg->type) {
 		case ARGT_SRV:
-			if (!arg->data.str.len) {
-				Alert("parsing [%s:%d] : missing server name in arg %d of %s%s%s%s '%s' %s proxy '%s'.\n",
-				      cur->file, cur->line,
-				      cur->arg_pos + 1, conv_pre, conv_ctx, conv_pos, ctx, cur->kw, where, p->id);
+			if (!arg->data.str.data) {
+				ha_alert("parsing [%s:%d] : missing server name in arg %d of %s%s%s%s '%s' %s proxy '%s'.\n",
+					 cur->file, cur->line,
+					 cur->arg_pos + 1, conv_pre, conv_ctx, conv_pos, ctx, cur->kw, where, p->id);
 				cfgerr++;
 				continue;
 			}
 
 			/* we support two formats : "bck/srv" and "srv" */
-			sname = strrchr(arg->data.str.str, '/');
+			sname = strrchr(arg->data.str.area, '/');
 
 			if (sname) {
 				*sname++ = '\0';
-				pname = arg->data.str.str;
+				pname = arg->data.str.area;
 
 				px = proxy_be_by_name(pname);
 				if (!px) {
-					Alert("parsing [%s:%d] : unable to find proxy '%s' referenced in arg %d of %s%s%s%s '%s' %s proxy '%s'.\n",
-					      cur->file, cur->line, pname,
-					      cur->arg_pos + 1, conv_pre, conv_ctx, conv_pos, ctx, cur->kw, where, p->id);
+					ha_alert("parsing [%s:%d] : unable to find proxy '%s' referenced in arg %d of %s%s%s%s '%s' %s proxy '%s'.\n",
+						 cur->file, cur->line, pname,
+						 cur->arg_pos + 1, conv_pre, conv_ctx, conv_pos, ctx, cur->kw, where, p->id);
 					cfgerr++;
 					break;
 				}
 			}
 			else
-				sname = arg->data.str.str;
+				sname = arg->data.str.area;
 
 			srv = findserver(px, sname);
 			if (!srv) {
-				Alert("parsing [%s:%d] : unable to find server '%s' in proxy '%s', referenced in arg %d of %s%s%s%s '%s' %s proxy '%s'.\n",
-				      cur->file, cur->line, sname, pname,
-				      cur->arg_pos + 1, conv_pre, conv_ctx, conv_pos, ctx, cur->kw, where, p->id);
+				ha_alert("parsing [%s:%d] : unable to find server '%s' in proxy '%s', referenced in arg %d of %s%s%s%s '%s' %s proxy '%s'.\n",
+					 cur->file, cur->line, sname, pname,
+					 cur->arg_pos + 1, conv_pre, conv_ctx, conv_pos, ctx, cur->kw, where, p->id);
 				cfgerr++;
 				break;
 			}
 
-			free(arg->data.str.str);
-			arg->data.str.str = NULL;
+			chunk_destroy(&arg->data.str);
 			arg->unresolved = 0;
 			arg->data.srv = srv;
 			break;
 
 		case ARGT_FE:
-			if (arg->data.str.len) {
-				pname = arg->data.str.str;
+			if (arg->data.str.data) {
+				pname = arg->data.str.area;
 				px = proxy_fe_by_name(pname);
 			}
 
 			if (!px) {
-				Alert("parsing [%s:%d] : unable to find frontend '%s' referenced in arg %d of %s%s%s%s '%s' %s proxy '%s'.\n",
-				      cur->file, cur->line, pname,
-				      cur->arg_pos + 1, conv_pre, conv_ctx, conv_pos, ctx, cur->kw, where, p->id);
+				ha_alert("parsing [%s:%d] : unable to find frontend '%s' referenced in arg %d of %s%s%s%s '%s' %s proxy '%s'.\n",
+					 cur->file, cur->line, pname,
+					 cur->arg_pos + 1, conv_pre, conv_ctx, conv_pos, ctx, cur->kw, where, p->id);
 				cfgerr++;
 				break;
 			}
 
 			if (!(px->cap & PR_CAP_FE)) {
-				Alert("parsing [%s:%d] : proxy '%s', referenced in arg %d of %s%s%s%s '%s' %s proxy '%s', has not frontend capability.\n",
-				      cur->file, cur->line, pname,
-				      cur->arg_pos + 1, conv_pre, conv_ctx, conv_pos, ctx, cur->kw, where, p->id);
+				ha_alert("parsing [%s:%d] : proxy '%s', referenced in arg %d of %s%s%s%s '%s' %s proxy '%s', has not frontend capability.\n",
+					 cur->file, cur->line, pname,
+					 cur->arg_pos + 1, conv_pre, conv_ctx, conv_pos, ctx, cur->kw, where, p->id);
 				cfgerr++;
 				break;
 			}
 
-			free(arg->data.str.str);
-			arg->data.str.str = NULL;
+			chunk_destroy(&arg->data.str);
 			arg->unresolved = 0;
 			arg->data.prx = px;
 			break;
 
 		case ARGT_BE:
-			if (arg->data.str.len) {
-				pname = arg->data.str.str;
+			if (arg->data.str.data) {
+				pname = arg->data.str.area;
 				px = proxy_be_by_name(pname);
 			}
 
 			if (!px) {
-				Alert("parsing [%s:%d] : unable to find backend '%s' referenced in arg %d of %s%s%s%s '%s' %s proxy '%s'.\n",
-				      cur->file, cur->line, pname,
-				      cur->arg_pos + 1, conv_pre, conv_ctx, conv_pos, ctx, cur->kw, where, p->id);
+				ha_alert("parsing [%s:%d] : unable to find backend '%s' referenced in arg %d of %s%s%s%s '%s' %s proxy '%s'.\n",
+					 cur->file, cur->line, pname,
+					 cur->arg_pos + 1, conv_pre, conv_ctx, conv_pos, ctx, cur->kw, where, p->id);
 				cfgerr++;
 				break;
 			}
 
 			if (!(px->cap & PR_CAP_BE)) {
-				Alert("parsing [%s:%d] : proxy '%s', referenced in arg %d of %s%s%s%s '%s' %s proxy '%s', has not backend capability.\n",
-				      cur->file, cur->line, pname,
-				      cur->arg_pos + 1, conv_pre, conv_ctx, conv_pos, ctx, cur->kw, where, p->id);
+				ha_alert("parsing [%s:%d] : proxy '%s', referenced in arg %d of %s%s%s%s '%s' %s proxy '%s', has not backend capability.\n",
+					 cur->file, cur->line, pname,
+					 cur->arg_pos + 1, conv_pre, conv_ctx, conv_pos, ctx, cur->kw, where, p->id);
 				cfgerr++;
 				break;
 			}
 
-			free(arg->data.str.str);
-			arg->data.str.str = NULL;
+			chunk_destroy(&arg->data.str);
 			arg->unresolved = 0;
 			arg->data.prx = px;
 			break;
 
 		case ARGT_TAB:
-			if (arg->data.str.len) {
-				pname = arg->data.str.str;
-				px = proxy_tbl_by_name(pname);
-			}
+			if (arg->data.str.data)
+				stktname = arg->data.str.area;
+			else
+				stktname = px->id;
 
-			if (!px) {
-				Alert("parsing [%s:%d] : unable to find table '%s' referenced in arg %d of %s%s%s%s '%s' %s proxy '%s'.\n",
-				      cur->file, cur->line, pname,
-				      cur->arg_pos + 1, conv_pre, conv_ctx, conv_pos, ctx, cur->kw, where, p->id);
+			t = stktable_find_by_name(stktname);
+			if (!t) {
+				ha_alert("parsing [%s:%d] : unable to find table '%s' referenced in arg %d of %s%s%s%s '%s' %s proxy '%s'.\n",
+					 cur->file, cur->line, stktname,
+					 cur->arg_pos + 1, conv_pre, conv_ctx, conv_pos, ctx, cur->kw, where, p->id);
 				cfgerr++;
 				break;
 			}
 
-			if (!px->table.size) {
-				Alert("parsing [%s:%d] : no table in proxy '%s' referenced in arg %d of %s%s%s%s '%s' %s proxy '%s'.\n",
-				      cur->file, cur->line, pname,
-				      cur->arg_pos + 1, conv_pre, conv_ctx, conv_pos, ctx, cur->kw, where, p->id);
+			if (!t->size) {
+				ha_alert("parsing [%s:%d] : no table in proxy '%s' referenced in arg %d of %s%s%s%s '%s' %s proxy '%s'.\n",
+					 cur->file, cur->line, stktname,
+					 cur->arg_pos + 1, conv_pre, conv_ctx, conv_pos, ctx, cur->kw, where, p->id);
 				cfgerr++;
 				break;
 			}
 
-			free(arg->data.str.str);
-			arg->data.str.str = NULL;
+			if (t->proxy && (p->bind_proc & ~t->proxy->bind_proc)) {
+				ha_alert("parsing [%s:%d] : stick-table '%s' not present on all processes covered by proxy '%s'.\n",
+					 cur->file, cur->line, t->proxy->id, p->id);
+				cfgerr++;
+				break;
+			}
+
+			if (!in_proxies_list(t->proxies_list, p)) {
+				p->next_stkt_ref = t->proxies_list;
+				t->proxies_list = p;
+			}
+
+			chunk_destroy(&arg->data.str);
 			arg->unresolved = 0;
-			arg->data.prx = px;
+			arg->data.t = t;
 			break;
 
 		case ARGT_USR:
-			if (!arg->data.str.len) {
-				Alert("parsing [%s:%d] : missing userlist name in arg %d of %s%s%s%s '%s' %s proxy '%s'.\n",
-				      cur->file, cur->line,
-				      cur->arg_pos + 1, conv_pre, conv_ctx, conv_pos, ctx, cur->kw, where, p->id);
+			if (!arg->data.str.data) {
+				ha_alert("parsing [%s:%d] : missing userlist name in arg %d of %s%s%s%s '%s' %s proxy '%s'.\n",
+					 cur->file, cur->line,
+					 cur->arg_pos + 1, conv_pre, conv_ctx, conv_pos, ctx, cur->kw, where, p->id);
 				cfgerr++;
 				break;
 			}
 
 			if (p->uri_auth && p->uri_auth->userlist &&
-			    !strcmp(p->uri_auth->userlist->name, arg->data.str.str))
+			    strcmp(p->uri_auth->userlist->name, arg->data.str.area) == 0)
 				ul = p->uri_auth->userlist;
 			else
-				ul = auth_find_userlist(arg->data.str.str);
+				ul = auth_find_userlist(arg->data.str.area);
 
 			if (!ul) {
-				Alert("parsing [%s:%d] : unable to find userlist '%s' referenced in arg %d of %s%s%s%s '%s' %s proxy '%s'.\n",
-				      cur->file, cur->line, arg->data.str.str,
-				      cur->arg_pos + 1, conv_pre, conv_ctx, conv_pos, ctx, cur->kw, where, p->id);
+				ha_alert("parsing [%s:%d] : unable to find userlist '%s' referenced in arg %d of %s%s%s%s '%s' %s proxy '%s'.\n",
+					 cur->file, cur->line,
+					 arg->data.str.area,
+					 cur->arg_pos + 1, conv_pre, conv_ctx, conv_pos, ctx, cur->kw, where, p->id);
 				cfgerr++;
 				break;
 			}
 
-			free(arg->data.str.str);
-			arg->data.str.str = NULL;
+			chunk_destroy(&arg->data.str);
 			arg->unresolved = 0;
 			arg->data.usr = ul;
 			break;
 
 		case ARGT_REG:
-			if (!arg->data.str.len) {
-				Alert("parsing [%s:%d] : missing regex in arg %d of %s%s%s%s '%s' %s proxy '%s'.\n",
-				      cur->file, cur->line,
-				      cur->arg_pos + 1, conv_pre, conv_ctx, conv_pos, ctx, cur->kw, where, p->id);
-				cfgerr++;
-				continue;
-			}
-
-			reg = calloc(1, sizeof(*reg));
-			if (!reg) {
-				Alert("parsing [%s:%d] : not enough memory to build regex in arg %d of %s%s%s%s '%s' %s proxy '%s'.\n",
-				      cur->file, cur->line,
-				      cur->arg_pos + 1, conv_pre, conv_ctx, conv_pos, ctx, cur->kw, where, p->id);
+			if (!arg->data.str.data) {
+				ha_alert("parsing [%s:%d] : missing regex in arg %d of %s%s%s%s '%s' %s proxy '%s'.\n",
+					 cur->file, cur->line,
+					 cur->arg_pos + 1, conv_pre, conv_ctx, conv_pos, ctx, cur->kw, where, p->id);
 				cfgerr++;
 				continue;
 			}
@@ -1313,17 +1322,16 @@ int smp_resolve_args(struct proxy *p)
 			rflags |= (arg->type_flags & ARGF_REG_ICASE) ? REG_ICASE : 0;
 			err = NULL;
 
-			if (!regex_comp(arg->data.str.str, reg, !(rflags & REG_ICASE), 1 /* capture substr */, &err)) {
-				Alert("parsing [%s:%d] : error in regex '%s' in arg %d of %s%s%s%s '%s' %s proxy '%s' : %s.\n",
-				      cur->file, cur->line,
-				      arg->data.str.str,
-				      cur->arg_pos + 1, conv_pre, conv_ctx, conv_pos, ctx, cur->kw, where, p->id, err);
+			if (!(reg = regex_comp(arg->data.str.area, !(rflags & REG_ICASE), 1 /* capture substr */, &err))) {
+				ha_alert("parsing [%s:%d] : error in regex '%s' in arg %d of %s%s%s%s '%s' %s proxy '%s' : %s.\n",
+					 cur->file, cur->line,
+					 arg->data.str.area,
+					 cur->arg_pos + 1, conv_pre, conv_ctx, conv_pos, ctx, cur->kw, where, p->id, err);
 				cfgerr++;
 				continue;
 			}
 
-			free(arg->data.str.str);
-			arg->data.str.str = NULL;
+			chunk_destroy(&arg->data.str);
 			arg->unresolved = 0;
 			arg->data.reg = reg;
 			break;
@@ -1392,16 +1400,12 @@ static void release_sample_arg(struct arg *p)
 
 	while (p->type != ARGT_STOP) {
 		if (p->type == ARGT_STR || p->unresolved) {
-			free(p->data.str.str);
-			p->data.str.str = NULL;
+			chunk_destroy(&p->data.str);
 			p->unresolved = 0;
 		}
 		else if (p->type == ARGT_REG) {
-			if (p->data.reg) {
-				regex_free(p->data.reg);
-				free(p->data.reg);
-				p->data.reg = NULL;
-			}
+			regex_free(p->data.reg);
+			p->data.reg = NULL;
 		}
 		p++;
 	}
@@ -1417,8 +1421,12 @@ void release_sample_expr(struct sample_expr *expr)
 	if (!expr)
 		return;
 
-	list_for_each_entry_safe(conv_expr, conv_exprb, &expr->conv_exprs, list)
+	list_for_each_entry_safe(conv_expr, conv_exprb, &expr->conv_exprs, list) {
+		LIST_DEL(&conv_expr->list);
 		release_sample_arg(conv_expr->arg_p);
+		free(conv_expr);
+	}
+
 	release_sample_arg(expr->arg_p);
 	free(expr);
 }
@@ -1428,75 +1436,481 @@ void release_sample_expr(struct sample_expr *expr)
 /*    These functions set the data type on return.               */
 /*****************************************************************/
 
-#ifdef DEBUG_EXPR
 static int sample_conv_debug(const struct arg *arg_p, struct sample *smp, void *private)
 {
 	int i;
 	struct sample tmp;
+	struct buffer *buf;
+	struct sink *sink;
+	struct ist line;
+	char *pfx;
 
-	if (!(global.mode & MODE_QUIET) || (global.mode & (MODE_VERBOSE | MODE_STARTING))) {
-		fprintf(stderr, "[debug converter] type: %s ", smp_to_type[smp->data.type]);
-		if (!sample_casts[smp->data.type][SMP_T_STR]) {
-			fprintf(stderr, "(undisplayable)");
-		} else {
+	buf = alloc_trash_chunk();
+	if (!buf)
+		goto end;
 
-			/* Copy sample fetch. This put the sample as const, the
-			 * cast will copy data if a transformation is required.
-			 */
-			memcpy(&tmp, smp, sizeof(struct sample));
-			tmp.flags = SMP_F_CONST;
+	sink = (struct sink *)arg_p[1].data.ptr;
+	BUG_ON(!sink);
 
-			if (!sample_casts[smp->data.type][SMP_T_STR](&tmp))
-				fprintf(stderr, "(undisplayable)");
+	pfx = arg_p[0].data.str.area;
+	BUG_ON(!pfx);
 
-			else {
-				/* Display the displayable chars*. */
-				fprintf(stderr, "<");
-				for (i = 0; i < tmp.data.u.str.len; i++) {
-					if (isprint(tmp.data.u.str.str[i]))
-						fputc(tmp.data.u.str.str[i], stderr);
-					else
-						fputc('.', stderr);
-				}
-			}
-			fprintf(stderr, ">\n");
-		}
+	chunk_printf(buf, "[debug] %s: type=%s ", pfx, smp_to_type[smp->data.type]);
+	if (!sample_casts[smp->data.type][SMP_T_STR])
+		goto nocast;
+
+	/* Copy sample fetch. This puts the sample as const, the
+	 * cast will copy data if a transformation is required.
+	 */
+	memcpy(&tmp, smp, sizeof(struct sample));
+	tmp.flags = SMP_F_CONST;
+
+	if (!sample_casts[smp->data.type][SMP_T_STR](&tmp))
+		goto nocast;
+
+	/* Display the displayable chars*. */
+	b_putchr(buf, '<');
+	for (i = 0; i < tmp.data.u.str.data; i++) {
+		if (isprint((unsigned char)tmp.data.u.str.area[i]))
+			b_putchr(buf, tmp.data.u.str.area[i]);
+		else
+			b_putchr(buf, '.');
 	}
+	b_putchr(buf, '>');
+
+ done:
+	line = ist2(buf->area, buf->data);
+	sink_write(sink, &line, 1, 0, 0, NULL);
+ end:
+	free_trash_chunk(buf);
+	return 1;
+ nocast:
+	chunk_appendf(buf, "(undisplayable)");
+	goto done;
+}
+
+// This function checks the "debug" converter's arguments.
+static int smp_check_debug(struct arg *args, struct sample_conv *conv,
+                           const char *file, int line, char **err)
+{
+	const char *name = "buf0";
+	struct sink *sink = NULL;
+
+	if (args[0].type != ARGT_STR) {
+		/* optional prefix */
+		args[0].data.str.area = "";
+		args[0].data.str.data = 0;
+	}
+
+	if (args[1].type == ARGT_STR)
+		name = args[1].data.str.area;
+
+	sink = sink_find(name);
+	if (!sink) {
+		memprintf(err, "No such sink '%s'", name);
+		return 0;
+	}
+
+	chunk_destroy(&args[1].data.str);
+	args[1].type = ARGT_PTR;
+	args[1].data.ptr = sink;
 	return 1;
 }
-#endif
+
+static int sample_conv_base642bin(const struct arg *arg_p, struct sample *smp, void *private)
+{
+	struct buffer *trash = get_trash_chunk();
+	int bin_len;
+
+	trash->data = 0;
+	bin_len = base64dec(smp->data.u.str.area, smp->data.u.str.data,
+			    trash->area, trash->size);
+	if (bin_len < 0)
+		return 0;
+
+	trash->data = bin_len;
+	smp->data.u.str = *trash;
+	smp->data.type = SMP_T_BIN;
+	smp->flags &= ~SMP_F_CONST;
+	return 1;
+}
 
 static int sample_conv_bin2base64(const struct arg *arg_p, struct sample *smp, void *private)
 {
-	struct chunk *trash = get_trash_chunk();
+	struct buffer *trash = get_trash_chunk();
 	int b64_len;
 
-	trash->len = 0;
-	b64_len = a2base64(smp->data.u.str.str, smp->data.u.str.len, trash->str, trash->size);
+	trash->data = 0;
+	b64_len = a2base64(smp->data.u.str.area, smp->data.u.str.data,
+			   trash->area, trash->size);
 	if (b64_len < 0)
 		return 0;
 
-	trash->len = b64_len;
+	trash->data = b64_len;
 	smp->data.u.str = *trash;
 	smp->data.type = SMP_T_STR;
 	smp->flags &= ~SMP_F_CONST;
 	return 1;
 }
 
+static int sample_conv_sha1(const struct arg *arg_p, struct sample *smp, void *private)
+{
+	blk_SHA_CTX ctx;
+	struct buffer *trash = get_trash_chunk();
+
+	memset(&ctx, 0, sizeof(ctx));
+
+	blk_SHA1_Init(&ctx);
+	blk_SHA1_Update(&ctx, smp->data.u.str.area, smp->data.u.str.data);
+	blk_SHA1_Final((unsigned char *) trash->area, &ctx);
+
+	trash->data = 20;
+	smp->data.u.str = *trash;
+	smp->data.type = SMP_T_BIN;
+	smp->flags &= ~SMP_F_CONST;
+	return 1;
+}
+
+#ifdef USE_OPENSSL
+static int smp_check_sha2(struct arg *args, struct sample_conv *conv,
+                          const char *file, int line, char **err)
+{
+	if (args[0].type == ARGT_STOP)
+		return 1;
+	if (args[0].type != ARGT_SINT) {
+		memprintf(err, "Invalid type '%s'", arg_type_names[args[0].type]);
+		return 0;
+	}
+
+	switch (args[0].data.sint) {
+		case 224:
+		case 256:
+		case 384:
+		case 512:
+			/* this is okay */
+			return 1;
+		default:
+			memprintf(err, "Unsupported number of bits: '%lld'", args[0].data.sint);
+			return 0;
+	}
+}
+
+static int sample_conv_sha2(const struct arg *arg_p, struct sample *smp, void *private)
+{
+	struct buffer *trash = get_trash_chunk();
+	int bits = 256;
+	if (arg_p && arg_p->data.sint)
+		bits = arg_p->data.sint;
+
+	switch (bits) {
+	case 224: {
+		SHA256_CTX ctx;
+
+		memset(&ctx, 0, sizeof(ctx));
+
+		SHA224_Init(&ctx);
+		SHA224_Update(&ctx, smp->data.u.str.area, smp->data.u.str.data);
+		SHA224_Final((unsigned char *) trash->area, &ctx);
+		trash->data = SHA224_DIGEST_LENGTH;
+		break;
+	}
+	case 256: {
+		SHA256_CTX ctx;
+
+		memset(&ctx, 0, sizeof(ctx));
+
+		SHA256_Init(&ctx);
+		SHA256_Update(&ctx, smp->data.u.str.area, smp->data.u.str.data);
+		SHA256_Final((unsigned char *) trash->area, &ctx);
+		trash->data = SHA256_DIGEST_LENGTH;
+		break;
+	}
+	case 384: {
+		SHA512_CTX ctx;
+
+		memset(&ctx, 0, sizeof(ctx));
+
+		SHA384_Init(&ctx);
+		SHA384_Update(&ctx, smp->data.u.str.area, smp->data.u.str.data);
+		SHA384_Final((unsigned char *) trash->area, &ctx);
+		trash->data = SHA384_DIGEST_LENGTH;
+		break;
+	}
+	case 512: {
+		SHA512_CTX ctx;
+
+		memset(&ctx, 0, sizeof(ctx));
+
+		SHA512_Init(&ctx);
+		SHA512_Update(&ctx, smp->data.u.str.area, smp->data.u.str.data);
+		SHA512_Final((unsigned char *) trash->area, &ctx);
+		trash->data = SHA512_DIGEST_LENGTH;
+		break;
+	}
+	default:
+		return 0;
+	}
+
+	smp->data.u.str = *trash;
+	smp->data.type = SMP_T_BIN;
+	smp->flags &= ~SMP_F_CONST;
+	return 1;
+}
+
+static inline int sample_conv_var2smp_str(const struct arg *arg, struct sample *smp)
+{
+	switch (arg->type) {
+	case ARGT_STR:
+		smp->data.type = SMP_T_STR;
+		smp->data.u.str = arg->data.str;
+		return 1;
+	case ARGT_VAR:
+		if (!vars_get_by_desc(&arg->data.var, smp))
+				return 0;
+		if (!sample_casts[smp->data.type][SMP_T_STR])
+				return 0;
+		if (!sample_casts[smp->data.type][SMP_T_STR](smp))
+				return 0;
+		return 1;
+	default:
+		return 0;
+	}
+}
+
+#if (HA_OPENSSL_VERSION_NUMBER >= 0x1000100fL)
+static int check_aes_gcm(struct arg *args, struct sample_conv *conv,
+						  const char *file, int line, char **err)
+{
+	switch(args[0].data.sint) {
+	case 128:
+	case 192:
+	case 256:
+		break;
+	default:
+		memprintf(err, "key size must be 128, 192 or 256 (bits).");
+		return 0;
+	}
+	/* Try to decode a variable. */
+	vars_check_arg(&args[1], NULL);
+	vars_check_arg(&args[2], NULL);
+	vars_check_arg(&args[3], NULL);
+	return 1;
+}
+
+/* Arguments: AES size in bits, nonce, key, tag. The last three arguments are base64 encoded */
+static int sample_conv_aes_gcm_dec(const struct arg *arg_p, struct sample *smp, void *private)
+{
+	struct sample nonce, key, aead_tag;
+	struct buffer *smp_trash, *smp_trash_alloc;
+	EVP_CIPHER_CTX *ctx;
+	int dec_size, ret;
+
+	smp_set_owner(&nonce, smp->px, smp->sess, smp->strm, smp->opt);
+	if (!sample_conv_var2smp_str(&arg_p[1], &nonce))
+		return 0;
+
+	smp_set_owner(&key, smp->px, smp->sess, smp->strm, smp->opt);
+	if (!sample_conv_var2smp_str(&arg_p[2], &key))
+		return 0;
+
+	smp_set_owner(&aead_tag, smp->px, smp->sess, smp->strm, smp->opt);
+	if (!sample_conv_var2smp_str(&arg_p[3], &aead_tag))
+		return 0;
+
+	smp_trash = get_trash_chunk();
+	smp_trash_alloc = alloc_trash_chunk();
+	if (!smp_trash_alloc)
+		return 0;
+
+	ctx = EVP_CIPHER_CTX_new();
+
+	if (!ctx)
+		goto err;
+
+	dec_size = base64dec(nonce.data.u.str.area, nonce.data.u.str.data, smp_trash->area, smp_trash->size);
+	if (dec_size < 0)
+		goto err;
+	smp_trash->data = dec_size;
+
+	/* Set cipher type and mode */
+	switch(arg_p[0].data.sint) {
+	case 128:
+		EVP_DecryptInit_ex(ctx, EVP_aes_128_gcm(), NULL, NULL, NULL);
+		break;
+	case 192:
+		EVP_DecryptInit_ex(ctx, EVP_aes_192_gcm(), NULL, NULL, NULL);
+		break;
+	case 256:
+		EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL);
+		break;
+	}
+
+	EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN, smp_trash->data, NULL);
+
+	/* Initialise IV */
+	if(!EVP_DecryptInit_ex(ctx, NULL, NULL, NULL, (unsigned char *) smp_trash->area))
+		goto err;
+
+	dec_size = base64dec(key.data.u.str.area, key.data.u.str.data, smp_trash->area, smp_trash->size);
+	if (dec_size < 0)
+		goto err;
+	smp_trash->data = dec_size;
+
+	/* Initialise key */
+	if (!EVP_DecryptInit_ex(ctx, NULL, NULL, (unsigned char *) smp_trash->area, NULL))
+		goto err;
+
+	if (!EVP_DecryptUpdate(ctx, (unsigned char *) smp_trash->area, (int *) &smp_trash->data,
+						  (unsigned char *) smp->data.u.str.area, (int) smp->data.u.str.data))
+		goto err;
+
+	dec_size = base64dec(aead_tag.data.u.str.area, aead_tag.data.u.str.data, smp_trash_alloc->area, smp_trash_alloc->size);
+	if (dec_size < 0)
+		goto err;
+	smp_trash_alloc->data = dec_size;
+	dec_size = smp_trash->data;
+
+	EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG, smp_trash_alloc->data, (void *) smp_trash_alloc->area);
+	ret = EVP_DecryptFinal_ex(ctx, (unsigned char *) smp_trash->area + smp_trash->data, (int *) &smp_trash->data);
+
+	if (ret <= 0)
+		goto err;
+
+	smp->data.u.str.data = dec_size + smp_trash->data;
+	smp->data.u.str.area = smp_trash->area;
+	smp->data.type = SMP_T_BIN;
+	smp->flags &= ~SMP_F_CONST;
+	free_trash_chunk(smp_trash_alloc);
+	return 1;
+
+err:
+	free_trash_chunk(smp_trash_alloc);
+	return 0;
+}
+#endif /* HA_OPENSSL_VERSION_NUMBER */
+
+static int check_crypto_digest(struct arg *args, struct sample_conv *conv,
+						  const char *file, int line, char **err)
+{
+	const EVP_MD *evp = EVP_get_digestbyname(args[0].data.str.area);
+
+	if (evp)
+		return 1;
+
+	memprintf(err, "algorithm must be a valid OpenSSL message digest name.");
+	return 0;
+}
+
+static int sample_conv_crypto_digest(const struct arg *args, struct sample *smp, void *private)
+{
+	struct buffer *trash = get_trash_chunk();
+	unsigned char *md = (unsigned char*) trash->area;
+	unsigned int md_len = trash->size;
+	EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+	const EVP_MD *evp = EVP_get_digestbyname(args[0].data.str.area);
+
+	if (!ctx)
+		return 0;
+
+	if (!EVP_DigestInit_ex(ctx, evp, NULL) ||
+	    !EVP_DigestUpdate(ctx, smp->data.u.str.area, smp->data.u.str.data) ||
+	    !EVP_DigestFinal_ex(ctx, md, &md_len)) {
+		EVP_MD_CTX_free(ctx);
+		return 0;
+	}
+
+	EVP_MD_CTX_free(ctx);
+
+	trash->data = md_len;
+	smp->data.u.str = *trash;
+	smp->data.type = SMP_T_BIN;
+	smp->flags &= ~SMP_F_CONST;
+	return 1;
+}
+
+static int check_crypto_hmac(struct arg *args, struct sample_conv *conv,
+						  const char *file, int line, char **err)
+{
+	if (!check_crypto_digest(args, conv, file, line, err))
+		return 0;
+
+	vars_check_arg(&args[1], NULL);
+	return 1;
+}
+
+static int sample_conv_crypto_hmac(const struct arg *args, struct sample *smp, void *private)
+{
+	struct sample key;
+	struct buffer *trash, *key_trash;
+	unsigned char *md;
+	unsigned int md_len;
+	const EVP_MD *evp = EVP_get_digestbyname(args[0].data.str.area);
+	int dec_size;
+
+	smp_set_owner(&key, smp->px, smp->sess, smp->strm, smp->opt);
+	if (!sample_conv_var2smp_str(&args[1], &key))
+		return 0;
+
+	trash = get_trash_chunk();
+	key_trash = alloc_trash_chunk();
+	if (!key_trash)
+		return 0;
+
+	dec_size = base64dec(key.data.u.str.area, key.data.u.str.data, key_trash->area, key_trash->size);
+	if (dec_size < 0)
+		goto err;
+
+	md = (unsigned char*) trash->area;
+	md_len = trash->size;
+	if (!HMAC(evp, key_trash->area, dec_size, (const unsigned char*) smp->data.u.str.area, smp->data.u.str.data, md, &md_len))
+		goto err;
+
+	free_trash_chunk(key_trash);
+
+	trash->data = md_len;
+	smp->data.u.str = *trash;
+	smp->data.type = SMP_T_BIN;
+	smp->flags &= ~SMP_F_CONST;
+	return 1;
+
+err:
+	free_trash_chunk(key_trash);
+	return 0;
+}
+
+#endif /* USE_OPENSSL */
+
 static int sample_conv_bin2hex(const struct arg *arg_p, struct sample *smp, void *private)
 {
-	struct chunk *trash = get_trash_chunk();
+	struct buffer *trash = get_trash_chunk();
 	unsigned char c;
 	int ptr = 0;
 
-	trash->len = 0;
-	while (ptr < smp->data.u.str.len && trash->len <= trash->size - 2) {
-		c = smp->data.u.str.str[ptr++];
-		trash->str[trash->len++] = hextab[(c >> 4) & 0xF];
-		trash->str[trash->len++] = hextab[c & 0xF];
+	trash->data = 0;
+	while (ptr < smp->data.u.str.data && trash->data <= trash->size - 2) {
+		c = smp->data.u.str.area[ptr++];
+		trash->area[trash->data++] = hextab[(c >> 4) & 0xF];
+		trash->area[trash->data++] = hextab[c & 0xF];
 	}
 	smp->data.u.str = *trash;
 	smp->data.type = SMP_T_STR;
+	smp->flags &= ~SMP_F_CONST;
+	return 1;
+}
+
+static int sample_conv_hex2int(const struct arg *arg_p, struct sample *smp, void *private)
+{
+	long long int n = 0;
+	int i, c;
+
+	for (i = 0; i < smp->data.u.str.data; i++) {
+		if ((c = hex2i(smp->data.u.str.area[i])) < 0)
+			return 0;
+		n = (n << 4) + c;
+	}
+
+	smp->data.u.sint = n;
+	smp->data.type = SMP_T_SINT;
 	smp->flags &= ~SMP_F_CONST;
 	return 1;
 }
@@ -1504,12 +1918,22 @@ static int sample_conv_bin2hex(const struct arg *arg_p, struct sample *smp, void
 /* hashes the binary input into a 32-bit unsigned int */
 static int sample_conv_djb2(const struct arg *arg_p, struct sample *smp, void *private)
 {
-	smp->data.u.sint = hash_djb2(smp->data.u.str.str, smp->data.u.str.len);
+	smp->data.u.sint = hash_djb2(smp->data.u.str.area,
+				     smp->data.u.str.data);
 	if (arg_p && arg_p->data.sint)
 		smp->data.u.sint = full_hash(smp->data.u.sint);
 	smp->data.type = SMP_T_SINT;
 	return 1;
 }
+
+static int sample_conv_length(const struct arg *arg_p, struct sample *smp, void *private)
+{
+	int i = smp->data.u.str.data;
+	smp->data.u.sint = i;
+	smp->data.type = SMP_T_SINT;
+	return 1;
+}
+
 
 static int sample_conv_str2lower(const struct arg *arg_p, struct sample *smp, void *private)
 {
@@ -1518,9 +1942,9 @@ static int sample_conv_str2lower(const struct arg *arg_p, struct sample *smp, vo
 	if (!smp_make_rw(smp))
 		return 0;
 
-	for (i = 0; i < smp->data.u.str.len; i++) {
-		if ((smp->data.u.str.str[i] >= 'A') && (smp->data.u.str.str[i] <= 'Z'))
-			smp->data.u.str.str[i] += 'a' - 'A';
+	for (i = 0; i < smp->data.u.str.data; i++) {
+		if ((smp->data.u.str.area[i] >= 'A') && (smp->data.u.str.area[i] <= 'Z'))
+			smp->data.u.str.area[i] += 'a' - 'A';
 	}
 	return 1;
 }
@@ -1532,18 +1956,35 @@ static int sample_conv_str2upper(const struct arg *arg_p, struct sample *smp, vo
 	if (!smp_make_rw(smp))
 		return 0;
 
-	for (i = 0; i < smp->data.u.str.len; i++) {
-		if ((smp->data.u.str.str[i] >= 'a') && (smp->data.u.str.str[i] <= 'z'))
-			smp->data.u.str.str[i] += 'A' - 'a';
+	for (i = 0; i < smp->data.u.str.data; i++) {
+		if ((smp->data.u.str.area[i] >= 'a') && (smp->data.u.str.area[i] <= 'z'))
+			smp->data.u.str.area[i] += 'A' - 'a';
 	}
 	return 1;
 }
 
-/* takes the netmask in arg_p */
-static int sample_conv_ipmask(const struct arg *arg_p, struct sample *smp, void *private)
+/* takes the IPv4 mask in args[0] and an optional IPv6 mask in args[1] */
+static int sample_conv_ipmask(const struct arg *args, struct sample *smp, void *private)
 {
-	smp->data.u.ipv4.s_addr &= arg_p->data.ipv4.s_addr;
-	smp->data.type = SMP_T_IPV4;
+	/* Attempt to convert to IPv4 to apply the correct mask. */
+	c_ipv62ip(smp);
+
+	if (smp->data.type == SMP_T_IPV4) {
+		smp->data.u.ipv4.s_addr &= args[0].data.ipv4.s_addr;
+		smp->data.type = SMP_T_IPV4;
+	}
+	else if (smp->data.type == SMP_T_IPV6) {
+		/* IPv6 cannot be converted without an IPv6 mask. */
+		if (args[1].type != ARGT_IPV6)
+			return 0;
+
+		write_u64(&smp->data.u.ipv6.s6_addr[0],
+			  read_u64(&smp->data.u.ipv6.s6_addr[0]) & read_u64(&args[1].data.ipv6.s6_addr[0]));
+		write_u64(&smp->data.u.ipv6.s6_addr[8],
+			  read_u64(&smp->data.u.ipv6.s6_addr[8]) & read_u64(&args[1].data.ipv6.s6_addr[8]));
+		smp->data.type = SMP_T_IPV6;
+	}
+
 	return 1;
 }
 
@@ -1553,7 +1994,7 @@ static int sample_conv_ipmask(const struct arg *arg_p, struct sample *smp, void 
  */
 static int sample_conv_ltime(const struct arg *args, struct sample *smp, void *private)
 {
-	struct chunk *temp;
+	struct buffer *temp;
 	/* With high numbers, the date returned can be negative, the 55 bits mask prevent this. */
 	time_t curr_date = smp->data.u.sint & 0x007fffffffffffffLL;
 	struct tm *tm;
@@ -1566,7 +2007,8 @@ static int sample_conv_ltime(const struct arg *args, struct sample *smp, void *p
 	if (!tm)
 		return 0;
 	temp = get_trash_chunk();
-	temp->len = strftime(temp->str, temp->size, args[0].data.str.str, tm);
+	temp->data = strftime(temp->area, temp->size, args[0].data.str.area,
+			      tm);
 	smp->data.u.str = *temp;
 	smp->data.type = SMP_T_STR;
 	return 1;
@@ -1575,7 +2017,8 @@ static int sample_conv_ltime(const struct arg *args, struct sample *smp, void *p
 /* hashes the binary input into a 32-bit unsigned int */
 static int sample_conv_sdbm(const struct arg *arg_p, struct sample *smp, void *private)
 {
-	smp->data.u.sint = hash_sdbm(smp->data.u.str.str, smp->data.u.str.len);
+	smp->data.u.sint = hash_sdbm(smp->data.u.str.area,
+				     smp->data.u.str.data);
 	if (arg_p && arg_p->data.sint)
 		smp->data.u.sint = full_hash(smp->data.u.sint);
 	smp->data.type = SMP_T_SINT;
@@ -1588,7 +2031,7 @@ static int sample_conv_sdbm(const struct arg *arg_p, struct sample *smp, void *p
  */
 static int sample_conv_utime(const struct arg *args, struct sample *smp, void *private)
 {
-	struct chunk *temp;
+	struct buffer *temp;
 	/* With high numbers, the date returned can be negative, the 55 bits mask prevent this. */
 	time_t curr_date = smp->data.u.sint & 0x007fffffffffffffLL;
 	struct tm *tm;
@@ -1601,7 +2044,8 @@ static int sample_conv_utime(const struct arg *args, struct sample *smp, void *p
 	if (!tm)
 		return 0;
 	temp = get_trash_chunk();
-	temp->len = strftime(temp->str, temp->size, args[0].data.str.str, tm);
+	temp->data = strftime(temp->area, temp->size, args[0].data.str.area,
+			      tm);
 	smp->data.u.str = *temp;
 	smp->data.type = SMP_T_STR;
 	return 1;
@@ -1610,9 +2054,61 @@ static int sample_conv_utime(const struct arg *args, struct sample *smp, void *p
 /* hashes the binary input into a 32-bit unsigned int */
 static int sample_conv_wt6(const struct arg *arg_p, struct sample *smp, void *private)
 {
-	smp->data.u.sint = hash_wt6(smp->data.u.str.str, smp->data.u.str.len);
+	smp->data.u.sint = hash_wt6(smp->data.u.str.area,
+				    smp->data.u.str.data);
 	if (arg_p && arg_p->data.sint)
 		smp->data.u.sint = full_hash(smp->data.u.sint);
+	smp->data.type = SMP_T_SINT;
+	return 1;
+}
+
+/* hashes the binary input into a 32-bit unsigned int using xxh.
+ * The seed of the hash defaults to 0 but can be changd in argument 1.
+ */
+static int sample_conv_xxh32(const struct arg *arg_p, struct sample *smp, void *private)
+{
+	unsigned int seed;
+
+	if (arg_p && arg_p->data.sint)
+		seed = arg_p->data.sint;
+	else
+		seed = 0;
+	smp->data.u.sint = XXH32(smp->data.u.str.area, smp->data.u.str.data,
+				 seed);
+	smp->data.type = SMP_T_SINT;
+	return 1;
+}
+
+/* hashes the binary input into a 64-bit unsigned int using xxh.
+ * In fact, the function returns a 64 bit unsigned, but the sample
+ * storage of haproxy only proposes 64-bits signed, so the value is
+ * cast as signed. This cast doesn't impact the hash repartition.
+ * The seed of the hash defaults to 0 but can be changd in argument 1.
+ */
+static int sample_conv_xxh64(const struct arg *arg_p, struct sample *smp, void *private)
+{
+	unsigned long long int seed;
+
+	if (arg_p && arg_p->data.sint)
+		seed = (unsigned long long int)arg_p->data.sint;
+	else
+		seed = 0;
+	smp->data.u.sint = (long long int)XXH64(smp->data.u.str.area,
+						smp->data.u.str.data, seed);
+	smp->data.type = SMP_T_SINT;
+	return 1;
+}
+
+static int sample_conv_xxh3(const struct arg *arg_p, struct sample *smp, void *private)
+{
+	unsigned long long int seed;
+
+	if (arg_p && arg_p->data.sint)
+		seed = (unsigned long long int)arg_p->data.sint;
+	else
+		seed = 0;
+	smp->data.u.sint = (long long int)XXH3(smp->data.u.str.area,
+	                                       smp->data.u.str.data, seed);
 	smp->data.type = SMP_T_SINT;
 	return 1;
 }
@@ -1620,7 +2116,19 @@ static int sample_conv_wt6(const struct arg *arg_p, struct sample *smp, void *pr
 /* hashes the binary input into a 32-bit unsigned int */
 static int sample_conv_crc32(const struct arg *arg_p, struct sample *smp, void *private)
 {
-	smp->data.u.sint = hash_crc32(smp->data.u.str.str, smp->data.u.str.len);
+	smp->data.u.sint = hash_crc32(smp->data.u.str.area,
+				      smp->data.u.str.data);
+	if (arg_p && arg_p->data.sint)
+		smp->data.u.sint = full_hash(smp->data.u.sint);
+	smp->data.type = SMP_T_SINT;
+	return 1;
+}
+
+/* hashes the binary input into crc32c (RFC4960, Appendix B [8].) */
+static int sample_conv_crc32c(const struct arg *arg_p, struct sample *smp, void *private)
+{
+	smp->data.u.sint = hash_crc32c(smp->data.u.str.area,
+				       smp->data.u.str.data);
 	if (arg_p && arg_p->data.sint)
 		smp->data.u.sint = full_hash(smp->data.u.sint);
 	smp->data.type = SMP_T_SINT;
@@ -1647,6 +2155,8 @@ enum input_type {
 static int sample_conv_json_check(struct arg *arg, struct sample_conv *conv,
                                   const char *file, int line, char **err)
 {
+	enum input_type type;
+
 	if (!arg) {
 		memprintf(err, "Unexpected empty arg list");
 		return 0;
@@ -1657,50 +2167,33 @@ static int sample_conv_json_check(struct arg *arg, struct sample_conv *conv,
 		return 0;
 	}
 
-	if (strcmp(arg->data.str.str, "") == 0) {
-		arg->type = ARGT_SINT;
-		arg->data.sint = IT_ASCII;
-		return 1;
+	if (strcmp(arg->data.str.area, "") == 0)
+		type = IT_ASCII;
+	else if (strcmp(arg->data.str.area, "ascii") == 0)
+		type = IT_ASCII;
+	else if (strcmp(arg->data.str.area, "utf8") == 0)
+		type = IT_UTF8;
+	else if (strcmp(arg->data.str.area, "utf8s") == 0)
+		type = IT_UTF8S;
+	else if (strcmp(arg->data.str.area, "utf8p") == 0)
+		type = IT_UTF8P;
+	else if (strcmp(arg->data.str.area, "utf8ps") == 0)
+		type = IT_UTF8PS;
+	else {
+		memprintf(err, "Unexpected input code type. "
+			  "Allowed value are 'ascii', 'utf8', 'utf8s', 'utf8p' and 'utf8ps'");
+		return 0;
 	}
 
-	else if (strcmp(arg->data.str.str, "ascii") == 0) {
-		arg->type = ARGT_SINT;
-		arg->data.sint = IT_ASCII;
-		return 1;
-	}
-
-	else if (strcmp(arg->data.str.str, "utf8") == 0) {
-		arg->type = ARGT_SINT;
-		arg->data.sint = IT_UTF8;
-		return 1;
-	}
-
-	else if (strcmp(arg->data.str.str, "utf8s") == 0) {
-		arg->type = ARGT_SINT;
-		arg->data.sint = IT_UTF8S;
-		return 1;
-	}
-
-	else if (strcmp(arg->data.str.str, "utf8p") == 0) {
-		arg->type = ARGT_SINT;
-		arg->data.sint = IT_UTF8P;
-		return 1;
-	}
-
-	else if (strcmp(arg->data.str.str, "utf8ps") == 0) {
-		arg->type = ARGT_SINT;
-		arg->data.sint = IT_UTF8PS;
-		return 1;
-	}
-
-	memprintf(err, "Unexpected input code type. "
-	               "Allowed value are 'ascii', 'utf8', 'utf8s', 'utf8p' and 'utf8ps'");
-	return 0;
+	chunk_destroy(&arg->data.str);
+	arg->type = ARGT_SINT;
+	arg->data.sint = type;
+	return 1;
 }
 
 static int sample_conv_json(const struct arg *arg_p, struct sample *smp, void *private)
 {
-	struct chunk *temp;
+	struct buffer *temp;
 	char _str[7]; /* \u + 4 hex digit + null char for sprintf. */
 	const char *str;
 	int len;
@@ -1713,10 +2206,10 @@ static int sample_conv_json(const struct arg *arg_p, struct sample *smp, void *p
 		input_type = arg_p->data.sint;
 
 	temp = get_trash_chunk();
-	temp->len = 0;
+	temp->data = 0;
 
-	p = smp->data.u.str.str;
-	while (p < smp->data.u.str.str + smp->data.u.str.len) {
+	p = smp->data.u.str.area;
+	while (p < smp->data.u.str.area + smp->data.u.str.data) {
 
 		if (input_type == IT_ASCII) {
 			/* Read input as ASCII. */
@@ -1725,7 +2218,9 @@ static int sample_conv_json(const struct arg *arg_p, struct sample *smp, void *p
 		}
 		else {
 			/* Read input as UTF8. */
-			ret = utf8_next(p, smp->data.u.str.len - ( p - smp->data.u.str.str ), &c);
+			ret = utf8_next(p,
+					smp->data.u.str.data - ( p - smp->data.u.str.area),
+					&c);
 			p += utf8_return_length(ret);
 
 			if (input_type == IT_UTF8 && utf8_return_code(ret) != UTF8_CODE_OK)
@@ -1778,7 +2273,7 @@ static int sample_conv_json(const struct arg *arg_p, struct sample *smp, void *p
 			len = 2;
 			str = "\\t";
 		}
-		else if (c > 0xff || !isprint(c)) {
+		else if (c > 0xff || !isprint((unsigned char)c)) {
 			/* isprint generate a segfault if c is too big. The man says that
 			 * c must have the value of an unsigned char or EOF.
 			 */
@@ -1790,16 +2285,17 @@ static int sample_conv_json(const struct arg *arg_p, struct sample *smp, void *p
 		}
 		else {
 			len = 1;
-			str = (char *)&c;
+			_str[0] = c;
+			str = _str;
 		}
 
 		/* Check length */
-		if (temp->len + len > temp->size)
+		if (temp->data + len > temp->size)
 			return 0;
 
 		/* Copy string. */
-		memcpy(temp->str + temp->len, str, len);
-		temp->len += len;
+		memcpy(temp->area + temp->data, str, len);
+		temp->data += len;
 	}
 
 	smp->flags &= ~SMP_F_CONST;
@@ -1814,18 +2310,18 @@ static int sample_conv_json(const struct arg *arg_p, struct sample *smp, void *p
  * Optional second arg is the length to truncate */
 static int sample_conv_bytes(const struct arg *arg_p, struct sample *smp, void *private)
 {
-	if (smp->data.u.str.len <= arg_p[0].data.sint) {
-		smp->data.u.str.len = 0;
+	if (smp->data.u.str.data <= arg_p[0].data.sint) {
+		smp->data.u.str.data = 0;
 		return 1;
 	}
 
 	if (smp->data.u.str.size)
 			smp->data.u.str.size -= arg_p[0].data.sint;
-	smp->data.u.str.len -= arg_p[0].data.sint;
-	smp->data.u.str.str += arg_p[0].data.sint;
+	smp->data.u.str.data -= arg_p[0].data.sint;
+	smp->data.u.str.area += arg_p[0].data.sint;
 
-	if ((arg_p[1].type == ARGT_SINT) && (arg_p[1].data.sint < smp->data.u.str.len))
-		smp->data.u.str.len = arg_p[1].data.sint;
+	if ((arg_p[1].type == ARGT_SINT) && (arg_p[1].data.sint < smp->data.u.str.data))
+		smp->data.u.str.data = arg_p[1].data.sint;
 
 	return 1;
 }
@@ -1857,7 +2353,7 @@ static int sample_conv_field_check(struct arg *args, struct sample_conv *conv,
 		return 0;
 	}
 
-	if (!arg->data.str.len) {
+	if (!arg->data.str.data) {
 		memprintf(err, "Empty separators list");
 		return 0;
 	}
@@ -1871,47 +2367,74 @@ static int sample_conv_field_check(struct arg *args, struct sample_conv *conv,
  */
 static int sample_conv_field(const struct arg *arg_p, struct sample *smp, void *private)
 {
-	unsigned int field;
+	int field;
 	char *start, *end;
 	int i;
+	int count = (arg_p[2].type == ARGT_SINT) ? arg_p[2].data.sint : 1;
 
 	if (!arg_p[0].data.sint)
 		return 0;
 
-	field = 1;
-	end = start = smp->data.u.str.str;
-	while (end - smp->data.u.str.str < smp->data.u.str.len) {
-
-		for (i = 0 ; i < arg_p[1].data.str.len ; i++) {
-			if (*end == arg_p[1].data.str.str[i]) {
-				if (field == arg_p[0].data.sint)
-					goto found;
-				start = end+1;
-				field++;
-				break;
+	if (arg_p[0].data.sint < 0) {
+		field = -1;
+		end = start = smp->data.u.str.area + smp->data.u.str.data;
+		while (start > smp->data.u.str.area) {
+			for (i = 0 ; i < arg_p[1].data.str.data; i++) {
+				if (*(start-1) == arg_p[1].data.str.area[i]) {
+					if (field == arg_p[0].data.sint) {
+						if (count == 1)
+							goto found;
+						else if (count > 1)
+							count--;
+					} else {
+						end = start-1;
+						field--;
+					}
+					break;
+				}
 			}
+			start--;
 		}
-		end++;
+	} else {
+		field = 1;
+		end = start = smp->data.u.str.area;
+		while (end - smp->data.u.str.area < smp->data.u.str.data) {
+			for (i = 0 ; i < arg_p[1].data.str.data; i++) {
+				if (*end == arg_p[1].data.str.area[i]) {
+					if (field == arg_p[0].data.sint) {
+						if (count == 1)
+							goto found;
+						else if (count > 1)
+							count--;
+					} else {
+						start = end+1;
+						field++;
+					}
+					break;
+				}
+			}
+			end++;
+		}
 	}
 
 	/* Field not found */
 	if (field != arg_p[0].data.sint) {
-		smp->data.u.str.len = 0;
-		return 1;
+		smp->data.u.str.data = 0;
+		return 0;
 	}
 found:
-	smp->data.u.str.len = end - start;
+	smp->data.u.str.data = end - start;
 	/* If ret string is len 0, no need to
            change pointers or to update size */
-	if (!smp->data.u.str.len)
+	if (!smp->data.u.str.data)
 		return 1;
 
-	smp->data.u.str.str = start;
+	smp->data.u.str.area = start;
 
 	/* Compute remaining size if needed
            Note: smp->data.u.str.size cannot be set to 0 */
 	if (smp->data.u.str.size)
-		smp->data.u.str.size -= start - smp->data.u.str.str;
+		smp->data.u.str.size -= start - smp->data.u.str.area;
 
 	return 1;
 }
@@ -1922,57 +2445,96 @@ found:
  */
 static int sample_conv_word(const struct arg *arg_p, struct sample *smp, void *private)
 {
-	unsigned int word;
+	int word;
 	char *start, *end;
 	int i, issep, inword;
+	int count = (arg_p[2].type == ARGT_SINT) ? arg_p[2].data.sint : 1;
 
 	if (!arg_p[0].data.sint)
 		return 0;
 
 	word = 0;
 	inword = 0;
-	end = start = smp->data.u.str.str;
-	while (end - smp->data.u.str.str < smp->data.u.str.len) {
-		issep = 0;
-		for (i = 0 ; i < arg_p[1].data.str.len ; i++) {
-			if (*end == arg_p[1].data.str.str[i]) {
-				issep = 1;
-				break;
+	if (arg_p[0].data.sint < 0) {
+		end = start = smp->data.u.str.area + smp->data.u.str.data;
+		while (start > smp->data.u.str.area) {
+			issep = 0;
+			for (i = 0 ; i < arg_p[1].data.str.data; i++) {
+				if (*(start-1) == arg_p[1].data.str.area[i]) {
+					issep = 1;
+					break;
+				}
 			}
-		}
-		if (!inword) {
-			if (!issep) {
-				word++;
-				start = end;
-				inword = 1;
+			if (!inword) {
+				if (!issep) {
+					if (word != arg_p[0].data.sint) {
+						word--;
+						end = start;
+					}
+					inword = 1;
+				}
 			}
+			else if (issep) {
+				if (word == arg_p[0].data.sint) {
+					if (count == 1)
+						goto found;
+					else if (count > 1)
+						count--;
+				}
+				inword = 0;
+			}
+			start--;
 		}
-		else if (issep) {
-			if (word == arg_p[0].data.sint)
-				goto found;
-			inword = 0;
+	} else {
+		end = start = smp->data.u.str.area;
+		while (end - smp->data.u.str.area < smp->data.u.str.data) {
+			issep = 0;
+			for (i = 0 ; i < arg_p[1].data.str.data; i++) {
+				if (*end == arg_p[1].data.str.area[i]) {
+					issep = 1;
+					break;
+				}
+			}
+			if (!inword) {
+				if (!issep) {
+					if (word != arg_p[0].data.sint) {
+						word++;
+						start = end;
+					}
+					inword = 1;
+				}
+			}
+			else if (issep) {
+				if (word == arg_p[0].data.sint) {
+					if (count == 1)
+						goto found;
+					else if (count > 1)
+						count--;
+				}
+				inword = 0;
+			}
+			end++;
 		}
-		end++;
 	}
 
 	/* Field not found */
 	if (word != arg_p[0].data.sint) {
-		smp->data.u.str.len = 0;
+		smp->data.u.str.data = 0;
 		return 1;
 	}
 found:
-	smp->data.u.str.len = end - start;
+	smp->data.u.str.data = end - start;
 	/* If ret string is len 0, no need to
            change pointers or to update size */
-	if (!smp->data.u.str.len)
+	if (!smp->data.u.str.data)
 		return 1;
 
-	smp->data.u.str.str = start;
+	smp->data.u.str.area = start;
 
 	/* Compute remaining size if needed
            Note: smp->data.u.str.size cannot be set to 0 */
 	if (smp->data.u.str.size)
-		smp->data.u.str.size -= start - smp->data.u.str.str;
+		smp->data.u.str.size -= start - smp->data.u.str.area;
 
 	return 1;
 }
@@ -1990,8 +2552,8 @@ static int sample_conv_regsub_check(struct arg *args, struct sample_conv *conv,
 	if (arg[2].type != ARGT_STR)
 		return 1;
 
-	p = arg[2].data.str.str;
-	len = arg[2].data.str.len;
+	p = arg[2].data.str.area;
+	len = arg[2].data.str.data;
 	while (len) {
 		if (*p == 'i') {
 			arg[0].type_flags |= ARGF_REG_ICASE;
@@ -2019,12 +2581,13 @@ static int sample_conv_regsub(const struct arg *arg_p, struct sample *smp, void 
 	char *start, *end;
 	struct my_regex *reg = arg_p[0].data.reg;
 	regmatch_t pmatch[MAX_MATCH];
-	struct chunk *trash = get_trash_chunk();
+	struct buffer *trash = get_trash_chunk();
+	struct buffer *output;
 	int flag, max;
 	int found;
 
-	start = smp->data.u.str.str;
-	end = start + smp->data.u.str.len;
+	start = smp->data.u.str.area;
+	end = start + smp->data.u.str.data;
 
 	flag = 0;
 	while (1) {
@@ -2041,25 +2604,34 @@ static int sample_conv_regsub(const struct arg *arg_p, struct sample *smp, void 
 			pmatch[0].rm_so = end - start;
 
 		/* copy the heading non-matching part (which may also be the tail if nothing matches) */
-		max = trash->size - trash->len;
+		max = trash->size - trash->data;
 		if (max && pmatch[0].rm_so > 0) {
 			if (max > pmatch[0].rm_so)
 				max = pmatch[0].rm_so;
-			memcpy(trash->str + trash->len, start, max);
-			trash->len += max;
+			memcpy(trash->area + trash->data, start, max);
+			trash->data += max;
 		}
 
 		if (!found)
 			break;
 
+		output = alloc_trash_chunk();
+		if (!output)
+			break;
+
+		output->data = exp_replace(output->area, output->size, start, arg_p[1].data.str.area, pmatch);
+
 		/* replace the matching part */
-		max = trash->size - trash->len;
+		max = output->size - output->data;
 		if (max) {
-			if (max > arg_p[1].data.str.len)
-				max = arg_p[1].data.str.len;
-			memcpy(trash->str + trash->len, arg_p[1].data.str.str, max);
-			trash->len += max;
+			if (max > output->data)
+				max = output->data;
+			memcpy(trash->area + trash->data,
+			       output->area, max);
+			trash->data += max;
 		}
+
+		free_trash_chunk(output);
 
 		/* stop here if we're done with this string */
 		if (start >= end)
@@ -2070,8 +2642,8 @@ static int sample_conv_regsub(const struct arg *arg_p, struct sample *smp, void 
 		 * so we have to copy that character and skip to the next one.
 		 */
 		if (!pmatch[0].rm_eo) {
-			if (trash->len < trash->size)
-				trash->str[trash->len++] = start[pmatch[0].rm_eo];
+			if (trash->data < trash->size)
+				trash->area[trash->data++] = start[pmatch[0].rm_eo];
 			pmatch[0].rm_eo++;
 		}
 
@@ -2091,20 +2663,24 @@ static int check_operator(struct arg *args, struct sample_conv *conv,
 {
 	const char *str;
 	const char *end;
+	long long int i;
 
 	/* Try to decode a variable. */
 	if (vars_check_arg(&args[0], NULL))
 		return 1;
 
 	/* Try to convert an integer */
-	str = args[0].data.str.str;
+	str = args[0].data.str.area;
 	end = str + strlen(str);
-	args[0].data.sint = read_int64(&str, end);
+	i = read_int64(&str, end);
 	if (*str != '\0') {
 		memprintf(err, "expects an integer or a variable name");
 		return 0;
 	}
+
+	chunk_destroy(&args[0].data.str);
 	args[0].type = ARGT_SINT;
+	args[0].data.sint = i;
 	return 1;
 }
 
@@ -2145,7 +2721,7 @@ static int sample_conv_binary_cpl(const struct arg *arg_p, struct sample *smp, v
 }
 
 /* Takes a SINT on input, applies a binary "and" with the SINT directly in
- * arg_p or in the varaible described in arg_p, and returns the SINT result.
+ * arg_p or in the variable described in arg_p, and returns the SINT result.
  */
 static int sample_conv_binary_and(const struct arg *arg_p, struct sample *smp, void *private)
 {
@@ -2159,7 +2735,7 @@ static int sample_conv_binary_and(const struct arg *arg_p, struct sample *smp, v
 }
 
 /* Takes a SINT on input, applies a binary "or" with the SINT directly in
- * arg_p or in the varaible described in arg_p, and returns the SINT result.
+ * arg_p or in the variable described in arg_p, and returns the SINT result.
  */
 static int sample_conv_binary_or(const struct arg *arg_p, struct sample *smp, void *private)
 {
@@ -2173,7 +2749,7 @@ static int sample_conv_binary_or(const struct arg *arg_p, struct sample *smp, vo
 }
 
 /* Takes a SINT on input, applies a binary "xor" with the SINT directly in
- * arg_p or in the varaible described in arg_p, and returns the SINT result.
+ * arg_p or in the variable described in arg_p, and returns the SINT result.
  */
 static int sample_conv_binary_xor(const struct arg *arg_p, struct sample *smp, void *private)
 {
@@ -2201,7 +2777,7 @@ static inline long long int arith_add(long long int a, long long int b)
 	 * +------+----------+----------+
 	 */
 	if ((a ^ b) >= 0) {
-		/* signs are differents. */
+		/* signs are different. */
 		if (a < 0) {
 			if (LLONG_MIN - a > b)
 				return LLONG_MIN;
@@ -2213,7 +2789,7 @@ static inline long long int arith_add(long long int a, long long int b)
 }
 
 /* Takes a SINT on input, applies an arithmetic "add" with the SINT directly in
- * arg_p or in the varaible described in arg_p, and returns the SINT result.
+ * arg_p or in the variable described in arg_p, and returns the SINT result.
  */
 static int sample_conv_arith_add(const struct arg *arg_p, struct sample *smp, void *private)
 {
@@ -2227,7 +2803,7 @@ static int sample_conv_arith_add(const struct arg *arg_p, struct sample *smp, vo
 }
 
 /* Takes a SINT on input, applies an arithmetic "sub" with the SINT directly in
- * arg_p or in the varaible described in arg_p, and returns the SINT result.
+ * arg_p or in the variable described in arg_p, and returns the SINT result.
  */
 static int sample_conv_arith_sub(const struct arg *arg_p,
                                  struct sample *smp, void *private)
@@ -2249,7 +2825,7 @@ static int sample_conv_arith_sub(const struct arg *arg_p,
 		return 1;
 	}
 
-	/* standard substraction: we use the "add" function and negate
+	/* standard subtraction: we use the "add" function and negate
 	 * the second operand.
 	 */
 	smp->data.u.sint = arith_add(smp->data.u.sint, -tmp.data.u.sint);
@@ -2257,7 +2833,7 @@ static int sample_conv_arith_sub(const struct arg *arg_p,
 }
 
 /* Takes a SINT on input, applies an arithmetic "mul" with the SINT directly in
- * arg_p or in the varaible described in arg_p, and returns the SINT result.
+ * arg_p or in the variable described in arg_p, and returns the SINT result.
  * If the result makes an overflow, then the largest possible quantity is
  * returned.
  */
@@ -2278,7 +2854,7 @@ static int sample_conv_arith_mul(const struct arg *arg_p,
 	}
 
 	/* The multiply between LLONG_MIN and -1 returns a
-	 * "floting point exception".
+	 * "floating point exception".
 	 */
 	if (smp->data.u.sint == LLONG_MIN && tmp.data.u.sint == -1) {
 		smp->data.u.sint = LLONG_MAX;
@@ -2302,7 +2878,7 @@ static int sample_conv_arith_mul(const struct arg *arg_p,
 }
 
 /* Takes a SINT on input, applies an arithmetic "div" with the SINT directly in
- * arg_p or in the varaible described in arg_p, and returns the SINT result.
+ * arg_p or in the variable described in arg_p, and returns the SINT result.
  * If arg_p makes the result overflow, then the largest possible quantity is
  * returned.
  */
@@ -2317,7 +2893,7 @@ static int sample_conv_arith_div(const struct arg *arg_p,
 
 	if (tmp.data.u.sint) {
 		/* The divide between LLONG_MIN and -1 returns a
-		 * "floting point exception".
+		 * "floating point exception".
 		 */
 		if (smp->data.u.sint == LLONG_MIN && tmp.data.u.sint == -1) {
 			smp->data.u.sint = LLONG_MAX;
@@ -2331,7 +2907,7 @@ static int sample_conv_arith_div(const struct arg *arg_p,
 }
 
 /* Takes a SINT on input, applies an arithmetic "mod" with the SINT directly in
- * arg_p or in the varaible described in arg_p, and returns the SINT result.
+ * arg_p or in the variable described in arg_p, and returns the SINT result.
  * If arg_p makes the result overflow, then 0 is returned.
  */
 static int sample_conv_arith_mod(const struct arg *arg_p,
@@ -2345,7 +2921,7 @@ static int sample_conv_arith_mod(const struct arg *arg_p,
 
 	if (tmp.data.u.sint) {
 		/* The divide between LLONG_MIN and -1 returns a
-		 * "floting point exception".
+		 * "floating point exception".
 		 */
 		if (smp->data.u.sint == LLONG_MIN && tmp.data.u.sint == -1) {
 			smp->data.u.sint = 0;
@@ -2415,6 +2991,531 @@ static int sample_conv_arith_even(const struct arg *arg_p,
 	return 1;
 }
 
+/* appends an optional const string, an optional variable contents and another
+ * optional const string to an existing string.
+ */
+static int sample_conv_concat(const struct arg *arg_p, struct sample *smp, void *private)
+{
+	struct buffer *trash;
+	struct sample tmp;
+	int max;
+
+	trash = get_trash_chunk();
+	trash->data = smp->data.u.str.data;
+	if (trash->data > trash->size - 1)
+		trash->data = trash->size - 1;
+
+	memcpy(trash->area, smp->data.u.str.area, trash->data);
+	trash->area[trash->data] = 0;
+
+	/* append first string */
+	max = arg_p[0].data.str.data;
+	if (max > trash->size - 1 - trash->data)
+		max = trash->size - 1 - trash->data;
+
+	if (max) {
+		memcpy(trash->area + trash->data, arg_p[0].data.str.area, max);
+		trash->data += max;
+		trash->area[trash->data] = 0;
+	}
+
+	/* append second string (variable) if it's found and we can turn it
+	 * into a string.
+	 */
+	smp_set_owner(&tmp, smp->px, smp->sess, smp->strm, smp->opt);
+	if (arg_p[1].type == ARGT_VAR && vars_get_by_desc(&arg_p[1].data.var, &tmp) &&
+	    (sample_casts[tmp.data.type][SMP_T_STR] == c_none ||
+	     sample_casts[tmp.data.type][SMP_T_STR](&tmp))) {
+
+		max = tmp.data.u.str.data;
+		if (max > trash->size - 1 - trash->data)
+			max = trash->size - 1 - trash->data;
+
+		if (max) {
+			memcpy(trash->area + trash->data, tmp.data.u.str.area,
+			       max);
+			trash->data += max;
+			trash->area[trash->data] = 0;
+		}
+	}
+
+	/* append third string */
+	max = arg_p[2].data.str.data;
+	if (max > trash->size - 1 - trash->data)
+		max = trash->size - 1 - trash->data;
+
+	if (max) {
+		memcpy(trash->area + trash->data, arg_p[2].data.str.area, max);
+		trash->data += max;
+		trash->area[trash->data] = 0;
+	}
+
+	smp->data.u.str = *trash;
+	smp->data.type = SMP_T_STR;
+	return 1;
+}
+
+/* This function checks the "concat" converter's arguments and extracts the
+ * variable name and its scope.
+ */
+static int smp_check_concat(struct arg *args, struct sample_conv *conv,
+                           const char *file, int line, char **err)
+{
+	/* Try to decode a variable. */
+	if (args[1].data.str.data > 0 && !vars_check_arg(&args[1], NULL)) {
+		memprintf(err, "failed to register variable name '%s'",
+			  args[1].data.str.area);
+		return 0;
+	}
+	return 1;
+}
+
+/* Compares string with a variable containing a string. Return value
+ * is compatible with strcmp(3)'s return value.
+ */
+static int sample_conv_strcmp(const struct arg *arg_p, struct sample *smp, void *private)
+{
+	struct sample tmp;
+	int max, result;
+
+	smp_set_owner(&tmp, smp->px, smp->sess, smp->strm, smp->opt);
+	if (arg_p[0].type != ARGT_VAR)
+		return 0;
+	if (!vars_get_by_desc(&arg_p[0].data.var, &tmp))
+		return 0;
+	if (!sample_casts[tmp.data.type][SMP_T_STR](&tmp))
+		return 0;
+
+	max = MIN(smp->data.u.str.data, tmp.data.u.str.data);
+	result = strncmp(smp->data.u.str.area, tmp.data.u.str.area, max);
+	if (result == 0) {
+		if (smp->data.u.str.data != tmp.data.u.str.data) {
+			if (smp->data.u.str.data < tmp.data.u.str.data) {
+				result = -1;
+			}
+			else {
+				result = 1;
+			}
+		}
+	}
+
+	smp->data.u.sint = result;
+	smp->data.type = SMP_T_SINT;
+	return 1;
+}
+
+#ifdef USE_OPENSSL
+/* Compares bytestring with a variable containing a bytestring. Return value
+ * is `true` if both bytestrings are bytewise identical and `false` otherwise.
+ *
+ * Comparison will be performed in constant time if both bytestrings are of
+ * the same length. If the lengths differ execution time will not be constant.
+ */
+static int sample_conv_secure_memcmp(const struct arg *arg_p, struct sample *smp, void *private)
+{
+	struct sample tmp;
+	int result;
+
+	smp_set_owner(&tmp, smp->px, smp->sess, smp->strm, smp->opt);
+	if (arg_p[0].type != ARGT_VAR)
+		return 0;
+	if (!vars_get_by_desc(&arg_p[0].data.var, &tmp))
+		return 0;
+	if (!sample_casts[tmp.data.type][SMP_T_BIN](&tmp))
+		return 0;
+
+	if (smp->data.u.str.data != tmp.data.u.str.data) {
+		smp->data.u.sint = 0;
+		smp->data.type = SMP_T_BOOL;
+		return 1;
+	}
+
+	/* The following comparison is performed in constant time. */
+	result = CRYPTO_memcmp(smp->data.u.str.area, tmp.data.u.str.area, smp->data.u.str.data);
+
+	smp->data.u.sint = result == 0;
+	smp->data.type = SMP_T_BOOL;
+	return 1;
+}
+#endif
+
+/* Takes a boolean as input. Returns the first argument if that boolean is true and
+ * the second argument otherwise.
+ */
+static int sample_conv_iif(const struct arg *arg_p, struct sample *smp, void *private)
+{
+	smp->data.type = SMP_T_STR;
+	smp->flags |= SMP_F_CONST;
+
+	if (smp->data.u.sint) {
+		smp->data.u.str.data = arg_p[0].data.str.data;
+		smp->data.u.str.area = arg_p[0].data.str.area;
+	}
+	else {
+		smp->data.u.str.data = arg_p[1].data.str.data;
+		smp->data.u.str.area = arg_p[1].data.str.area;
+	}
+
+	return 1;
+}
+
+#define GRPC_MSG_COMPRESS_FLAG_SZ 1 /* 1 byte */
+#define GRPC_MSG_LENGTH_SZ        4 /* 4 bytes */
+#define GRPC_MSG_HEADER_SZ        (GRPC_MSG_COMPRESS_FLAG_SZ + GRPC_MSG_LENGTH_SZ)
+
+/*
+ * Extract the field value of an input binary sample. Takes a mandatory argument:
+ * the protocol buffers field identifier (dotted notation) internally represented
+ * as an array of unsigned integers and its size.
+ * Return 1 if the field was found, 0 if not.
+ */
+static int sample_conv_ungrpc(const struct arg *arg_p, struct sample *smp, void *private)
+{
+	unsigned char *pos;
+	size_t grpc_left;
+
+	pos = (unsigned char *)smp->data.u.str.area;
+	grpc_left = smp->data.u.str.data;
+
+	while (grpc_left > GRPC_MSG_HEADER_SZ) {
+		size_t grpc_msg_len, left;
+
+		grpc_msg_len = left = ntohl(*(uint32_t *)(pos + GRPC_MSG_COMPRESS_FLAG_SZ));
+
+		pos += GRPC_MSG_HEADER_SZ;
+		grpc_left -= GRPC_MSG_HEADER_SZ;
+
+		if (grpc_left < left)
+			return 0;
+
+		if (protobuf_field_lookup(arg_p, smp, &pos, &left))
+			return 1;
+
+		grpc_left -= grpc_msg_len;
+	}
+
+	return 0;
+}
+
+static int sample_conv_protobuf(const struct arg *arg_p, struct sample *smp, void *private)
+{
+	unsigned char *pos;
+	size_t left;
+
+	pos = (unsigned char *)smp->data.u.str.area;
+	left = smp->data.u.str.data;
+
+	return protobuf_field_lookup(arg_p, smp, &pos, &left);
+}
+
+static int sample_conv_protobuf_check(struct arg *args, struct sample_conv *conv,
+                                      const char *file, int line, char **err)
+{
+	if (!args[1].type) {
+		args[1].type = ARGT_SINT;
+		args[1].data.sint = PBUF_T_BINARY;
+	}
+	else {
+		int pbuf_type;
+
+		pbuf_type = protobuf_type(args[1].data.str.area);
+		if (pbuf_type == -1) {
+			memprintf(err, "Wrong protocol buffer type '%s'", args[1].data.str.area);
+			return 0;
+		}
+
+		chunk_destroy(&args[1].data.str);
+		args[1].type = ARGT_SINT;
+		args[1].data.sint = pbuf_type;
+	}
+
+	return 1;
+}
+
+/*
+ * Extract the tag value of an input binary sample. Takes a mandatory argument:
+ * the FIX protocol tag identifier.
+ * Return 1 if the tag was found, 0 if not.
+ */
+static int sample_conv_fix_tag_value(const struct arg *arg_p, struct sample *smp, void *private)
+{
+	struct ist value;
+
+	smp->flags &= ~SMP_F_MAY_CHANGE;
+	value = fix_tag_value(ist2(smp->data.u.str.area, smp->data.u.str.data),
+			      arg_p[0].data.sint);
+	if (!istlen(value)) {
+		if (!isttest(value)) {
+			/* value != IST_NULL, need more data */
+			smp->flags |= SMP_F_MAY_CHANGE;
+		}
+		return 0;
+	}
+
+	smp->data.u.str = ist2buf(value);
+	smp->flags |= SMP_F_CONST;
+
+	return 1;
+}
+
+/* This function checks the "fix_tag_value" converter configuration.
+ * It expects a "known" (by HAProxy) tag name or ID.
+ * Tag string names are converted to their ID counterpart because this is the
+ * format they are sent over the wire.
+ */
+static int sample_conv_fix_value_check(struct arg *args, struct sample_conv *conv,
+				       const char *file, int line, char **err)
+{
+	struct ist str;
+	unsigned int tag;
+
+	str = ist2(args[0].data.str.area, args[0].data.str.data);
+	tag = fix_tagid(str);
+	if (!tag) {
+		memprintf(err, "Unknown FIX tag name '%s'", args[0].data.str.area);
+		return 0;
+	}
+
+	chunk_destroy(&args[0].data.str);
+	args[0].type = ARGT_SINT;
+	args[0].data.sint = tag;
+
+	return 1;
+}
+
+/*
+ * Checks that a buffer contains a valid FIX message
+ *
+ * Return 1 if the check could be run, 0 if not.
+ * The result of the analyse itself is stored in <smp> as a boolean
+ */
+static int sample_conv_fix_is_valid(const struct arg *arg_p, struct sample *smp, void *private)
+{
+	struct ist msg;
+
+	msg = ist2(smp->data.u.str.area, smp->data.u.str.data);
+
+	smp->flags &= ~SMP_F_MAY_CHANGE;
+	switch (fix_validate_message(msg)) {
+	case FIX_VALID_MESSAGE:
+		smp->data.type = SMP_T_BOOL;
+		smp->data.u.sint = 1;
+		return 1;
+	case FIX_NEED_MORE_DATA:
+		smp->flags |= SMP_F_MAY_CHANGE;
+		return 0;
+	case FIX_INVALID_MESSAGE:
+		smp->data.type = SMP_T_BOOL;
+		smp->data.u.sint = 0;
+		return 1;
+	}
+	return 0;
+}
+
+/*
+ * Extract the field value of an input binary sample containing an MQTT packet.
+ * Takes 2 mandatory arguments:
+ * - packet type
+ * - field name
+ *
+ * return 1 if the field was found, 0 if not.
+ */
+static int sample_conv_mqtt_field_value(const struct arg *arg_p, struct sample *smp, void *private)
+{
+	struct ist pkt, value;
+	int type, fieldname_id;
+
+	pkt = ist2(smp->data.u.str.area, smp->data.u.str.data);
+	type = arg_p[0].data.sint;
+	fieldname_id = arg_p[1].data.sint;
+
+	smp->flags &= ~SMP_F_MAY_CHANGE;
+	value = mqtt_field_value(pkt, type, fieldname_id);
+	if (!istlen(value)) {
+		if (isttest(value)) {
+			/* value != IST_NULL, need more data */
+			smp->flags |= SMP_F_MAY_CHANGE;
+		}
+		return 0;
+	}
+
+	smp->data.u.str = ist2buf(value);
+	smp->flags |= SMP_F_CONST;
+	return 1;
+}
+
+/*
+ * this function checks the "mqtt_field_value" converter configuration.
+ * It expects a known packet type name or ID and a field name, in this order
+ *
+ * Args[0] will be turned into a MQTT_CPT_* value for direct matching when parsing
+ * a packet.
+ */
+static int sample_conv_mqtt_field_value_check(struct arg *args, struct sample_conv *conv,
+					      const char *file, int line, char **err)
+{
+	int type, fieldname_id;
+
+	/* check the MQTT packet type is valid */
+	type = mqtt_typeid(ist2(args[0].data.str.area, args[0].data.str.data));
+	if (type == MQTT_CPT_INVALID) {
+		memprintf(err, "Unknown MQTT type '%s'", args[0].data.str.area);
+		return 0;
+	}
+
+	/* check the field name belongs to the MQTT packet type */
+	fieldname_id = mqtt_check_type_fieldname(type, ist2(args[1].data.str.area, args[1].data.str.data));
+	if (fieldname_id == MQTT_FN_INVALID) {
+		memprintf(err, "Unknown MQTT field name '%s' for packet type '%s'", args[1].data.str.area,
+			  args[0].data.str.area);
+		return 0;
+	}
+
+	/* save numeric counterparts of type and field name */
+	chunk_destroy(&args[0].data.str);
+	chunk_destroy(&args[1].data.str);
+	args[0].type = ARGT_SINT;
+	args[0].data.sint = type;
+	args[1].type = ARGT_SINT;
+	args[1].data.sint = fieldname_id;
+
+	return 1;
+}
+
+/*
+ * Checks that <smp> contains a valid MQTT message
+ *
+ * The function returns 1 if the check was run to its end, 0 otherwise.
+ * The result of the analyse itself is stored in <smp> as a boolean.
+ */
+static int sample_conv_mqtt_is_valid(const struct arg *arg_p, struct sample *smp, void *private)
+{
+	struct ist msg;
+
+	msg = ist2(smp->data.u.str.area, smp->data.u.str.data);
+
+	smp->flags &= ~SMP_F_MAY_CHANGE;
+	switch (mqtt_validate_message(msg, NULL)) {
+	case FIX_VALID_MESSAGE:
+		smp->data.type = SMP_T_BOOL;
+		smp->data.u.sint = 1;
+		return 1;
+	case FIX_NEED_MORE_DATA:
+		smp->flags |= SMP_F_MAY_CHANGE;
+		return 0;
+	case FIX_INVALID_MESSAGE:
+		smp->data.type = SMP_T_BOOL;
+		smp->data.u.sint = 0;
+		return 1;
+	}
+	return 0;
+}
+
+/* This function checks the "strcmp" converter's arguments and extracts the
+ * variable name and its scope.
+ */
+static int smp_check_strcmp(struct arg *args, struct sample_conv *conv,
+                           const char *file, int line, char **err)
+{
+	/* Try to decode a variable. */
+	if (vars_check_arg(&args[0], NULL))
+		return 1;
+
+	memprintf(err, "failed to register variable name '%s'",
+		  args[0].data.str.area);
+	return 0;
+}
+
+#ifdef USE_OPENSSL
+/* This function checks the "secure_memcmp" converter's arguments and extracts the
+ * variable name and its scope.
+ */
+static int smp_check_secure_memcmp(struct arg *args, struct sample_conv *conv,
+                           const char *file, int line, char **err)
+{
+	/* Try to decode a variable. */
+	if (vars_check_arg(&args[0], NULL))
+		return 1;
+
+	memprintf(err, "failed to register variable name '%s'",
+		  args[0].data.str.area);
+	return 0;
+}
+#endif
+
+/**/
+static int sample_conv_htonl(const struct arg *arg_p, struct sample *smp, void *private)
+{
+	struct buffer *tmp;
+	uint32_t n;
+
+	n = htonl((uint32_t)smp->data.u.sint);
+	tmp = get_trash_chunk();
+
+	memcpy(b_head(tmp), &n, 4);
+	b_add(tmp, 4);
+
+	smp->data.u.str = *tmp;
+	smp->data.type = SMP_T_BIN;
+	return 1;
+}
+
+/**/
+static int sample_conv_cut_crlf(const struct arg *arg_p, struct sample *smp, void *private)
+{
+	char *p;
+	size_t l;
+
+	p = smp->data.u.str.area;
+	for (l = 0; l < smp->data.u.str.data; l++) {
+		if (*(p+l) == '\r' || *(p+l) == '\n')
+			break;
+	}
+	smp->data.u.str.data = l;
+	return 1;
+}
+
+/**/
+static int sample_conv_ltrim(const struct arg *arg_p, struct sample *smp, void *private)
+{
+	char *delimiters, *p;
+	size_t dlen, l;
+
+	delimiters =  arg_p[0].data.str.area;
+	dlen = arg_p[0].data.str.data;
+
+	l = smp->data.u.str.data;
+	p = smp->data.u.str.area;
+	while (l && memchr(delimiters, *p, dlen) != NULL) {
+		p++;
+		l--;
+	}
+
+	smp->data.u.str.area = p;
+	smp->data.u.str.data = l;
+	return 1;
+}
+
+/**/
+static int sample_conv_rtrim(const struct arg *arg_p, struct sample *smp, void *private)
+{
+	char *delimiters, *p;
+	size_t dlen, l;
+
+	delimiters =  arg_p[0].data.str.area;
+	dlen = arg_p[0].data.str.data;
+
+	l = smp->data.u.str.data;
+	p = smp->data.u.str.area + l - 1;
+	while (l && memchr(delimiters, *p, dlen) != NULL) {
+		p--;
+		l--;
+	}
+
+	smp->data.u.str.data = l;
+	return 1;
+}
+
 /************************************************************************/
 /*       All supported sample fetch functions must be declared here     */
 /************************************************************************/
@@ -2423,6 +3524,9 @@ static int sample_conv_arith_even(const struct arg *arg_p,
 static int
 smp_fetch_true(const struct arg *args, struct sample *smp, const char *kw, void *private)
 {
+	if (!smp_make_rw(smp))
+		return 0;
+
 	smp->data.type = SMP_T_BOOL;
 	smp->data.u.sint = 1;
 	return 1;
@@ -2446,24 +3550,73 @@ smp_fetch_env(const struct arg *args, struct sample *smp, const char *kw, void *
 	if (!args || args[0].type != ARGT_STR)
 		return 0;
 
-	env = getenv(args[0].data.str.str);
+	env = getenv(args[0].data.str.area);
 	if (!env)
 		return 0;
 
 	smp->data.type = SMP_T_STR;
 	smp->flags = SMP_F_CONST;
-	smp->data.u.str.str = env;
-	smp->data.u.str.len = strlen(env);
+	smp->data.u.str.area = env;
+	smp->data.u.str.data = strlen(env);
 	return 1;
 }
 
-/* retrieve the current local date in epoch time, and applies an optional offset
- * of args[0] seconds.
+/* Validates the data unit argument passed to "date" fetch. Argument 1 support an
+ * optional string representing the unit of the result: "s" for seconds, "ms" for
+ * milliseconds and "us" for microseconds.
+ * Returns 0 on error and non-zero if OK.
+ */
+int smp_check_date_unit(struct arg *args, char **err)
+{
+        if (args[1].type == ARGT_STR) {
+		long long int unit;
+
+                if (strcmp(args[1].data.str.area, "s") == 0) {
+                        unit = TIME_UNIT_S;
+                }
+                else if (strcmp(args[1].data.str.area, "ms") == 0) {
+                        unit = TIME_UNIT_MS;
+                }
+                else if (strcmp(args[1].data.str.area, "us") == 0) {
+                        unit = TIME_UNIT_US;
+                }
+                else {
+                        memprintf(err, "expects 's', 'ms' or 'us', got '%s'",
+                                  args[1].data.str.area);
+                        return 0;
+                }
+
+		chunk_destroy(&args[1].data.str);
+                args[1].type = ARGT_SINT;
+		args[1].data.sint = unit;
+        }
+        else if (args[1].type != ARGT_STOP) {
+                memprintf(err, "Unexpected arg type");
+                return 0;
+        }
+
+        return 1;
+}
+
+/* retrieve the current local date in epoch time, converts it to milliseconds
+ * or microseconds if asked to in optional args[1] unit param, and applies an
+ * optional args[0] offset.
  */
 static int
 smp_fetch_date(const struct arg *args, struct sample *smp, const char *kw, void *private)
 {
 	smp->data.u.sint = date.tv_sec;
+
+	/* report in milliseconds */
+	if (args && args[1].type == ARGT_SINT && args[1].data.sint == TIME_UNIT_MS) {
+		smp->data.u.sint *= 1000;
+		smp->data.u.sint += date.tv_usec / 1000;
+	}
+	/* report in microseconds */
+	else if (args && args[1].type == ARGT_SINT && args[1].data.sint == TIME_UNIT_US) {
+		smp->data.u.sint *= 1000000;
+		smp->data.u.sint += date.tv_usec;
+	}
 
 	/* add offset */
 	if (args && args[0].type == ARGT_SINT)
@@ -2471,6 +3624,28 @@ smp_fetch_date(const struct arg *args, struct sample *smp, const char *kw, void 
 
 	smp->data.type = SMP_T_SINT;
 	smp->flags |= SMP_F_VOL_TEST | SMP_F_MAY_CHANGE;
+	return 1;
+}
+
+/* retrieve the current microsecond part of the date  */
+static int
+smp_fetch_date_us(const struct arg *args, struct sample *smp, const char *kw, void *private)
+{
+	smp->data.u.sint = date.tv_usec;
+	smp->data.type = SMP_T_SINT;
+	smp->flags |= SMP_F_VOL_TEST | SMP_F_MAY_CHANGE;
+	return 1;
+}
+
+
+/* returns the hostname */
+static int
+smp_fetch_hostname(const struct arg *args, struct sample *smp, const char *kw, void *private)
+{
+	smp->data.type = SMP_T_STR;
+	smp->flags = SMP_F_CONST;
+	smp->data.u.str.area = hostname;
+	smp->data.u.str.data = strlen(hostname);
 	return 1;
 }
 
@@ -2492,17 +3667,26 @@ smp_fetch_proc(const struct arg *args, struct sample *smp, const char *kw, void 
 	return 1;
 }
 
+/* returns the number of the current thread (between 1 and nbthread */
+static int
+smp_fetch_thread(const struct arg *args, struct sample *smp, const char *kw, void *private)
+{
+	smp->data.type = SMP_T_SINT;
+	smp->data.u.sint = tid;
+	return 1;
+}
+
 /* generate a random 32-bit integer for whatever purpose, with an optional
  * range specified in argument.
  */
 static int
 smp_fetch_rand(const struct arg *args, struct sample *smp, const char *kw, void *private)
 {
-	smp->data.u.sint = random();
+	smp->data.u.sint = ha_random32();
 
 	/* reduce if needed. Don't do a modulo, use all bits! */
 	if (args && args[0].type == ARGT_SINT)
-		smp->data.u.sint = (smp->data.u.sint * args[0].data.sint) / ((u64)RAND_MAX+1);
+		smp->data.u.sint = ((u64)smp->data.u.sint * (u64)args[0].data.sint) >> 32;
 
 	smp->data.type = SMP_T_SINT;
 	smp->flags |= SMP_F_VOL_TEST | SMP_F_MAY_CHANGE;
@@ -2518,25 +3702,87 @@ smp_fetch_stopping(const struct arg *args, struct sample *smp, const char *kw, v
 	return 1;
 }
 
+/* returns the number of calls of the current stream's process_stream() */
+static int
+smp_fetch_cpu_calls(const struct arg *args, struct sample *smp, const char *kw, void *private)
+{
+	if (!smp->strm)
+		return 0;
+
+	smp->data.type = SMP_T_SINT;
+	smp->data.u.sint = smp->strm->task->calls;
+	return 1;
+}
+
+/* returns the average number of nanoseconds spent processing the stream per call */
+static int
+smp_fetch_cpu_ns_avg(const struct arg *args, struct sample *smp, const char *kw, void *private)
+{
+	if (!smp->strm)
+		return 0;
+
+	smp->data.type = SMP_T_SINT;
+	smp->data.u.sint = smp->strm->task->calls ? smp->strm->task->cpu_time / smp->strm->task->calls : 0;
+	return 1;
+}
+
+/* returns the total number of nanoseconds spent processing the stream */
+static int
+smp_fetch_cpu_ns_tot(const struct arg *args, struct sample *smp, const char *kw, void *private)
+{
+	if (!smp->strm)
+		return 0;
+
+	smp->data.type = SMP_T_SINT;
+	smp->data.u.sint = smp->strm->task->cpu_time;
+	return 1;
+}
+
+/* returns the average number of nanoseconds per call spent waiting for other tasks to be processed */
+static int
+smp_fetch_lat_ns_avg(const struct arg *args, struct sample *smp, const char *kw, void *private)
+{
+	if (!smp->strm)
+		return 0;
+
+	smp->data.type = SMP_T_SINT;
+	smp->data.u.sint = smp->strm->task->calls ? smp->strm->task->lat_time / smp->strm->task->calls : 0;
+	return 1;
+}
+
+/* returns the total number of nanoseconds per call spent waiting for other tasks to be processed */
+static int
+smp_fetch_lat_ns_tot(const struct arg *args, struct sample *smp, const char *kw, void *private)
+{
+	if (!smp->strm)
+		return 0;
+
+	smp->data.type = SMP_T_SINT;
+	smp->data.u.sint = smp->strm->task->lat_time;
+	return 1;
+}
+
 static int smp_fetch_const_str(const struct arg *args, struct sample *smp, const char *kw, void *private)
 {
 	smp->flags |= SMP_F_CONST;
 	smp->data.type = SMP_T_STR;
-	smp->data.u.str.str = args[0].data.str.str;
-	smp->data.u.str.len = args[0].data.str.len;
+	smp->data.u.str.area = args[0].data.str.area;
+	smp->data.u.str.data = args[0].data.str.data;
 	return 1;
 }
 
 static int smp_check_const_bool(struct arg *args, char **err)
 {
-	if (strcasecmp(args[0].data.str.str, "true") == 0 ||
-	    strcasecmp(args[0].data.str.str, "1") == 0) {
+	if (strcasecmp(args[0].data.str.area, "true") == 0 ||
+	    strcasecmp(args[0].data.str.area, "1") == 0) {
+		chunk_destroy(&args[0].data.str);
 		args[0].type = ARGT_SINT;
 		args[0].data.sint = 1;
 		return 1;
 	}
-	if (strcasecmp(args[0].data.str.str, "false") == 0 ||
-	    strcasecmp(args[0].data.str.str, "0") == 0) {
+	if (strcasecmp(args[0].data.str.area, "false") == 0 ||
+	    strcasecmp(args[0].data.str.area, "0") == 0) {
+		chunk_destroy(&args[0].data.str);
 		args[0].type = ARGT_SINT;
 		args[0].data.sint = 0;
 		return 1;
@@ -2578,11 +3824,12 @@ static int smp_check_const_bin(struct arg *args, char **err)
 	char *binstr = NULL;
 	int binstrlen;
 
-	if (!parse_binary(args[0].data.str.str, &binstr, &binstrlen, err))
+	if (!parse_binary(args[0].data.str.area, &binstr, &binstrlen, err))
 		return 0;
+	chunk_destroy(&args[0].data.str);
 	args[0].type = ARGT_STR;
-	args[0].data.str.str = binstr;
-	args[0].data.str.len = binstrlen;
+	args[0].data.str.area = binstr;
+	args[0].data.str.data = binstrlen;
 	return 1;
 }
 
@@ -2590,8 +3837,8 @@ static int smp_fetch_const_bin(const struct arg *args, struct sample *smp, const
 {
 	smp->flags |= SMP_F_CONST;
 	smp->data.type = SMP_T_BIN;
-	smp->data.u.str.str = args[0].data.str.str;
-	smp->data.u.str.len = args[0].data.str.len;
+	smp->data.u.str.area = args[0].data.str.area;
+	smp->data.u.str.data = args[0].data.str.data;
 	return 1;
 }
 
@@ -2600,18 +3847,19 @@ static int smp_check_const_meth(struct arg *args, char **err)
 	enum http_meth_t meth;
 	int i;
 
-	meth = find_http_meth(args[0].data.str.str, args[0].data.str.len);
+	meth = find_http_meth(args[0].data.str.area, args[0].data.str.data);
 	if (meth != HTTP_METH_OTHER) {
+		chunk_destroy(&args[0].data.str);
 		args[0].type = ARGT_SINT;
 		args[0].data.sint = meth;
 	} else {
-		/* Check method avalaibility. A methos is a token defined as :
+		/* Check method avalaibility. A method is a token defined as :
 		 * tchar = "!" / "#" / "$" / "%" / "&" / "'" / "*" / "+" / "-" / "." /
 		 *         "^" / "_" / "`" / "|" / "~" / DIGIT / ALPHA
 		 * token = 1*tchar
 		 */
-		for (i = 0; i < args[0].data.str.len; i++) {
-			if (!HTTP_IS_TOKEN(args[0].data.str.str[i])) {
+		for (i = 0; i < args[0].data.str.data; i++) {
+			if (!HTTP_IS_TOKEN(args[0].data.str.area[i])) {
 				memprintf(err, "expects valid method.");
 				return 0;
 			}
@@ -2626,15 +3874,46 @@ static int smp_fetch_const_meth(const struct arg *args, struct sample *smp, cons
 	if (args[0].type == ARGT_SINT) {
 		smp->flags &= ~SMP_F_CONST;
 		smp->data.u.meth.meth = args[0].data.sint;
-		smp->data.u.meth.str.str = "";
-		smp->data.u.meth.str.len = 0;
+		smp->data.u.meth.str.area = "";
+		smp->data.u.meth.str.data = 0;
 	} else {
 		smp->flags |= SMP_F_CONST;
 		smp->data.u.meth.meth = HTTP_METH_OTHER;
-		smp->data.u.meth.str.str = args[0].data.str.str;
-		smp->data.u.meth.str.len = args[0].data.str.len;
+		smp->data.u.meth.str.area = args[0].data.str.area;
+		smp->data.u.meth.str.data = args[0].data.str.data;
 	}
 	return 1;
+}
+
+// This function checks the "uuid" sample's arguments.
+// Function won't get called when no parameter is specified (maybe a bug?)
+static int smp_check_uuid(struct arg *args, char **err)
+{
+	if (!args[0].type) {
+		args[0].type = ARGT_SINT;
+		args[0].data.sint = 4;
+	}
+	else if (args[0].data.sint != 4) {
+		memprintf(err, "Unsupported UUID version: '%lld'", args[0].data.sint);
+		return 0;
+	}
+
+	return 1;
+}
+
+// Generate a RFC4122 UUID (default is v4 = fully random)
+static int smp_fetch_uuid(const struct arg *args, struct sample *smp, const char *kw, void *private)
+{
+	if (args[0].data.sint == 4 || !args[0].type) {
+		ha_generate_uuid(&trash);
+		smp->data.type = SMP_T_STR;
+		smp->flags = SMP_F_VOL_TEST | SMP_F_MAY_CHANGE;
+		smp->data.u.str = trash;
+		return 1;
+	}
+
+	// more implementations of other uuid formats possible here
+	return 0;
 }
 
 /* Note: must not be declared <const> as its list will be overwritten.
@@ -2646,11 +3925,22 @@ static struct sample_fetch_kw_list smp_kws = {ILH, {
 	{ "always_false", smp_fetch_false, 0,            NULL, SMP_T_BOOL, SMP_USE_INTRN },
 	{ "always_true",  smp_fetch_true,  0,            NULL, SMP_T_BOOL, SMP_USE_INTRN },
 	{ "env",          smp_fetch_env,   ARG1(1,STR),  NULL, SMP_T_STR,  SMP_USE_INTRN },
-	{ "date",         smp_fetch_date,  ARG1(0,SINT), NULL, SMP_T_SINT, SMP_USE_INTRN },
+	{ "date",         smp_fetch_date,  ARG2(0,SINT,STR), smp_check_date_unit, SMP_T_SINT, SMP_USE_INTRN },
+	{ "date_us",      smp_fetch_date_us,  0,         NULL, SMP_T_SINT, SMP_USE_INTRN },
+	{ "hostname",     smp_fetch_hostname, 0,         NULL, SMP_T_STR,  SMP_USE_INTRN },
 	{ "nbproc",       smp_fetch_nbproc,0,            NULL, SMP_T_SINT, SMP_USE_INTRN },
 	{ "proc",         smp_fetch_proc,  0,            NULL, SMP_T_SINT, SMP_USE_INTRN },
+	{ "thread",       smp_fetch_thread,  0,          NULL, SMP_T_SINT, SMP_USE_INTRN },
 	{ "rand",         smp_fetch_rand,  ARG1(0,SINT), NULL, SMP_T_SINT, SMP_USE_INTRN },
 	{ "stopping",     smp_fetch_stopping, 0,         NULL, SMP_T_BOOL, SMP_USE_INTRN },
+	{ "stopping",     smp_fetch_stopping, 0,         NULL, SMP_T_BOOL, SMP_USE_INTRN },
+	{ "uuid",         smp_fetch_uuid,  ARG1(0, SINT),      smp_check_uuid, SMP_T_STR, SMP_USE_INTRN },
+
+	{ "cpu_calls",    smp_fetch_cpu_calls,  0,       NULL, SMP_T_SINT, SMP_USE_INTRN },
+	{ "cpu_ns_avg",   smp_fetch_cpu_ns_avg, 0,       NULL, SMP_T_SINT, SMP_USE_INTRN },
+	{ "cpu_ns_tot",   smp_fetch_cpu_ns_tot, 0,       NULL, SMP_T_SINT, SMP_USE_INTRN },
+	{ "lat_ns_avg",   smp_fetch_lat_ns_avg, 0,       NULL, SMP_T_SINT, SMP_USE_INTRN },
+	{ "lat_ns_tot",   smp_fetch_lat_ns_tot, 0,       NULL, SMP_T_SINT, SMP_USE_INTRN },
 
 	{ "str",  smp_fetch_const_str,  ARG1(1,STR),  NULL                , SMP_T_STR,  SMP_USE_INTRN },
 	{ "bool", smp_fetch_const_bool, ARG1(1,STR),  smp_check_const_bool, SMP_T_BOOL, SMP_USE_INTRN },
@@ -2663,28 +3953,62 @@ static struct sample_fetch_kw_list smp_kws = {ILH, {
 	{ /* END */ },
 }};
 
+INITCALL1(STG_REGISTER, sample_register_fetches, &smp_kws);
+
 /* Note: must not be declared <const> as its list will be overwritten */
 static struct sample_conv_kw_list sample_conv_kws = {ILH, {
-#ifdef DEBUG_EXPR
-	{ "debug",  sample_conv_debug,     0,            NULL, SMP_T_ANY,  SMP_T_ANY  },
-#endif
-
+	{ "debug",  sample_conv_debug,     ARG2(0,STR,STR), smp_check_debug, SMP_T_ANY,  SMP_T_ANY },
+	{ "b64dec", sample_conv_base642bin,0,            NULL, SMP_T_STR,  SMP_T_BIN  },
 	{ "base64", sample_conv_bin2base64,0,            NULL, SMP_T_BIN,  SMP_T_STR  },
 	{ "upper",  sample_conv_str2upper, 0,            NULL, SMP_T_STR,  SMP_T_STR  },
 	{ "lower",  sample_conv_str2lower, 0,            NULL, SMP_T_STR,  SMP_T_STR  },
+	{ "length", sample_conv_length,    0,            NULL, SMP_T_STR,  SMP_T_SINT },
 	{ "hex",    sample_conv_bin2hex,   0,            NULL, SMP_T_BIN,  SMP_T_STR  },
-	{ "ipmask", sample_conv_ipmask,    ARG1(1,MSK4), NULL, SMP_T_IPV4, SMP_T_IPV4 },
+	{ "hex2i",  sample_conv_hex2int,   0,            NULL, SMP_T_STR,  SMP_T_SINT },
+	{ "ipmask", sample_conv_ipmask,    ARG2(1,MSK4,MSK6), NULL, SMP_T_ADDR, SMP_T_IPV4 },
 	{ "ltime",  sample_conv_ltime,     ARG2(1,STR,SINT), NULL, SMP_T_SINT, SMP_T_STR },
 	{ "utime",  sample_conv_utime,     ARG2(1,STR,SINT), NULL, SMP_T_SINT, SMP_T_STR },
 	{ "crc32",  sample_conv_crc32,     ARG1(0,SINT), NULL, SMP_T_BIN,  SMP_T_SINT  },
+	{ "crc32c", sample_conv_crc32c,    ARG1(0,SINT), NULL, SMP_T_BIN,  SMP_T_SINT  },
 	{ "djb2",   sample_conv_djb2,      ARG1(0,SINT), NULL, SMP_T_BIN,  SMP_T_SINT  },
 	{ "sdbm",   sample_conv_sdbm,      ARG1(0,SINT), NULL, SMP_T_BIN,  SMP_T_SINT  },
 	{ "wt6",    sample_conv_wt6,       ARG1(0,SINT), NULL, SMP_T_BIN,  SMP_T_SINT  },
+	{ "xxh3",   sample_conv_xxh3,      ARG1(0,SINT), NULL, SMP_T_BIN,  SMP_T_SINT  },
+	{ "xxh32",  sample_conv_xxh32,     ARG1(0,SINT), NULL, SMP_T_BIN,  SMP_T_SINT  },
+	{ "xxh64",  sample_conv_xxh64,     ARG1(0,SINT), NULL, SMP_T_BIN,  SMP_T_SINT  },
 	{ "json",   sample_conv_json,      ARG1(1,STR),  sample_conv_json_check, SMP_T_STR,  SMP_T_STR },
 	{ "bytes",  sample_conv_bytes,     ARG2(1,SINT,SINT), NULL, SMP_T_BIN,  SMP_T_BIN },
-	{ "field",  sample_conv_field,     ARG2(2,SINT,STR), sample_conv_field_check, SMP_T_STR,  SMP_T_STR },
-	{ "word",   sample_conv_word,      ARG2(2,SINT,STR), sample_conv_field_check, SMP_T_STR,  SMP_T_STR },
+	{ "field",  sample_conv_field,     ARG3(2,SINT,STR,SINT), sample_conv_field_check, SMP_T_STR,  SMP_T_STR },
+	{ "word",   sample_conv_word,      ARG3(2,SINT,STR,SINT), sample_conv_field_check, SMP_T_STR,  SMP_T_STR },
 	{ "regsub", sample_conv_regsub,    ARG3(2,REG,STR,STR), sample_conv_regsub_check, SMP_T_STR, SMP_T_STR },
+	{ "sha1",   sample_conv_sha1,      0,            NULL, SMP_T_BIN,  SMP_T_BIN  },
+#ifdef USE_OPENSSL
+	{ "sha2",   sample_conv_sha2,      ARG1(0, SINT), smp_check_sha2, SMP_T_BIN,  SMP_T_BIN  },
+#if (HA_OPENSSL_VERSION_NUMBER >= 0x1000100fL)
+	{ "aes_gcm_dec", sample_conv_aes_gcm_dec,   ARG4(4,SINT,STR,STR,STR), check_aes_gcm,       SMP_T_BIN, SMP_T_BIN },
+#endif
+	{ "digest",      sample_conv_crypto_digest, ARG1(1,STR),              check_crypto_digest, SMP_T_BIN, SMP_T_BIN },
+	{ "hmac",        sample_conv_crypto_hmac,   ARG2(2,STR,STR),          check_crypto_hmac,   SMP_T_BIN, SMP_T_BIN },
+#endif
+	{ "concat", sample_conv_concat,    ARG3(1,STR,STR,STR), smp_check_concat, SMP_T_STR,  SMP_T_STR },
+	{ "strcmp", sample_conv_strcmp,    ARG1(1,STR), smp_check_strcmp, SMP_T_STR,  SMP_T_SINT },
+#ifdef USE_OPENSSL
+	{ "secure_memcmp", sample_conv_secure_memcmp,    ARG1(1,STR), smp_check_secure_memcmp, SMP_T_BIN,  SMP_T_BOOL },
+#endif
+
+	/* gRPC converters. */
+	{ "ungrpc", sample_conv_ungrpc,    ARG2(1,PBUF_FNUM,STR), sample_conv_protobuf_check, SMP_T_BIN, SMP_T_BIN  },
+	{ "protobuf", sample_conv_protobuf, ARG2(1,PBUF_FNUM,STR), sample_conv_protobuf_check, SMP_T_BIN, SMP_T_BIN  },
+
+	/* FIX converters */
+	{ "fix_is_valid",  sample_conv_fix_is_valid,  0,           NULL,                        SMP_T_BIN, SMP_T_BOOL  },
+	{ "fix_tag_value", sample_conv_fix_tag_value, ARG1(1,STR), sample_conv_fix_value_check, SMP_T_BIN, SMP_T_BIN  },
+
+	/* MQTT converters */
+	{ "mqtt_is_valid",    sample_conv_mqtt_is_valid,     0,               NULL,                               SMP_T_BIN, SMP_T_BOOL },
+	{ "mqtt_field_value", sample_conv_mqtt_field_value,  ARG2(2,STR,STR), sample_conv_mqtt_field_value_check, SMP_T_BIN, SMP_T_STR },
+
+	{ "iif", sample_conv_iif, ARG2(2, STR, STR), NULL, SMP_T_BOOL, SMP_T_STR },
 
 	{ "and",    sample_conv_binary_and, ARG1(1,STR), check_operator, SMP_T_SINT, SMP_T_SINT  },
 	{ "or",     sample_conv_binary_or,  ARG1(1,STR), check_operator, SMP_T_SINT, SMP_T_SINT  },
@@ -2701,13 +4025,11 @@ static struct sample_conv_kw_list sample_conv_kws = {ILH, {
 	{ "mod",    sample_conv_arith_mod,  ARG1(1,STR), check_operator, SMP_T_SINT, SMP_T_SINT  },
 	{ "neg",    sample_conv_arith_neg,            0, NULL, SMP_T_SINT, SMP_T_SINT  },
 
+	{ "htonl",    sample_conv_htonl,              0, NULL, SMP_T_SINT, SMP_T_BIN  },
+	{ "cut_crlf", sample_conv_cut_crlf,           0, NULL, SMP_T_STR,  SMP_T_STR  },
+	{ "ltrim",    sample_conv_ltrim,    ARG1(1,STR), NULL, SMP_T_STR,  SMP_T_STR  },
+	{ "rtrim",    sample_conv_rtrim,    ARG1(1,STR), NULL, SMP_T_STR,  SMP_T_STR  },
 	{ NULL, NULL, 0, 0, 0 },
 }};
 
-__attribute__((constructor))
-static void __sample_init(void)
-{
-	/* register sample fetch and format conversion keywords */
-	sample_register_fetches(&smp_kws);
-	sample_register_convs(&sample_conv_kws);
-}
+INITCALL1(STG_REGISTER, sample_register_convs, &sample_conv_kws);

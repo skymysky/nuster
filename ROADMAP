@@ -1,8 +1,8 @@
-Medium-long term wish list - 2016/11/25
+Medium-long term wish list - updated 2019/06/15
 
 Legend: '+' = done, '-' = todo, '*' = done except doc
 
-1.8 or later :
+2.1 or later :
   - return-html code xxx [ file "xxx" | text "xxx" ] if <acl>
 
   - return-raw  [ file "xxx" | text "xxx" ] if <acl>
@@ -11,16 +11,9 @@ Legend: '+' = done, '-' = todo, '*' = done except doc
     stream interface changes. This would result in a single analyser to wait
     for the end of data transfer in HTTP.
 
-  - support for time-ordered priority queues with ability to add an offset
-    based on request matching. Each session will have one ebtree node to be
-    attached to whatever queue the session is waiting in.
-
   - make it possible to condition a timeout on an ACL (dynamic timeouts)
 
   - forwardfor/originalto except with IPv6
-
-  - remove lots of remaining Alert() calls or ensure that they forward to
-    send_log() after the fork.
 
   - tcp-request session expect-proxy {L4|L5} if ...
 
@@ -50,8 +43,6 @@ Old, maybe obsolete points :
   - 3 memory models : failsafe (prealloc), normal (current), optimal (alloc on
     demand)
 
-  - implement support for event-triggerred epoll()
-
   - verify if it would be worth implementing an epoll_ctl_batch() for Linux
 
   - option minservers XXX : activates some spare servers when active servers
@@ -64,11 +55,7 @@ Old, maybe obsolete points :
     the server's name or cookie in a header so that the server knows it.
 
 Unsorted :
-  - outgoing log load-balancing (round-robin or hash among multiple servers)
-
   - internal socket for "server XXX frontend:name"
-
-  - HTTP/2.0
 
   - XML inspection (content-switching for SOAP requests)
 
@@ -77,8 +64,6 @@ Unsorted :
   - fastcgi to servers
 
   - hot config reload
-
-  - RAM-based cache for small files
 
   - RHI - BGP
 

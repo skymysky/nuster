@@ -24,63 +24,76 @@
 #include <sys/time.h>
 #include <sys/uio.h>
 
-#include <common/config.h>
-#include <common/compat.h>
-#include <common/standard.h>
-#include <common/time.h>
+#include <haproxy/api.h>
+#include <haproxy/applet-t.h>
+#include <haproxy/cfgparse.h>
+#include <haproxy/cli.h>
+#include <haproxy/fd.h>
+#include <haproxy/frontend.h>
+#include <haproxy/global.h>
+#include <haproxy/http.h>
+#include <haproxy/listener.h>
+#include <haproxy/log.h>
+#include <haproxy/proxy.h>
+#include <haproxy/ring.h>
+#include <haproxy/sample.h>
+#include <haproxy/sink.h>
+#include <haproxy/ssl_sock.h>
+#include <haproxy/stream.h>
+#include <haproxy/stream_interface.h>
+#include <haproxy/time.h>
+#include <haproxy/tools.h>
+#include <haproxy/version.h>
 
-#include <types/global.h>
-#include <types/log.h>
+/* global recv logs counter */
+int cum_log_messages;
 
-#include <proto/frontend.h>
-#include <proto/proto_http.h>
-#include <proto/log.h>
-#include <proto/sample.h>
-#include <proto/stream.h>
-#include <proto/stream_interface.h>
-#ifdef USE_OPENSSL
-#include <proto/ssl_sock.h>
-#endif
+/* log forward proxy list */
+struct proxy *cfg_log_forward;
 
-struct log_fmt {
+struct log_fmt_st {
 	char *name;
-	struct {
-		struct chunk sep1; /* first pid separator */
-		struct chunk sep2; /* second pid separator */
-	} pid;
 };
 
-static const struct log_fmt log_formats[LOG_FORMATS] = {
+static const struct log_fmt_st log_formats[LOG_FORMATS] = {
+	[LOG_FORMAT_LOCAL] = {
+		.name = "local",
+	},
 	[LOG_FORMAT_RFC3164] = {
 		.name = "rfc3164",
-		.pid = {
-			.sep1 = { .str = "[",   .len = 1 },
-			.sep2 = { .str = "]: ", .len = 3 }
-		}
 	},
 	[LOG_FORMAT_RFC5424] = {
 		.name = "rfc5424",
-		.pid = {
-			.sep1 = { .str = " ",   .len = 1 },
-			.sep2 = { .str = " - ", .len = 3 }
-		}
-	}
+	},
+	[LOG_FORMAT_PRIO] = {
+		.name = "priority",
+	},
+	[LOG_FORMAT_SHORT] = {
+		.name = "short",
+	},
+	[LOG_FORMAT_TIMED] = {
+		.name = "timed",
+	},
+	[LOG_FORMAT_ISO] = {
+		.name = "iso",
+	},
+	[LOG_FORMAT_RAW] = {
+		.name = "raw",
+	},
 };
 
-#define FD_SETS_ARE_BITFIELDS
-#ifdef FD_SETS_ARE_BITFIELDS
 /*
  * This map is used with all the FD_* macros to check whether a particular bit
- * is set or not. Each bit represents an ACSII code. FD_SET() sets those bytes
- * which should be escaped. When FD_ISSET() returns non-zero, it means that the
- * byte should be escaped. Be careful to always pass bytes from 0 to 255
- * exclusively to the macros.
+ * is set or not. Each bit represents an ACSII code. ha_bit_set() sets those
+ * bytes which should be escaped. When ha_bit_test() returns non-zero, it means
+ * that the byte should be escaped. Be careful to always pass bytes from 0 to
+ * 255 exclusively to the macros.
  */
-fd_set rfc5424_escape_map[(sizeof(fd_set) > (256/8)) ? 1 : ((256/8) / sizeof(fd_set))];
+long rfc5424_escape_map[(256/8) / sizeof(long)];
+long hdr_encode_map[(256/8) / sizeof(long)];
+long url_encode_map[(256/8) / sizeof(long)];
+long http_encode_map[(256/8) / sizeof(long)];
 
-#else
-#error "Check if your OS uses bitfields for fd_sets"
-#endif
 
 const char *log_facilities[NB_LOG_FACILITIES] = {
 	"kern", "user", "mail", "daemon",
@@ -121,7 +134,7 @@ static const struct logformat_type logformat_keywords[] = {
 	{ "CC", LOG_FMT_CCLIENT, PR_MODE_HTTP, LW_REQHDR, NULL },  /* client cookie */
 	{ "CS", LOG_FMT_CSERVER, PR_MODE_HTTP, LW_RSPHDR, NULL },  /* server cookie */
 	{ "H", LOG_FMT_HOSTNAME, PR_MODE_TCP, LW_INIT, NULL }, /* Hostname */
-	{ "ID", LOG_FMT_UNIQUEID, PR_MODE_HTTP, LW_BYTES, NULL }, /* Unique ID */
+	{ "ID", LOG_FMT_UNIQUEID, PR_MODE_TCP, LW_BYTES, NULL }, /* Unique ID */
 	{ "ST", LOG_FMT_STATUS, PR_MODE_TCP, LW_RESP, NULL },   /* status code */
 	{ "T", LOG_FMT_DATEGMT, PR_MODE_TCP, LW_INIT, NULL },   /* date GMT */
 	{ "Ta", LOG_FMT_Ta, PR_MODE_HTTP, LW_BYTES, NULL },      /* Time active (tr to end) */
@@ -135,6 +148,7 @@ static const struct logformat_type logformat_keywords[] = {
 	{ "Td", LOG_FMT_TD, PR_MODE_TCP, LW_BYTES, NULL },       /* Td = Tt - (Tq + Tw + Tc + Tr) */
 	{ "Ts", LOG_FMT_TS, PR_MODE_TCP, LW_INIT, NULL },   /* timestamp GMT */
 	{ "Tt", LOG_FMT_TT, PR_MODE_TCP, LW_BYTES, NULL },       /* Tt */
+	{ "Tu", LOG_FMT_TU, PR_MODE_TCP, LW_BYTES, NULL },       /* Tu = Tt -Ti */
 	{ "Tw", LOG_FMT_TW, PR_MODE_TCP, LW_BYTES, NULL },       /* Tw */
 	{ "U", LOG_FMT_BYTES_UP, PR_MODE_TCP, LW_BYTES, NULL },  /* bytes from client to server */
 	{ "ac", LOG_FMT_ACTCONN, PR_MODE_TCP, LW_BYTES, NULL },  /* actconn */
@@ -155,7 +169,8 @@ static const struct logformat_type logformat_keywords[] = {
 	{ "hs", LOG_FMT_HDRRESPONS, PR_MODE_TCP, LW_RSPHDR, NULL },  /* header response */
 	{ "hsl", LOG_FMT_HDRRESPONSLIST, PR_MODE_TCP, LW_RSPHDR, NULL },  /* header response list */
 	{ "HM", LOG_FMT_HTTP_METHOD, PR_MODE_HTTP, LW_REQ, NULL },  /* HTTP method */
-	{ "HP", LOG_FMT_HTTP_PATH, PR_MODE_HTTP, LW_REQ, NULL },  /* HTTP path */
+	{ "HP", LOG_FMT_HTTP_PATH, PR_MODE_HTTP, LW_REQ, NULL },  /* HTTP relative or absolute path */
+	{ "HPO", LOG_FMT_HTTP_PATH_ONLY, PR_MODE_HTTP, LW_REQ, NULL }, /* HTTP path only (without host nor query string) */
 	{ "HQ", LOG_FMT_HTTP_QUERY, PR_MODE_HTTP, LW_REQ, NULL },  /* HTTP query */
 	{ "HU", LOG_FMT_HTTP_URI, PR_MODE_HTTP, LW_REQ, NULL },  /* HTTP full URI */
 	{ "HV", LOG_FMT_HTTP_VERSION, PR_MODE_HTTP, LW_REQ, NULL },  /* HTTP version */
@@ -204,26 +219,22 @@ char *log_format = NULL;
  */
 char default_rfc5424_sd_log_format[] = "- ";
 
-/* This is a global syslog header, common to all outgoing messages in
- * RFC3164 format. It begins with time-based part and is updated by
- * update_log_hdr().
- */
-char *logheader = NULL;
-
-/* This is a global syslog header for messages in RFC5424 format. It is
- * updated by update_log_hdr_rfc5424().
- */
-char *logheader_rfc5424 = NULL;
+/* total number of dropped logs */
+unsigned int dropped_logs = 0;
 
 /* This is a global syslog message buffer, common to all outgoing
  * messages. It contains only the data part.
  */
-char *logline = NULL;
+THREAD_LOCAL char *logline = NULL;
 
 /* A global syslog message buffer, common to all RFC5424 syslog messages.
  * Currently, it is used for generating the structured-data part.
  */
-char *logline_rfc5424 = NULL;
+THREAD_LOCAL char *logline_rfc5424 = NULL;
+
+/* A global buffer used to store all startup alerts/warnings. It will then be
+ * retrieve on the CLI. */
+static struct ring *startup_logs = NULL;
 
 struct logformat_var_args {
 	char *name;
@@ -271,6 +282,10 @@ static inline const char *fmt_directive(const struct proxy *curproxy)
 		return "spoe-message";
 	case ARGC_UBK:
 		return "use_backend";
+	case ARGC_HERR:
+		return "http-error";
+	case ARGC_OT:
+		return "ot-scope";
 	default:
 		return "undefined(please report this bug)"; /* must never happen */
 	}
@@ -350,7 +365,7 @@ int parse_logformat_var_args(char *args, struct logformat_node *node, char **err
 int parse_logformat_var(char *arg, int arg_len, char *var, int var_len, struct proxy *curproxy, struct list *list_format, int *defoptions, char **err)
 {
 	int j;
-	struct logformat_node *node;
+	struct logformat_node *node = NULL;
 
 	for (j = 0; logformat_keywords[j].name; j++) { // search a log type
 		if (strlen(logformat_keywords[j].name) == var_len &&
@@ -359,14 +374,14 @@ int parse_logformat_var(char *arg, int arg_len, char *var, int var_len, struct p
 				node = calloc(1, sizeof(*node));
 				if (!node) {
 					memprintf(err, "out of memory error");
-					return 0;
+					goto error_free;
 				}
 				node->type = logformat_keywords[j].type;
 				node->options = *defoptions;
 				if (arg_len) {
 					node->arg = my_strndup(arg, arg_len);
 					if (!parse_logformat_var_args(node->arg, node, err))
-						return 0;
+						goto error_free;
 				}
 				if (node->type == LOG_FMT_GLOBAL) {
 					*defoptions = node->options;
@@ -375,20 +390,20 @@ int parse_logformat_var(char *arg, int arg_len, char *var, int var_len, struct p
 				} else {
 					if (logformat_keywords[j].config_callback &&
 					    logformat_keywords[j].config_callback(node, curproxy) != 0) {
-						return 0;
+						goto error_free;
 					}
 					curproxy->to_log |= logformat_keywords[j].lw;
 					LIST_ADDQ(list_format, &node->list);
 				}
 				if (logformat_keywords[j].replace_by)
-					Warning("parsing [%s:%d] : deprecated variable '%s' in '%s', please replace it with '%s'.\n",
-					        curproxy->conf.args.file, curproxy->conf.args.line,
-					        logformat_keywords[j].name, fmt_directive(curproxy), logformat_keywords[j].replace_by);
+					ha_warning("parsing [%s:%d] : deprecated variable '%s' in '%s', please replace it with '%s'.\n",
+						   curproxy->conf.args.file, curproxy->conf.args.line,
+						   logformat_keywords[j].name, fmt_directive(curproxy), logformat_keywords[j].replace_by);
 				return 1;
 			} else {
 				memprintf(err, "format variable '%s' is reserved for HTTP mode",
 				          logformat_keywords[j].name);
-				return 0;
+				goto error_free;
 			}
 		}
 	}
@@ -397,6 +412,12 @@ int parse_logformat_var(char *arg, int arg_len, char *var, int var_len, struct p
 	var[var_len] = 0;
 	memprintf(err, "no such format variable '%s'. If you wanted to emit the '%%' character verbatim, you need to use '%%%%'", var);
 	var[var_len] = j;
+
+  error_free:
+	if (node) {
+		free(node->arg);
+		free(node);
+	}
 	return 0;
 }
 
@@ -442,31 +463,33 @@ int add_to_logformat_list(char *start, char *end, int type, struct list *list_fo
 /*
  * Parse the sample fetch expression <text> and add a node to <list_format> upon
  * success. At the moment, sample converters are not yet supported but fetch arguments
- * should work. The curpx->conf.args.ctx must be set by the caller.
+ * should work. The curpx->conf.args.ctx must be set by the caller. If an end pointer
+ * is passed in <endptr>, it will be updated with the pointer to the first character
+ * not part of the sample expression.
  *
  * In error case, the function returns 0, otherwise it returns 1.
  */
-int add_sample_to_logformat_list(char *text, char *arg, int arg_len, struct proxy *curpx, struct list *list_format, int options, int cap, char **err)
+int add_sample_to_logformat_list(char *text, char *arg, int arg_len, struct proxy *curpx, struct list *list_format, int options, int cap, char **err, char **endptr)
 {
 	char *cmd[2];
-	struct sample_expr *expr;
-	struct logformat_node *node;
+	struct sample_expr *expr = NULL;
+	struct logformat_node *node = NULL;
 	int cmd_arg;
 
 	cmd[0] = text;
 	cmd[1] = "";
 	cmd_arg = 0;
 
-	expr = sample_parse_expr(cmd, &cmd_arg, curpx->conf.args.file, curpx->conf.args.line, err, &curpx->conf.args);
+	expr = sample_parse_expr(cmd, &cmd_arg, curpx->conf.args.file, curpx->conf.args.line, err, &curpx->conf.args, endptr);
 	if (!expr) {
 		memprintf(err, "failed to parse sample expression <%s> : %s", text, *err);
-		return 0;
+		goto error_free;
 	}
 
 	node = calloc(1, sizeof(*node));
 	if (!node) {
 		memprintf(err, "out of memory error");
-		return 0;
+		goto error_free;
 	}
 	node->type = LOG_FMT_EXPR;
 	node->expr = expr;
@@ -475,7 +498,7 @@ int add_sample_to_logformat_list(char *text, char *arg, int arg_len, struct prox
 	if (arg_len) {
 		node->arg = my_strndup(arg, arg_len);
 		if (!parse_logformat_var_args(node->arg, node, err))
-			return 0;
+			goto error_free;
 	}
 	if (expr->fetch->val & cap & SMP_VAL_REQUEST)
 		node->options |= LOG_OPT_REQ_CAP; /* fetch method is request-compatible */
@@ -486,10 +509,10 @@ int add_sample_to_logformat_list(char *text, char *arg, int arg_len, struct prox
 	if (!(expr->fetch->val & cap)) {
 		memprintf(err, "sample fetch <%s> may not be reliably used here because it needs '%s' which is not available here",
 		          text, sample_src_names(expr->fetch->use));
-		return 0;
+		goto error_free;
 	}
 
-	/* check if we need to allocate an hdr_idx struct for HTTP parsing */
+	/* check if we need to allocate an http_txn struct for HTTP parsing */
 	/* Note, we may also need to set curpx->to_log with certain fetches */
 	curpx->http_needed |= !!(expr->fetch->use & SMP_USE_HTTP_ANY);
 
@@ -498,9 +521,18 @@ int add_sample_to_logformat_list(char *text, char *arg, int arg_len, struct prox
 	 * now on, but this will leave with sample capabilities soon.
 	 */
 	curpx->to_log |= LW_XPRT;
-	curpx->to_log |= LW_REQ;
+	if (curpx->http_needed)
+		curpx->to_log |= LW_REQ;
 	LIST_ADDQ(list_format, &node->list);
 	return 1;
+
+  error_free:
+	release_sample_expr(expr);
+	if (node) {
+		free(node->arg);
+		free(node);
+	}
+	return 0;
 }
 
 /*
@@ -509,7 +541,7 @@ int add_sample_to_logformat_list(char *text, char *arg, int arg_len, struct prox
  * You can set arguments using { } : %{many arguments}varname.
  * The curproxy->conf.args.ctx must be set by the caller.
  *
- *  str: the string to parse
+ *  fmt: the string to parse
  *  curproxy: the proxy affected
  *  list_format: the destination list
  *  options: LOG_OPT_* to force on every node
@@ -538,6 +570,8 @@ int parse_logformat_string(const char *fmt, struct proxy *curproxy, struct list 
 	/* flush the list first. */
 	list_for_each_entry_safe(tmplf, back, list_format, list) {
 		LIST_DEL(&tmplf->list);
+		release_sample_expr(tmplf->expr);
+		free(tmplf->arg);
 		free(tmplf);
 	}
 
@@ -547,7 +581,7 @@ int parse_logformat_string(const char *fmt, struct proxy *curproxy, struct list 
 		if (!*str)
 			cformat = LF_END;              // preset it to save all states from doing this
 
-		/* The prinicple of the two-step state machine below is to first detect a change, and
+		/* The principle of the two-step state machine below is to first detect a change, and
 		 * second have all common paths processed at one place. The common paths are the ones
 		 * encountered in text areas (LF_INIT, LF_TEXT, LF_SEPARATOR) and at the end (LF_END).
 		 * We use the common LF_INIT state to dispatch to the different final states.
@@ -569,7 +603,7 @@ int parse_logformat_string(const char *fmt, struct proxy *curproxy, struct list 
 				var = str;
 			}
 			else if (*str == '%')
-				cformat = LF_TEXT;     // convert this character to a litteral (useful for '%')
+				cformat = LF_TEXT;     // convert this character to a literal (useful for '%')
 			else if (isdigit((unsigned char)*str) || *str == ' ' || *str == '\t') {
 				/* single '%' followed by blank or digit, send them both */
 				cformat = LF_TEXT;
@@ -577,11 +611,11 @@ int parse_logformat_string(const char *fmt, struct proxy *curproxy, struct list 
 				sp = str - 1; /* send both the '%' and the current char */
 				memprintf(err, "unexpected variable name near '%c' at position %d line : '%s'. Maybe you want to write a single '%%', use the syntax '%%%%'",
 				          *str, (int)(str - backfmt), fmt);
-				return 0;
+				goto fail;
 
 			}
 			else
-				cformat = LF_INIT;     // handle other cases of litterals
+				cformat = LF_INIT;     // handle other cases of literals
 			break;
 
 		case LF_STARG:                         // text immediately following '%{'
@@ -604,13 +638,30 @@ int parse_logformat_string(const char *fmt, struct proxy *curproxy, struct list 
 				break;
 			}
 			memprintf(err, "parse argument modifier without variable name near '%%{%s}'", arg);
-			return 0;
+			goto fail;
 
 		case LF_STEXPR:                        // text immediately following '%['
-			if (*str == ']') {             // end of arg
-				cformat = LF_EDEXPR;
-				var_len = str - var;
-				*str = 0;              // needed for parsing the expression
+			/* the whole sample expression is parsed at once,
+			 * returning the pointer to the first character not
+			 * part of the expression, which MUST be the trailing
+			 * angle bracket.
+			 */
+			if (!add_sample_to_logformat_list(var, arg, arg_len, curproxy, list_format, options, cap, err, &str))
+				goto fail;
+
+			if (*str == ']') {
+				// end of arg, go on with next state
+				cformat = pformat = LF_EDEXPR;
+				sp = str;
+			}
+			else {
+				char c = *str;
+				*str = 0;
+				if (isprint((unsigned char)c))
+					memprintf(err, "expected ']' after '%s', but found '%c'", var, c);
+				else
+					memprintf(err, "missing ']' after '%s'", var);
+				goto fail;
 			}
 			break;
 
@@ -627,8 +678,13 @@ int parse_logformat_string(const char *fmt, struct proxy *curproxy, struct list 
 		if (cformat == LF_INIT) { /* resynchronize state to text/sep/startvar */
 			switch (*str) {
 			case '%': cformat = LF_STARTVAR;  break;
-			case ' ': cformat = LF_SEPARATOR; break;
 			case  0 : cformat = LF_END;       break;
+			case ' ':
+				if (options & LOG_OPT_MERGE_SPACES) {
+					cformat = LF_SEPARATOR;
+					break;
+				}
+				/* fall through */
 			default : cformat = LF_TEXT;      break;
 			}
 		}
@@ -637,16 +693,12 @@ int parse_logformat_string(const char *fmt, struct proxy *curproxy, struct list 
 			switch (pformat) {
 			case LF_VAR:
 				if (!parse_logformat_var(arg, arg_len, var, var_len, curproxy, list_format, &options, err))
-					return 0;
-				break;
-			case LF_STEXPR:
-				if (!add_sample_to_logformat_list(var, arg, arg_len, curproxy, list_format, options, cap, err))
-					return 0;
+					goto fail;
 				break;
 			case LF_TEXT:
 			case LF_SEPARATOR:
 				if (!add_to_logformat_list(sp, str, pformat, list_format, err))
-					return 0;
+					goto fail;
 				break;
 			}
 			sp = str; /* new start of text at every state switch and at every separator */
@@ -655,30 +707,406 @@ int parse_logformat_string(const char *fmt, struct proxy *curproxy, struct list 
 
 	if (pformat == LF_STARTVAR || pformat == LF_STARG || pformat == LF_STEXPR) {
 		memprintf(err, "truncated line after '%s'", var ? var : arg ? arg : "%");
-		return 0;
+		goto fail;
 	}
 	free(backfmt);
 
 	return 1;
+ fail:
+	free(backfmt);
+	return 0;
+}
+
+/*
+ * Parse the first range of indexes from a string made of a list of comma separated
+ * ranges of indexes. Note that an index may be considered as a particular range
+ * with a high limit to the low limit.
+ */
+int get_logsrv_smp_range(unsigned int *low, unsigned int *high, char **arg, char **err)
+{
+	char *end, *p;
+
+	*low = *high = 0;
+
+	p = *arg;
+	end = strchr(p, ',');
+	if (!end)
+		end = p + strlen(p);
+
+	*high = *low = read_uint((const char **)&p, end);
+	if (!*low || (p != end && *p != '-'))
+		goto err;
+
+	if (p == end)
+		goto done;
+
+	p++;
+	*high = read_uint((const char **)&p, end);
+	if (!*high || *high <= *low || p != end)
+		goto err;
+
+ done:
+	if (*end == ',')
+		end++;
+	*arg = end;
+	return 1;
+
+ err:
+	memprintf(err, "wrong sample range '%s'", *arg);
+	return 0;
+}
+
+/*
+ * Returns 1 if the range defined by <low> and <high> overlaps
+ * one of them in <rgs> array of ranges with <sz> the size of this
+ * array, 0 if not.
+ */
+int smp_log_ranges_overlap(struct smp_log_range *rgs, size_t sz,
+                           unsigned int low, unsigned int high, char **err)
+{
+	size_t i;
+
+	for (i = 0; i < sz; i++) {
+		if ((low  >= rgs[i].low && low  <= rgs[i].high) ||
+		    (high >= rgs[i].low && high <= rgs[i].high)) {
+			memprintf(err, "ranges are overlapping");
+			return 1;
+		}
+	}
+
+	return 0;
+}
+
+int smp_log_range_cmp(const void *a, const void *b)
+{
+	const struct smp_log_range *rg_a = a;
+	const struct smp_log_range *rg_b = b;
+
+	if (rg_a->high < rg_b->low)
+		return -1;
+	else if (rg_a->low > rg_b->high)
+		return 1;
+
+	return 0;
+}
+
+/*
+ * Parse "log" keyword and update <logsrvs> list accordingly.
+ *
+ * When <do_del> is set, it means the "no log" line was parsed, so all log
+ * servers in <logsrvs> are released.
+ *
+ * Otherwise, we try to parse the "log" line. First of all, when the list is not
+ * the global one, we look for the parameter "global". If we find it,
+ * global.logsrvs is copied. Else we parse each arguments.
+ *
+ * The function returns 1 in success case, otherwise, it returns 0 and err is
+ * filled.
+ */
+int parse_logsrv(char **args, struct list *logsrvs, int do_del, char **err)
+{
+	struct smp_log_range *smp_rgs = NULL;
+	struct sockaddr_storage *sk;
+	struct logsrv *logsrv = NULL;
+	int port1, port2;
+	int cur_arg;
+	int fd;
+
+	/*
+	 * "no log": delete previous herited or defined syslog
+	 *           servers.
+	 */
+	if (do_del) {
+		struct logsrv *back;
+
+		if (*(args[1]) != 0) {
+			memprintf(err, "'no log' does not expect arguments");
+			goto error;
+		}
+
+		list_for_each_entry_safe(logsrv, back, logsrvs, list) {
+			LIST_DEL(&logsrv->list);
+			free(logsrv);
+		}
+		return 1;
+	}
+
+	/*
+	 * "log global": copy global.logrsvs linked list to the end of logsrvs
+	 *               list. But first, we check (logsrvs != global.logsrvs).
+	 */
+	if (*(args[1]) && *(args[2]) == 0 && strcmp(args[1], "global") == 0) {
+		if (logsrvs == &global.logsrvs) {
+			memprintf(err, "'global' is not supported for a global syslog server");
+			goto error;
+		}
+		list_for_each_entry(logsrv, &global.logsrvs, list) {
+			struct logsrv *node;
+
+			list_for_each_entry(node, logsrvs, list) {
+				if (node->ref == logsrv)
+					goto skip_logsrv;
+			}
+
+			node = malloc(sizeof(*node));
+			memcpy(node, logsrv, sizeof(struct logsrv));
+			node->ref = logsrv;
+			LIST_INIT(&node->list);
+			LIST_ADDQ(logsrvs, &node->list);
+
+		  skip_logsrv:
+			continue;
+		}
+		return 1;
+	}
+
+	/*
+	* "log <address> ...: parse a syslog server line
+	*/
+	if (*(args[1]) == 0 || *(args[2]) == 0) {
+		memprintf(err, "expects <address> and <facility> %s as arguments",
+			  ((logsrvs == &global.logsrvs) ? "" : "or global"));
+		goto error;
+	}
+
+	/* take care of "stdout" and "stderr" as regular aliases for fd@1 / fd@2 */
+	if (strcmp(args[1], "stdout") == 0)
+		args[1] = "fd@1";
+	else if (strcmp(args[1], "stderr") == 0)
+		args[1] = "fd@2";
+
+	logsrv = calloc(1, sizeof(*logsrv));
+	if (!logsrv) {
+		memprintf(err, "out of memory");
+		goto error;
+	}
+
+	/* skip address for now, it will be parsed at the end */
+	cur_arg = 2;
+
+	/* just after the address, a length may be specified */
+	logsrv->maxlen = MAX_SYSLOG_LEN;
+	if (strcmp(args[cur_arg], "len") == 0) {
+		int len = atoi(args[cur_arg+1]);
+		if (len < 80 || len > 65535) {
+			memprintf(err, "invalid log length '%s', must be between 80 and 65535",
+				  args[cur_arg+1]);
+			goto error;
+		}
+		logsrv->maxlen = len;
+		cur_arg += 2;
+	}
+	if (logsrv->maxlen > global.max_syslog_len)
+		global.max_syslog_len = logsrv->maxlen;
+
+	/* after the length, a format may be specified */
+	if (strcmp(args[cur_arg], "format") == 0) {
+		logsrv->format = get_log_format(args[cur_arg+1]);
+		if (logsrv->format == LOG_FORMAT_UNSPEC) {
+			memprintf(err, "unknown log format '%s'", args[cur_arg+1]);
+			goto error;
+		}
+		cur_arg += 2;
+	}
+
+	if (strcmp(args[cur_arg], "sample") == 0) {
+		unsigned low, high;
+		char *p, *beg, *end, *smp_sz_str;
+		size_t smp_rgs_sz = 0, smp_sz = 0, new_smp_sz;
+
+		p = args[cur_arg+1];
+		smp_sz_str = strchr(p, ':');
+		if (!smp_sz_str) {
+			memprintf(err, "Missing sample size");
+			goto error;
+		}
+
+		*smp_sz_str++ = '\0';
+
+		end = p + strlen(p);
+
+		while (p != end) {
+			if (!get_logsrv_smp_range(&low, &high, &p, err))
+				goto error;
+
+			if (smp_rgs && smp_log_ranges_overlap(smp_rgs, smp_rgs_sz, low, high, err))
+				goto error;
+
+			smp_rgs = my_realloc2(smp_rgs, (smp_rgs_sz + 1) * sizeof *smp_rgs);
+			if (!smp_rgs) {
+				memprintf(err, "out of memory error");
+				goto error;
+			}
+
+			smp_rgs[smp_rgs_sz].low = low;
+			smp_rgs[smp_rgs_sz].high = high;
+			smp_rgs[smp_rgs_sz].sz = high - low + 1;
+			smp_rgs[smp_rgs_sz].curr_idx = 0;
+			if (smp_rgs[smp_rgs_sz].high > smp_sz)
+				smp_sz = smp_rgs[smp_rgs_sz].high;
+			smp_rgs_sz++;
+		}
+
+		if (smp_rgs == NULL) {
+			memprintf(err, "no sampling ranges given");
+			goto error;
+		}
+
+		beg = smp_sz_str;
+		end = beg + strlen(beg);
+		new_smp_sz = read_uint((const char **)&beg, end);
+		if (!new_smp_sz || beg != end) {
+			memprintf(err, "wrong sample size '%s' for sample range '%s'",
+						   smp_sz_str, args[cur_arg+1]);
+			goto error;
+		}
+
+		if (new_smp_sz < smp_sz) {
+			memprintf(err, "sample size %zu should be greater or equal to "
+						   "%zu the maximum of the high ranges limits",
+						   new_smp_sz, smp_sz);
+			goto error;
+		}
+		smp_sz = new_smp_sz;
+
+		/* Let's order <smp_rgs> array. */
+		qsort(smp_rgs, smp_rgs_sz, sizeof(struct smp_log_range), smp_log_range_cmp);
+
+		logsrv->lb.smp_rgs = smp_rgs;
+		logsrv->lb.smp_rgs_sz = smp_rgs_sz;
+		logsrv->lb.smp_sz = smp_sz;
+
+		cur_arg += 2;
+	}
+	HA_SPIN_INIT(&logsrv->lock);
+	/* parse the facility */
+	logsrv->facility = get_log_facility(args[cur_arg]);
+	if (logsrv->facility < 0) {
+		memprintf(err, "unknown log facility '%s'", args[cur_arg]);
+		goto error;
+	}
+	cur_arg++;
+
+	/* parse the max syslog level (default: debug) */
+	logsrv->level = 7;
+	if (*(args[cur_arg])) {
+		logsrv->level = get_log_level(args[cur_arg]);
+		if (logsrv->level < 0) {
+			memprintf(err, "unknown optional log level '%s'", args[cur_arg]);
+			goto error;
+		}
+		cur_arg++;
+	}
+
+	/* parse the limit syslog level (default: emerg) */
+	logsrv->minlvl = 0;
+	if (*(args[cur_arg])) {
+		logsrv->minlvl = get_log_level(args[cur_arg]);
+		if (logsrv->minlvl < 0) {
+			memprintf(err, "unknown optional minimum log level '%s'", args[cur_arg]);
+			goto error;
+		}
+		cur_arg++;
+	}
+
+	/* Too many args */
+	if (*(args[cur_arg])) {
+		memprintf(err, "cannot handle unexpected argument '%s'", args[cur_arg]);
+		goto error;
+	}
+
+	/* now, back to the address */
+	logsrv->type = LOG_TARGET_DGRAM;
+	if (strncmp(args[1], "ring@", 5) == 0) {
+		logsrv->addr.ss_family = AF_UNSPEC;
+		logsrv->type = LOG_TARGET_BUFFER;
+		logsrv->sink = NULL;
+		logsrv->ring_name = strdup(args[1] + 5);
+		goto done;
+	}
+
+	sk = str2sa_range(args[1], NULL, &port1, &port2, &fd, NULL,
+	                  err, NULL, NULL, PA_O_RESOLVE | PA_O_PORT_OK | PA_O_RAW_FD | PA_O_DGRAM);
+	if (!sk)
+		goto error;
+
+	if (fd != -1)
+		logsrv->type = LOG_TARGET_FD;
+	logsrv->addr = *sk;
+
+	if (sk->ss_family == AF_INET || sk->ss_family == AF_INET6) {
+		logsrv->addr = *sk;
+		if (!port1)
+			set_host_port(&logsrv->addr, SYSLOG_PORT);
+	}
+ done:
+	LIST_ADDQ(logsrvs, &logsrv->list);
+	return 1;
+
+  error:
+	free(smp_rgs);
+	if (logsrv)
+		free(logsrv->ring_name);
+	free(logsrv);
+	return 0;
+}
+
+
+/* Generic function to display messages prefixed by a label */
+static void print_message(const char *label, const char *fmt, va_list argp)
+{
+	struct tm tm;
+	char *head, *msg;
+
+	head = msg = NULL;
+
+	get_localtime(date.tv_sec, &tm);
+	memprintf(&head, "[%s] %03d/%02d%02d%02d (%d) : ",
+		  label, tm.tm_yday, tm.tm_hour, tm.tm_min, tm.tm_sec, (int)getpid());
+	memvprintf(&msg, fmt, argp);
+
+	if (global.mode & MODE_STARTING) {
+		if (unlikely(!startup_logs))
+			startup_logs = ring_new(STARTUP_LOG_SIZE);
+
+		if (likely(startup_logs)) {
+			struct ist m[2];
+
+			m[0] = ist(head);
+			m[1] = ist(msg);
+			/* trim the trailing '\n' */
+			if (m[1].len > 0 && m[1].ptr[m[1].len - 1] == '\n')
+				m[1].len--;
+			ring_write(startup_logs, ~0, 0, 0, m, 2);
+		}
+	}
+
+	fprintf(stderr, "%s%s", head, msg);
+	fflush(stderr);
+
+	free(head);
+	free(msg);
 }
 
 /*
  * Displays the message on stderr with the date and pid. Overrides the quiet
  * mode during startup.
  */
-void Alert(const char *fmt, ...)
+void ha_alert(const char *fmt, ...)
 {
 	va_list argp;
-	struct tm tm;
 
 	if (!(global.mode & MODE_QUIET) || (global.mode & (MODE_VERBOSE | MODE_STARTING))) {
-		va_start(argp, fmt);
+		if (!(warned & WARN_EXEC_PATH)) {
+			const char *path = get_exec_path();
 
-		get_localtime(date.tv_sec, &tm);
-		fprintf(stderr, "[ALERT] %03d/%02d%02d%02d (%d) : ",
-			tm.tm_yday, tm.tm_hour, tm.tm_min, tm.tm_sec, (int)getpid());
-		vfprintf(stderr, fmt, argp);
-		fflush(stderr);
+			warned |= WARN_EXEC_PATH;
+			ha_notice("haproxy version is %s\n", haproxy_version);
+			if (path)
+				ha_notice("path to executable is %s\n", path);
+		}
+		va_start(argp, fmt);
+		print_message("ALERT", fmt, argp);
 		va_end(argp);
 	}
 }
@@ -687,19 +1115,29 @@ void Alert(const char *fmt, ...)
 /*
  * Displays the message on stderr with the date and pid.
  */
-void Warning(const char *fmt, ...)
+void ha_warning(const char *fmt, ...)
 {
 	va_list argp;
-	struct tm tm;
+
+	warned |= WARN_ANY;
 
 	if (!(global.mode & MODE_QUIET) || (global.mode & MODE_VERBOSE)) {
 		va_start(argp, fmt);
+		print_message("WARNING", fmt, argp);
+		va_end(argp);
+	}
+}
 
-		get_localtime(date.tv_sec, &tm);
-		fprintf(stderr, "[WARNING] %03d/%02d%02d%02d (%d) : ",
-			tm.tm_yday, tm.tm_hour, tm.tm_min, tm.tm_sec, (int)getpid());
-		vfprintf(stderr, fmt, argp);
-		fflush(stderr);
+/*
+ * Displays the message on stderr with the date and pid.
+ */
+void ha_notice(const char *fmt, ...)
+{
+	va_list argp;
+
+	if (!(global.mode & MODE_QUIET) || (global.mode & MODE_VERBOSE)) {
+		va_start(argp, fmt);
+		print_message("NOTICE", fmt, argp);
 		va_end(argp);
 	}
 }
@@ -720,16 +1158,18 @@ void qfprintf(FILE *out, const char *fmt, ...)
 }
 
 /*
- * returns log format for <fmt> or -1 if not found.
+ * returns log format, LOG_FORMAT_UNSPEC is return if not found.
  */
-int get_log_format(const char *fmt)
+enum log_fmt get_log_format(const char *fmt)
 {
-	int format;
+	enum log_fmt format;
 
 	format = LOG_FORMATS - 1;
-	while (format >= 0 && strcmp(log_formats[format].name, fmt))
+	while (format > 0 && log_formats[format].name
+	                  && strcmp(log_formats[format].name, fmt) != 0)
 		format--;
 
+	/* Note: 0 is LOG_FORMAT_UNSPEC */
 	return format;
 }
 
@@ -741,7 +1181,7 @@ int get_log_level(const char *lev)
 	int level;
 
 	level = NB_LOG_LEVELS - 1;
-	while (level >= 0 && strcmp(log_levels[level], lev))
+	while (level >= 0 && strcmp(log_levels[level], lev) != 0)
 		level--;
 
 	return level;
@@ -755,7 +1195,7 @@ int get_log_facility(const char *fac)
 	int facility;
 
 	facility = NB_LOG_FACILITIES - 1;
-	while (facility >= 0 && strcmp(log_facilities[facility], fac))
+	while (facility >= 0 && strcmp(log_facilities[facility], fac) != 0)
 		facility--;
 
 	return facility;
@@ -769,7 +1209,7 @@ int get_log_facility(const char *fac)
  * <escape>.
  */
 static char *lf_encode_string(char *start, char *stop,
-                              const char escape, const fd_set *map,
+                              const char escape, const long *map,
                               const char *string,
                               struct logformat_node *node)
 {
@@ -777,8 +1217,8 @@ static char *lf_encode_string(char *start, char *stop,
 		if (start < stop) {
 			stop--; /* reserve one byte for the final '\0' */
 			while (start < stop && *string != '\0') {
-				if (!FD_ISSET((unsigned char)(*string), map)) {
-					if (!FD_ISSET((unsigned char)(*string), rfc5424_escape_map))
+				if (!ha_bit_test((unsigned char)(*string), map)) {
+					if (!ha_bit_test((unsigned char)(*string), rfc5424_escape_map))
 						*start++ = *string;
 					else {
 						if (start + 2 >= stop)
@@ -814,21 +1254,21 @@ static char *lf_encode_string(char *start, char *stop,
  * <escape>.
  */
 static char *lf_encode_chunk(char *start, char *stop,
-                             const char escape, const fd_set *map,
-                             const struct chunk *chunk,
+                             const char escape, const long *map,
+                             const struct buffer *chunk,
                              struct logformat_node *node)
 {
 	char *str, *end;
 
 	if (node->options & LOG_OPT_ESC) {
 		if (start < stop) {
-			str = chunk->str;
-			end = chunk->str + chunk->len;
+			str = chunk->area;
+			end = chunk->area + chunk->data;
 
 			stop--; /* reserve one byte for the final '\0' */
 			while (start < stop && str < end) {
-				if (!FD_ISSET((unsigned char)(*str), map)) {
-					if (!FD_ISSET((unsigned char)(*str), rfc5424_escape_map))
+				if (!ha_bit_test((unsigned char)(*str), map)) {
+					if (!ha_bit_test((unsigned char)(*str), rfc5424_escape_map))
 						*start++ = *str;
 					else {
 						if (start + 2 >= stop)
@@ -860,9 +1300,9 @@ static char *lf_encode_chunk(char *start, char *stop,
  * Write a string in the log string
  * Take cares of quote and escape options
  *
- * Return the adress of the \0 character, or NULL on error
+ * Return the address of the \0 character, or NULL on error
  */
-char *lf_text_len(char *dst, const char *src, size_t len, size_t size, struct logformat_node *node)
+char *lf_text_len(char *dst, const char *src, size_t len, size_t size, const struct logformat_node *node)
 {
 	if (size < 2)
 		return NULL;
@@ -906,24 +1346,37 @@ char *lf_text_len(char *dst, const char *src, size_t len, size_t size, struct lo
 	return dst;
 }
 
-static inline char *lf_text(char *dst, const char *src, size_t size, struct logformat_node *node)
+static inline char *lf_text(char *dst, const char *src, size_t size, const struct logformat_node *node)
 {
 	return lf_text_len(dst, src, size, size, node);
 }
 
 /*
- * Write a IP adress to the log string
- * +X option write in hexadecimal notation, most signifant byte on the left
+ * Write a IP address to the log string
+ * +X option write in hexadecimal notation, most significant byte on the left
  */
-char *lf_ip(char *dst, struct sockaddr *sockaddr, size_t size, struct logformat_node *node)
+char *lf_ip(char *dst, const struct sockaddr *sockaddr, size_t size, const struct logformat_node *node)
 {
 	char *ret = dst;
 	int iret;
 	char pn[INET6_ADDRSTRLEN];
 
 	if (node->options & LOG_OPT_HEXA) {
-		const unsigned char *addr = (const unsigned char *)&((struct sockaddr_in *)sockaddr)->sin_addr.s_addr;
-		iret = snprintf(dst, size, "%02X%02X%02X%02X", addr[0], addr[1], addr[2], addr[3]);
+		unsigned char *addr = NULL;
+		switch (sockaddr->sa_family) {
+		case AF_INET:
+			addr = (unsigned char *)&((struct sockaddr_in *)sockaddr)->sin_addr.s_addr;
+			iret = snprintf(dst, size, "%02X%02X%02X%02X", addr[0], addr[1], addr[2], addr[3]);
+			break;
+		case AF_INET6:
+			addr = (unsigned char *)&((struct sockaddr_in6 *)sockaddr)->sin6_addr.s6_addr;
+			iret = snprintf(dst, size, "%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X",
+			                addr[0], addr[1], addr[2], addr[3], addr[4], addr[5], addr[6], addr[7],
+			                addr[8], addr[9], addr[10], addr[11], addr[12], addr[13], addr[14], addr[15]);
+			break;
+		default:
+			return NULL;
+		}
 		if (iret < 0 || iret > size)
 			return NULL;
 		ret += iret;
@@ -938,9 +1391,9 @@ char *lf_ip(char *dst, struct sockaddr *sockaddr, size_t size, struct logformat_
 
 /*
  * Write a port to the log
- * +X option write in hexadecimal notation, most signifant byte on the left
+ * +X option write in hexadecimal notation, most significant byte on the left
  */
-char *lf_port(char *dst, struct sockaddr *sockaddr, size_t size, struct logformat_node *node)
+char *lf_port(char *dst, const struct sockaddr *sockaddr, size_t size, const struct logformat_node *node)
 {
 	char *ret = dst;
 	int iret;
@@ -959,90 +1412,6 @@ char *lf_port(char *dst, struct sockaddr *sockaddr, size_t size, struct logforma
 	return ret;
 }
 
-/* Re-generate time-based part of the syslog header in RFC3164 format at
- * the beginning of logheader once a second and return the pointer to the
- * first character after it.
- */
-static char *update_log_hdr(const time_t time)
-{
-	static long tvsec;
-	static char *dataptr = NULL; /* backup of last end of header, NULL first time */
-	static struct chunk host = { NULL, 0, 0 };
-	static int sep = 0;
-
-	if (unlikely(time != tvsec || dataptr == NULL)) {
-		/* this string is rebuild only once a second */
-		struct tm tm;
-		int hdr_len;
-
-		tvsec = time;
-		get_localtime(tvsec, &tm);
-
-		if (unlikely(global.log_send_hostname != host.str)) {
-			host.str = global.log_send_hostname;
-			host.len = host.str ? strlen(host.str) : 0;
-			sep = host.len ? 1 : 0;
-		}
-
-		hdr_len = snprintf(logheader, global.max_syslog_len,
-				   "<<<<>%s %2d %02d:%02d:%02d %.*s%*s",
-				   monthname[tm.tm_mon],
-				   tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec,
-				   host.len, host.str, sep, "");
-		/* WARNING: depending upon implementations, snprintf may return
-		 * either -1 or the number of bytes that would be needed to store
-		 * the total message. In both cases, we must adjust it.
-		 */
-		if (hdr_len < 0 || hdr_len > global.max_syslog_len)
-			hdr_len = global.max_syslog_len;
-
-		dataptr = logheader + hdr_len;
-	}
-
-	dataptr[0] = 0; // ensure we get rid of any previous attempt
-
-	return dataptr;
-}
-
-/* Re-generate time-based part of the syslog header in RFC5424 format at
- * the beginning of logheader_rfc5424 once a second and return the pointer
- * to the first character after it.
- */
-static char *update_log_hdr_rfc5424(const time_t time)
-{
-	static long tvsec;
-	static char *dataptr = NULL; /* backup of last end of header, NULL first time */
-	const char *gmt_offset;
-
-	if (unlikely(time != tvsec || dataptr == NULL)) {
-		/* this string is rebuild only once a second */
-		struct tm tm;
-		int hdr_len;
-
-		tvsec = time;
-		get_localtime(tvsec, &tm);
-		gmt_offset = get_gmt_offset(time, &tm);
-
-		hdr_len = snprintf(logheader_rfc5424, global.max_syslog_len,
-				   "<<<<>1 %4d-%02d-%02dT%02d:%02d:%02d%.3s:%.2s %s ",
-				   tm.tm_year+1900, tm.tm_mon+1, tm.tm_mday,
-				   tm.tm_hour, tm.tm_min, tm.tm_sec,
-				   gmt_offset, gmt_offset+3,
-				   global.log_send_hostname ? global.log_send_hostname : hostname);
-		/* WARNING: depending upon implementations, snprintf may return
-		 * either -1 or the number of bytes that would be needed to store
-		 * the total message. In both cases, we must adjust it.
-		 */
-		if (hdr_len < 0 || hdr_len > global.max_syslog_len)
-			hdr_len = global.max_syslog_len;
-
-		dataptr = logheader_rfc5424 + hdr_len;
-	}
-
-	dataptr[0] = 0; // ensure we get rid of any previous attempt
-
-	return dataptr;
-}
 
 /*
  * This function sends the syslog message using a printf format string. It
@@ -1062,228 +1431,535 @@ void send_log(struct proxy *p, int level, const char *format, ...)
 		data_len = global.max_syslog_len;
 	va_end(argp);
 
-	__send_log(p, level, logline, data_len, default_rfc5424_sd_log_format, 2);
+	__send_log((p ? &p->logsrvs : NULL), (p ? &p->log_tag : NULL), level,
+		   logline, data_len, default_rfc5424_sd_log_format, 2);
+}
+/*
+ * This function builds a log header of given format using given
+ * metadata, if format is set to LOF_FORMAT_UNSPEC, it tries
+ * to determine format based on given metadas. It is useful
+ * for log-forwarding to be able to forward any format without
+ * settings.
+ * This function returns a struct ist array of elements of the header
+ * nbelem is set to the number of available elements.
+ * This function returns currently a maximum of NB_LOG_HDR_IST_ELEMENTS
+ * elements.
+ */
+struct ist *build_log_header(enum log_fmt format, int level, int facility,
+                             struct ist *metadata, size_t *nbelem)
+{
+	static THREAD_LOCAL struct {
+		struct ist ist_vector[NB_LOG_HDR_MAX_ELEMENTS];
+		char timestamp_buffer[LOG_LEGACYTIME_LEN+1+1];
+		time_t cur_legacy_time;
+		char priority_buffer[6];
+	} hdr_ctx = { .priority_buffer = "<<<<>" };
+
+	struct tm logtime;
+	int len;
+	int fac_level = 0;
+	time_t time = date.tv_sec;
+
+	*nbelem = 0;
+
+
+	if (format == LOG_FORMAT_UNSPEC) {
+		format = LOG_FORMAT_RAW;
+		if (metadata) {
+			/* If a hostname is set, it appears we want to perform syslog
+			 * because only rfc5427 or rfc3164 support an hostname.
+			 */
+			if (metadata[LOG_META_HOST].len) {
+				/* If a rfc5424 compliant timestamp is used we consider
+				 * that output format is rfc5424, else legacy format
+				 * is used as specified default for local logs
+				 * in documentation.
+				 */
+				if ((metadata[LOG_META_TIME].len == 1 && metadata[LOG_META_TIME].ptr[0] == '-')
+				    || (metadata[LOG_META_TIME].len >= LOG_ISOTIME_MINLEN))
+					format = LOG_FORMAT_RFC5424;
+				else
+					format = LOG_FORMAT_RFC3164;
+			}
+			else if (metadata[LOG_META_TAG].len) {
+				/* Tag is present but no hostname, we should
+				 * consider we try to emit a local log
+				 * in legacy format (analog to RFC3164 but
+				 * with stripped hostname).
+				 */
+				format = LOG_FORMAT_LOCAL;
+			}
+			else if (metadata[LOG_META_PRIO].len) {
+				/* the source seems a parsed message
+				 * offering a valid level/prio prefix
+				 * so we consider this format.
+				 */
+				format = LOG_FORMAT_PRIO;
+			}
+		}
+	}
+
+	/* prepare priority, stored into 1 single elem */
+	switch (format) {
+		case LOG_FORMAT_LOCAL:
+		case LOG_FORMAT_RFC3164:
+		case LOG_FORMAT_RFC5424:
+		case LOG_FORMAT_PRIO:
+			fac_level = facility << 3;
+			/* further format ignore the facility */
+			/* fall through */
+		case LOG_FORMAT_TIMED:
+		case LOG_FORMAT_SHORT:
+			fac_level += level;
+			hdr_ctx.ist_vector[*nbelem].ptr = &hdr_ctx.priority_buffer[3]; /* last digit of the log level */
+			do {
+				*hdr_ctx.ist_vector[*nbelem].ptr = '0' + fac_level % 10;
+				fac_level /= 10;
+				hdr_ctx.ist_vector[*nbelem].ptr--;
+			} while (fac_level && hdr_ctx.ist_vector[*nbelem].ptr > &hdr_ctx.priority_buffer[0]);
+			*hdr_ctx.ist_vector[*nbelem].ptr = '<';
+			hdr_ctx.ist_vector[(*nbelem)++].len = &hdr_ctx.priority_buffer[5] - hdr_ctx.ist_vector[0].ptr;
+			break;
+		case LOG_FORMAT_ISO:
+		case LOG_FORMAT_RAW:
+			break;
+		case LOG_FORMAT_UNSPEC:
+		case LOG_FORMATS:
+			ABORT_NOW();
+	}
+
+
+	/* prepare timestamp, stored into a max of 4 elems */
+	switch (format) {
+		case LOG_FORMAT_LOCAL:
+		case LOG_FORMAT_RFC3164:
+			/* rfc3164 ex: 'Jan  1 00:00:00 ' */
+			if (metadata && metadata[LOG_META_TIME].len == LOG_LEGACYTIME_LEN) {
+				hdr_ctx.ist_vector[(*nbelem)++] = metadata[LOG_META_TIME];
+				hdr_ctx.ist_vector[(*nbelem)++] = ist2(" ", 1);
+				/* time is set, break immediately */
+				break;
+			}
+			else if (metadata && metadata[LOG_META_TIME].len >= LOG_ISOTIME_MINLEN) {
+				int month;
+				char *timestamp = metadata[LOG_META_TIME].ptr;
+
+				/* iso time always begins like this: '1970-01-01T00:00:00' */
+
+				/* compute month */
+				month = 10*(timestamp[5] - '0') + (timestamp[6] - '0');
+				if (month)
+					month--;
+				if (month <= 11) {
+					/* builds log prefix ex: 'Jan  1 ' */
+					len = snprintf(hdr_ctx.timestamp_buffer, sizeof(hdr_ctx.timestamp_buffer),
+					               "%s %c%c ", monthname[month],
+					               timestamp[8] != '0' ? timestamp[8] : ' ',
+					               timestamp[9]);
+					/* we reused the timestamp_buffer, signal that it does not
+					 * contain local time anymore
+					 */
+					hdr_ctx.cur_legacy_time = 0;
+					if (len == 7) {
+						hdr_ctx.ist_vector[(*nbelem)++] = ist2(&hdr_ctx.timestamp_buffer[0], len);
+						/* adds 'HH:MM:SS' from iso time */
+						hdr_ctx.ist_vector[(*nbelem)++] = ist2(&timestamp[11], 8);
+						hdr_ctx.ist_vector[(*nbelem)++] = ist2(" ", 1);
+						/* we successfully reuse iso time, we can break */
+						break;
+					}
+				}
+				/* Failed to reuse isotime time, fallback to local legacy time */
+			}
+
+			if (unlikely(time != hdr_ctx.cur_legacy_time)) {
+				/* re-builds timestamp from the current local time */
+				get_localtime(time, &logtime);
+
+				len = snprintf(hdr_ctx.timestamp_buffer, sizeof(hdr_ctx.timestamp_buffer),
+				               "%s %2d %02d:%02d:%02d ",
+				               monthname[logtime.tm_mon],
+				               logtime.tm_mday, logtime.tm_hour, logtime.tm_min, logtime.tm_sec);
+				if (len != LOG_LEGACYTIME_LEN+1)
+					hdr_ctx.cur_legacy_time = 0;
+				else
+					hdr_ctx.cur_legacy_time = time;
+			}
+			if (likely(hdr_ctx.cur_legacy_time))
+				hdr_ctx.ist_vector[(*nbelem)++] = ist2(&hdr_ctx.timestamp_buffer[0], LOG_LEGACYTIME_LEN+1);
+			else
+				hdr_ctx.ist_vector[(*nbelem)++] = ist2("Jan  1 00:00:00 ", LOG_LEGACYTIME_LEN+1);
+			break;
+		case LOG_FORMAT_RFC5424:
+			/* adds rfc5425 version prefix */
+			hdr_ctx.ist_vector[(*nbelem)++] = ist2("1 ", 2);
+			if (metadata && metadata[LOG_META_TIME].len == 1 && metadata[LOG_META_TIME].ptr[0] == '-') {
+				/* submitted len is NILVALUE, it is a valid timestamp for rfc5425 */
+				hdr_ctx.ist_vector[(*nbelem)++] = metadata[LOG_META_TIME];
+				hdr_ctx.ist_vector[(*nbelem)++] = ist2(" ", 1);
+				break;
+			}
+			/* let continue as 'timed' and 'iso' format for usual timestamp */
+			/* fall through */
+		case LOG_FORMAT_TIMED:
+		case LOG_FORMAT_ISO:
+			/* ISO format ex: '1900:01:01T12:00:00.123456Z'
+			 *                '1900:01:01T14:00:00+02:00'
+			 *                '1900:01:01T10:00:00.123456-02:00'
+			 */
+			if (metadata && metadata[LOG_META_TIME].len >= LOG_ISOTIME_MINLEN) {
+				hdr_ctx.ist_vector[(*nbelem)++] = metadata[LOG_META_TIME];
+				hdr_ctx.ist_vector[(*nbelem)++] = ist2(" ", 1);
+				/* time is set, break immediately */
+				break;
+			}
+			else if (metadata && metadata[LOG_META_TIME].len == LOG_LEGACYTIME_LEN) {
+				int month;
+				char *timestamp = metadata[LOG_META_TIME].ptr;
+
+				for (month = 0; month < 12; month++)
+					if (!memcmp(monthname[month], timestamp, 3))
+						break;
+
+				if (month < 12) {
+
+					/* get local time to retrieve year */
+					get_localtime(time, &logtime);
+
+					/* year seems changed since log */
+					if (logtime.tm_mon < month)
+						logtime.tm_year--;
+
+					/* builds rfc5424 prefix ex: '1900-01-01T' */
+					len = snprintf(hdr_ctx.timestamp_buffer, sizeof(hdr_ctx.timestamp_buffer),
+							   "%4d-%02d-%c%cT",
+							   logtime.tm_year+1900, month+1,
+							   timestamp[4] != ' ' ? timestamp[4] : '0',
+							   timestamp[5]);
+
+					/* we reused the timestamp_buffer, signal that it does not
+					 * contain local time anymore
+					 */
+					hdr_ctx.cur_legacy_time = 0;
+					if (len == 11) {
+						hdr_ctx.ist_vector[(*nbelem)++] = ist2(&hdr_ctx.timestamp_buffer[0], len);
+						/* adds HH:MM:SS from legacy timestamp */
+						hdr_ctx.ist_vector[(*nbelem)++] = ist2(&timestamp[7], 8);
+						/* skip secfraq because it is optional */
+						/* according to rfc: -00:00 means we don't know the timezone */
+						hdr_ctx.ist_vector[(*nbelem)++] = ist2("-00:00 ", 7);
+						/* we successfully reuse legacy time, we can break */
+						break;
+					}
+				}
+				/* Failed to reuse legacy time, fallback to local iso time */
+			}
+			hdr_ctx.ist_vector[(*nbelem)++] = ist2(timeofday_as_iso_us(1), LOG_ISOTIME_MAXLEN + 1);
+			break;
+		case LOG_FORMAT_PRIO:
+		case LOG_FORMAT_SHORT:
+		case LOG_FORMAT_RAW:
+			break;
+		case LOG_FORMAT_UNSPEC:
+		case LOG_FORMATS:
+			ABORT_NOW();
+	}
+
+	/* prepare other meta data, stored into a max of 10 elems */
+	switch (format) {
+		case LOG_FORMAT_RFC3164:
+			if (metadata && metadata[LOG_META_HOST].len) {
+				hdr_ctx.ist_vector[(*nbelem)++] = metadata[LOG_META_HOST];
+				hdr_ctx.ist_vector[(*nbelem)++] = ist2(" ", 1);
+			}
+			else /* the caller MUST fill the hostname, this field is mandatory */
+				hdr_ctx.ist_vector[(*nbelem)++] = ist2("localhost ", 10);
+			/* fall through */
+		case LOG_FORMAT_LOCAL:
+			if (!metadata || !metadata[LOG_META_TAG].len)
+				break;
+
+			hdr_ctx.ist_vector[(*nbelem)++] = metadata[LOG_META_TAG];
+			if (metadata[LOG_META_PID].len) {
+				hdr_ctx.ist_vector[(*nbelem)++] = ist2("[", 1);
+				hdr_ctx.ist_vector[(*nbelem)++] = metadata[LOG_META_PID];
+				hdr_ctx.ist_vector[(*nbelem)++] = ist2("]", 1);
+			}
+			hdr_ctx.ist_vector[(*nbelem)++] = ist2(": ", 2);
+			break;
+		case LOG_FORMAT_RFC5424:
+			if (metadata && metadata[LOG_META_HOST].len) {
+				hdr_ctx.ist_vector[(*nbelem)++] = metadata[LOG_META_HOST];
+				hdr_ctx.ist_vector[(*nbelem)++] = ist2(" ", 1);
+			}
+			else
+				hdr_ctx.ist_vector[(*nbelem)++] = ist2("- ", 2);
+
+			if (metadata && metadata[LOG_META_TAG].len) {
+				hdr_ctx.ist_vector[(*nbelem)++] = metadata[LOG_META_TAG];
+				hdr_ctx.ist_vector[(*nbelem)++] = ist2(" ", 1);
+			}
+			else
+				hdr_ctx.ist_vector[(*nbelem)++] = ist2("- ", 2);
+
+			if (metadata && metadata[LOG_META_PID].len) {
+				hdr_ctx.ist_vector[(*nbelem)++] = metadata[LOG_META_PID];
+				hdr_ctx.ist_vector[(*nbelem)++] = ist2(" ", 1);
+			}
+			else
+				hdr_ctx.ist_vector[(*nbelem)++] = ist2("- ", 2);
+
+			if (metadata && metadata[LOG_META_MSGID].len) {
+				hdr_ctx.ist_vector[(*nbelem)++] = metadata[LOG_META_MSGID];
+				hdr_ctx.ist_vector[(*nbelem)++] = ist2(" ", 1);
+			}
+			else
+				hdr_ctx.ist_vector[(*nbelem)++] = ist2("- ", 2);
+
+			if (metadata && metadata[LOG_META_STDATA].len) {
+				hdr_ctx.ist_vector[(*nbelem)++] = metadata[LOG_META_STDATA];
+				hdr_ctx.ist_vector[(*nbelem)++] = ist2(" ", 1);
+			}
+			else
+				hdr_ctx.ist_vector[(*nbelem)++] = ist2("- ", 2);
+			break;
+		case LOG_FORMAT_PRIO:
+		case LOG_FORMAT_SHORT:
+		case LOG_FORMAT_TIMED:
+		case LOG_FORMAT_ISO:
+		case LOG_FORMAT_RAW:
+			break;
+		case LOG_FORMAT_UNSPEC:
+		case LOG_FORMATS:
+			ABORT_NOW();
+	}
+
+	return hdr_ctx.ist_vector;
+}
+
+/*
+ * This function sends a syslog message to <logsrv>.
+ * The argument <metadata> MUST be an array of size
+ * LOG_META_FIELDS*sizeof(struct ist) containing data to build the header.
+ * It overrides the last byte of the message vector with an LF character.
+ * Does not return any error,
+ */
+static inline void __do_send_log(struct logsrv *logsrv, int nblogger, int level, int facility, struct ist *metadata, char *message, size_t size)
+{
+	static THREAD_LOCAL struct iovec iovec[NB_LOG_HDR_MAX_ELEMENTS+1+1] = { }; /* header elements + message + LF */
+	static THREAD_LOCAL struct msghdr msghdr = {
+		//.msg_iov = iovec,
+		.msg_iovlen = NB_LOG_HDR_MAX_ELEMENTS+2
+	};
+	static THREAD_LOCAL int logfdunix = -1;	/* syslog to AF_UNIX socket */
+	static THREAD_LOCAL int logfdinet = -1;	/* syslog to AF_INET socket */
+	int *plogfd;
+	int sent;
+	size_t nbelem;
+	struct ist *msg_header = NULL;
+
+	msghdr.msg_iov = iovec;
+
+	/* historically some messages used to already contain the trailing LF
+	 * or Zero. Let's remove all trailing LF or Zero
+	 */
+	while (size && (message[size-1] == '\n' || (message[size-1] == 0)))
+		size--;
+
+	if (logsrv->type == LOG_TARGET_BUFFER) {
+		plogfd = NULL;
+		goto send;
+	}
+	else if (logsrv->addr.ss_family == AF_CUST_EXISTING_FD) {
+		/* the socket's address is a file descriptor */
+		plogfd = (int *)&((struct sockaddr_in *)&logsrv->addr)->sin_addr.s_addr;
+	}
+	else if (logsrv->addr.ss_family == AF_UNIX)
+		plogfd = &logfdunix;
+	else
+		plogfd = &logfdinet;
+
+	if (plogfd && unlikely(*plogfd < 0)) {
+		/* socket not successfully initialized yet */
+		if ((*plogfd = socket(logsrv->addr.ss_family, SOCK_DGRAM,
+							  (logsrv->addr.ss_family == AF_UNIX) ? 0 : IPPROTO_UDP)) < 0) {
+			static char once;
+
+			if (!once) {
+				once = 1; /* note: no need for atomic ops here */
+				ha_alert("socket() failed in logger #%d: %s (errno=%d)\n",
+						 nblogger, strerror(errno), errno);
+			}
+			return;
+		} else {
+			/* we don't want to receive anything on this socket */
+			setsockopt(*plogfd, SOL_SOCKET, SO_RCVBUF, &zero, sizeof(zero));
+			/* does nothing under Linux, maybe needed for others */
+			shutdown(*plogfd, SHUT_RD);
+			fcntl(*plogfd, F_SETFD, fcntl(*plogfd, F_GETFD, FD_CLOEXEC) | FD_CLOEXEC);
+		}
+	}
+
+	msg_header = build_log_header(logsrv->format, level, facility, metadata, &nbelem);
+ send:
+	if (logsrv->type == LOG_TARGET_BUFFER) {
+		struct ist msg;
+
+		msg = ist2(message, size);
+		if (msg.len > logsrv->maxlen)
+			msg.len = logsrv->maxlen;
+
+		sent = sink_write(logsrv->sink, &msg, 1, level, logsrv->facility, metadata);
+	}
+	else if (logsrv->addr.ss_family == AF_CUST_EXISTING_FD) {
+		struct ist msg;
+
+		msg = ist2(message, size);
+		if (msg.len > logsrv->maxlen)
+			msg.len = logsrv->maxlen;
+
+		sent = fd_write_frag_line(*plogfd, logsrv->maxlen, msg_header, nbelem, &msg, 1, 1);
+	}
+	else {
+		int i = 0;
+		int totlen = logsrv->maxlen;
+
+		for (i = 0 ; i < nbelem ; i++ ) {
+			iovec[i].iov_base = msg_header[i].ptr;
+			iovec[i].iov_len  = msg_header[i].len;
+			if (totlen <= iovec[i].iov_len) {
+				iovec[i].iov_len = totlen;
+				totlen = 0;
+				break;
+			}
+			totlen -= iovec[i].iov_len;
+		}
+		if (totlen) {
+			iovec[i].iov_base = message;
+			iovec[i].iov_len  = size;
+			if (totlen <= iovec[i].iov_len)
+				iovec[i].iov_len = totlen;
+			i++;
+		}
+		iovec[i].iov_base = "\n"; /* insert a \n at the end of the message */
+		iovec[i].iov_len = 1;
+		i++;
+
+		msghdr.msg_iovlen = i;
+		msghdr.msg_name = (struct sockaddr *)&logsrv->addr;
+		msghdr.msg_namelen = get_addr_len(&logsrv->addr);
+
+		sent = sendmsg(*plogfd, &msghdr, MSG_DONTWAIT | MSG_NOSIGNAL);
+	}
+
+	if (sent < 0) {
+		static char once;
+
+		if (errno == EAGAIN)
+			_HA_ATOMIC_ADD(&dropped_logs, 1);
+		else if (!once) {
+			once = 1; /* note: no need for atomic ops here */
+			ha_alert("sendmsg()/writev() failed in logger #%d: %s (errno=%d)\n",
+					 nblogger, strerror(errno), errno);
+		}
+	}
 }
 
 /*
  * This function sends a syslog message.
  * It doesn't care about errors nor does it report them.
- * It overrides the last byte of the message vector with an LF character.
- * The arguments <sd> and <sd_size> are used for the structured-data part
- * in RFC5424 formatted syslog messages.
+ * The argument <metadata> MUST be an array of size
+ * LOG_META_FIELDS*sizeof(struct ist)  containing
+ * data to build the header.
  */
-void __send_log(struct proxy *p, int level, char *message, size_t size, char *sd, size_t sd_size)
+void process_send_log(struct list *logsrvs, int level, int facility,
+	                struct ist *metadata, char *message, size_t size)
 {
-	static struct iovec iovec[NB_MSG_IOVEC_ELEMENTS] = { };
-	static struct msghdr msghdr = {
-		.msg_iov = iovec,
-		.msg_iovlen = NB_MSG_IOVEC_ELEMENTS
-	};
-	static int logfdunix = -1;	/* syslog to AF_UNIX socket */
-	static int logfdinet = -1;	/* syslog to AF_INET socket */
-	static char *dataptr = NULL;
-	int fac_level;
-	struct list *logsrvs = NULL;
-	struct logsrv *tmp = NULL;
+	struct logsrv *logsrv;
 	int nblogger;
-	char *hdr, *hdr_ptr;
-	size_t hdr_size;
-	time_t time = date.tv_sec;
-	struct chunk *tag = &global.log_tag;
-	static int curr_pid;
-	static char pidstr[100];
-	static struct chunk pid;
-
-	dataptr = message;
-
-	if (p == NULL) {
-		if (!LIST_ISEMPTY(&global.logsrvs)) {
-			logsrvs = &global.logsrvs;
-		}
-	} else {
-		if (!LIST_ISEMPTY(&p->logsrvs)) {
-			logsrvs = &p->logsrvs;
-		}
-		if (p->log_tag.str) {
-			tag = &p->log_tag;
-		}
-	}
-
-	if (!logsrvs)
-		return;
-
-	if (unlikely(curr_pid != getpid())) {
-		curr_pid = getpid();
-		ltoa_o(curr_pid, pidstr, sizeof(pidstr));
-		chunk_initstr(&pid, pidstr);
-	}
 
 	/* Send log messages to syslog server. */
 	nblogger = 0;
-	list_for_each_entry(tmp, logsrvs, list) {
-		const struct logsrv *logsrv = tmp;
-		int *plogfd = logsrv->addr.ss_family == AF_UNIX ?
-			&logfdunix : &logfdinet;
-		char *pid_sep1 = NULL, *pid_sep2 = NULL;
-		int sent;
-		int maxlen;
-		int hdr_max = 0;
-		int tag_max = 0;
-		int pid_sep1_max = 0;
-		int pid_max = 0;
-		int pid_sep2_max = 0;
-		int sd_max = 0;
-		int max = 0;
-
-		nblogger++;
+	list_for_each_entry(logsrv, logsrvs, list) {
+		int in_range = 1;
 
 		/* we can filter the level of the messages that are sent to each logger */
 		if (level > logsrv->level)
 			continue;
 
-		if (unlikely(*plogfd < 0)) {
-			/* socket not successfully initialized yet */
-			int proto = logsrv->addr.ss_family == AF_UNIX ? 0 : IPPROTO_UDP;
+		if (logsrv->lb.smp_rgs) {
+			struct smp_log_range *curr_rg;
 
-			if ((*plogfd = socket(logsrv->addr.ss_family, SOCK_DGRAM, proto)) < 0) {
-				Alert("socket for logger #%d failed: %s (errno=%d)\n",
-				      nblogger, strerror(errno), errno);
-				continue;
+			HA_SPIN_LOCK(LOGSRV_LOCK, &logsrv->lock);
+			curr_rg = &logsrv->lb.smp_rgs[logsrv->lb.curr_rg];
+			in_range = in_smp_log_range(curr_rg, logsrv->lb.curr_idx);
+			if (in_range) {
+				/* Let's consume this range. */
+				curr_rg->curr_idx = (curr_rg->curr_idx + 1) % curr_rg->sz;
+				if (!curr_rg->curr_idx) {
+					/* If consumed, let's select the next range. */
+					logsrv->lb.curr_rg = (logsrv->lb.curr_rg + 1) % logsrv->lb.smp_rgs_sz;
+				}
 			}
-			/* we don't want to receive anything on this socket */
-			setsockopt(*plogfd, SOL_SOCKET, SO_RCVBUF, &zero, sizeof(zero));
-			/* does nothing under Linux, maybe needed for others */
-			shutdown(*plogfd, SHUT_RD);
+			logsrv->lb.curr_idx = (logsrv->lb.curr_idx + 1) % logsrv->lb.smp_sz;
+			HA_SPIN_UNLOCK(LOGSRV_LOCK, &logsrv->lock);
 		}
-
-		switch (logsrv->format) {
-		case LOG_FORMAT_RFC3164:
-			hdr = logheader;
-			hdr_ptr = update_log_hdr(time);
-			break;
-
-		case LOG_FORMAT_RFC5424:
-			hdr = logheader_rfc5424;
-			hdr_ptr = update_log_hdr_rfc5424(time);
-			sd_max = sd_size; /* the SD part allowed only in RFC5424 */
-			break;
-
-		default:
-			continue; /* must never happen */
-		}
-
-		hdr_size = hdr_ptr - hdr;
-
-		/* For each target, we may have a different facility.
-		 * We can also have a different log level for each message.
-		 * This induces variations in the message header length.
-		 * Since we don't want to recompute it each time, nor copy it every
-		 * time, we only change the facility in the pre-computed header,
-		 * and we change the pointer to the header accordingly.
-		 */
-		fac_level = (logsrv->facility << 3) + MAX(level, logsrv->minlvl);
-		hdr_ptr = hdr + 3; /* last digit of the log level */
-		do {
-			*hdr_ptr = '0' + fac_level % 10;
-			fac_level /= 10;
-			hdr_ptr--;
-		} while (fac_level && hdr_ptr > hdr);
-		*hdr_ptr = '<';
-
-		hdr_max = hdr_size - (hdr_ptr - hdr);
-
-		/* time-based header */
-		if (unlikely(hdr_size >= logsrv->maxlen)) {
-			hdr_max = MIN(hdr_max, logsrv->maxlen) - 1;
-			sd_max = 0;
-			goto send;
-		}
-
-		maxlen = logsrv->maxlen - hdr_max;
-
-		/* tag */
-		tag_max = tag->len;
-		if (unlikely(tag_max >= maxlen)) {
-			tag_max = maxlen - 1;
-			sd_max = 0;
-			goto send;
-		}
-
-		maxlen -= tag_max;
-
-		/* first pid separator */
-		pid_sep1_max = log_formats[logsrv->format].pid.sep1.len;
-		if (unlikely(pid_sep1_max >= maxlen)) {
-			pid_sep1_max = maxlen - 1;
-			sd_max = 0;
-			goto send;
-		}
-
-		pid_sep1 = log_formats[logsrv->format].pid.sep1.str;
-		maxlen -= pid_sep1_max;
-
-		/* pid */
-		pid_max = pid.len;
-		if (unlikely(pid_max >= maxlen)) {
-			pid_max = maxlen - 1;
-			sd_max = 0;
-			goto send;
-		}
-
-		maxlen -= pid_max;
-
-		/* second pid separator */
-		pid_sep2_max = log_formats[logsrv->format].pid.sep2.len;
-		if (unlikely(pid_sep2_max >= maxlen)) {
-			pid_sep2_max = maxlen - 1;
-			sd_max = 0;
-			goto send;
-		}
-
-		pid_sep2 = log_formats[logsrv->format].pid.sep2.str;
-		maxlen -= pid_sep2_max;
-
-		/* structured-data */
-		if (sd_max >= maxlen) {
-			sd_max = maxlen - 1;
-			goto send;
-		}
-
-		max = MIN(size, maxlen - sd_max) - 1;
-send:
-		iovec[0].iov_base = hdr_ptr;
-		iovec[0].iov_len  = hdr_max;
-		iovec[1].iov_base = tag->str;
-		iovec[1].iov_len  = tag_max;
-		iovec[2].iov_base = pid_sep1;
-		iovec[2].iov_len  = pid_sep1_max;
-		iovec[3].iov_base = pid.str;
-		iovec[3].iov_len  = pid_max;
-		iovec[4].iov_base = pid_sep2;
-		iovec[4].iov_len  = pid_sep2_max;
-		iovec[5].iov_base = sd;
-		iovec[5].iov_len  = sd_max;
-		iovec[6].iov_base = dataptr;
-		iovec[6].iov_len  = max;
-		iovec[7].iov_base = "\n"; /* insert a \n at the end of the message */
-		iovec[7].iov_len  = 1;
-
-		msghdr.msg_name = (struct sockaddr *)&logsrv->addr;
-		msghdr.msg_namelen = get_addr_len(&logsrv->addr);
-
-		sent = sendmsg(*plogfd, &msghdr, MSG_DONTWAIT | MSG_NOSIGNAL);
-
-		if (sent < 0) {
-			Alert("sendmsg logger #%d failed: %s (errno=%d)\n",
-				nblogger, strerror(errno), errno);
-		}
+		if (in_range)
+			__do_send_log(logsrv, ++nblogger,  MAX(level, logsrv->minlvl),
+			              (facility == -1) ? logsrv->facility : facility,
+			              metadata, message, size);
 	}
 }
 
-extern fd_set hdr_encode_map[];
-extern fd_set url_encode_map[];
-extern fd_set http_encode_map[];
+/*
+ * This function sends a syslog message.
+ * It doesn't care about errors nor does it report them.
+ * The arguments <sd> and <sd_size> are used for the structured-data part
+ * in RFC5424 formatted syslog messages.
+ */
+void __send_log(struct list *logsrvs, struct buffer *tagb, int level,
+		char *message, size_t size, char *sd, size_t sd_size)
+{
+	static THREAD_LOCAL pid_t curr_pid;
+	static THREAD_LOCAL char pidstr[16];
+	static THREAD_LOCAL struct ist metadata[LOG_META_FIELDS];
 
+	if (logsrvs == NULL) {
+		if (!LIST_ISEMPTY(&global.logsrvs)) {
+			logsrvs = &global.logsrvs;
+		}
+	}
+	if (!logsrvs || LIST_ISEMPTY(logsrvs))
+		return;
+
+	if (!metadata[LOG_META_HOST].len) {
+		if (global.log_send_hostname)
+			metadata[LOG_META_HOST] = ist2(global.log_send_hostname, strlen(global.log_send_hostname));
+	}
+
+	if (!tagb || !tagb->area)
+		tagb = &global.log_tag;
+
+	if (tagb)
+		metadata[LOG_META_TAG] = ist2(tagb->area, tagb->data);
+
+	if (unlikely(curr_pid != getpid()))
+		metadata[LOG_META_PID].len = 0;
+
+	if (!metadata[LOG_META_PID].len) {
+		curr_pid = getpid();
+		ltoa_o(curr_pid, pidstr, sizeof(pidstr));
+		metadata[LOG_META_PID] = ist2(pidstr, strlen(pidstr));
+	}
+
+	metadata[LOG_META_STDATA] = ist2(sd, sd_size);
+
+	/* Remove trailing space of structured data */
+	while (metadata[LOG_META_STDATA].len && metadata[LOG_META_STDATA].ptr[metadata[LOG_META_STDATA].len-1] == ' ')
+		metadata[LOG_META_STDATA].len--;
+
+	return process_send_log(logsrvs, level, -1, metadata, message, size);
+}
 
 const char sess_cookie[8]     = "NIDVEOU7";	/* No cookie, Invalid cookie, cookie for a Down server, Valid cookie, Expired cookie, Old cookie, Unused, unknown */
 const char sess_set_cookie[8] = "NPDIRU67";	/* No set-cookie, Set-cookie found and left unchanged (passive),
@@ -1302,11 +1978,11 @@ const char sess_set_cookie[8] = "NPDIRU67";	/* No set-cookie, Set-cookie found a
 		} while(0)
 
 
-/* Initializes some log data.
- */
-void init_log()
+/* Initializes some log data at boot */
+static void init_log()
 {
 	char *tmp;
+	int i;
 
 	/* Initialize the escape map for the RFC5424 structured-data : '"\]'
 	 * inside PARAM-VALUE should be escaped with '\' as prefix.
@@ -1317,23 +1993,103 @@ void init_log()
 
 	tmp = "\"\\]";
 	while (*tmp) {
-		FD_SET(*tmp, rfc5424_escape_map);
+		ha_bit_set(*tmp, rfc5424_escape_map);
 		tmp++;
 	}
+
+	/* initialize the log header encoding map : '{|}"#' should be encoded with
+	 * '#' as prefix, as well as non-printable characters ( <32 or >= 127 ).
+	 * URL encoding only requires '"', '#' to be encoded as well as non-
+	 * printable characters above.
+	 */
+	memset(hdr_encode_map, 0, sizeof(hdr_encode_map));
+	memset(url_encode_map, 0, sizeof(url_encode_map));
+	for (i = 0; i < 32; i++) {
+		ha_bit_set(i, hdr_encode_map);
+		ha_bit_set(i, url_encode_map);
+	}
+	for (i = 127; i < 256; i++) {
+		ha_bit_set(i, hdr_encode_map);
+		ha_bit_set(i, url_encode_map);
+	}
+
+	tmp = "\"#{|}";
+	while (*tmp) {
+		ha_bit_set(*tmp, hdr_encode_map);
+		tmp++;
+	}
+
+	tmp = "\"#";
+	while (*tmp) {
+		ha_bit_set(*tmp, url_encode_map);
+		tmp++;
+	}
+
+	/* initialize the http header encoding map. The draft httpbis define the
+	 * header content as:
+	 *
+	 *    HTTP-message   = start-line
+	 *                     *( header-field CRLF )
+	 *                     CRLF
+	 *                     [ message-body ]
+	 *    header-field   = field-name ":" OWS field-value OWS
+	 *    field-value    = *( field-content / obs-fold )
+	 *    field-content  = field-vchar [ 1*( SP / HTAB ) field-vchar ]
+	 *    obs-fold       = CRLF 1*( SP / HTAB )
+	 *    field-vchar    = VCHAR / obs-text
+	 *    VCHAR          = %x21-7E
+	 *    obs-text       = %x80-FF
+	 *
+	 * All the chars are encoded except "VCHAR", "obs-text", SP and HTAB.
+	 * The encoded chars are form 0x00 to 0x08, 0x0a to 0x1f and 0x7f. The
+	 * "obs-fold" is voluntarily forgotten because haproxy remove this.
+	 */
+	memset(http_encode_map, 0, sizeof(http_encode_map));
+	for (i = 0x00; i <= 0x08; i++)
+		ha_bit_set(i, http_encode_map);
+	for (i = 0x0a; i <= 0x1f; i++)
+		ha_bit_set(i, http_encode_map);
+	ha_bit_set(0x7f, http_encode_map);
+}
+
+INITCALL0(STG_PREPARE, init_log);
+
+/* Initialize log buffers used for syslog messages */
+int init_log_buffers()
+{
+	logline = my_realloc2(logline, global.max_syslog_len + 1);
+	logline_rfc5424 = my_realloc2(logline_rfc5424, global.max_syslog_len + 1);
+	if (!logline || !logline_rfc5424)
+		return 0;
+	return 1;
+}
+
+/* Deinitialize log buffers used for syslog messages */
+void deinit_log_buffers()
+{
+	free(logline);
+	free(logline_rfc5424);
+	ring_free(_HA_ATOMIC_XCHG(&startup_logs, NULL));
+	logline           = NULL;
+	logline_rfc5424   = NULL;
 }
 
 /* Builds a log line in <dst> based on <list_format>, and stops before reaching
  * <maxsize> characters. Returns the size of the output string in characters,
  * not counting the trailing zero which is always added if the resulting size
- * is not zero.
+ * is not zero. It requires a valid session and optionally a stream. If the
+ * stream is NULL, default values will be assumed for the stream part.
  */
-int build_logline(struct stream *s, char *dst, size_t maxsize, struct list *list_format)
+int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t maxsize, struct list *list_format)
 {
-	struct session *sess = strm_sess(s);
 	struct proxy *fe = sess->fe;
-	struct proxy *be = s->be;
-	struct http_txn *txn = s->txn;
-	struct chunk chunk;
+	struct proxy *be;
+	struct http_txn *txn;
+	const struct strm_logs *logs;
+	struct connection *fe_conn, *be_conn;
+	unsigned int s_flags;
+	unsigned int uniq_id;
+	struct buffer chunk;
 	char *uri;
 	char *spc;
 	char *qmark;
@@ -1346,14 +2102,85 @@ int build_logline(struct stream *s, char *dst, size_t maxsize, struct list *list
 	char *tmplog;
 	char *ret;
 	int iret;
+	int status;
 	struct logformat_node *tmp;
 	struct timeval tv;
+	struct strm_logs tmp_strm_log;
+	struct ist path;
 
 	/* FIXME: let's limit ourselves to frontend logging for now. */
 
+	if (likely(s)) {
+		be = s->be;
+		txn = s->txn;
+		be_conn = cs_conn(objt_cs(s->si[1].end));
+		status = (txn ? txn->status : 0);
+		s_flags = s->flags;
+		uniq_id = s->uniq_id;
+		logs = &s->logs;
+	} else {
+		/* we have no stream so we first need to initialize a few
+		 * things that are needed later. We do increment the request
+		 * ID so that it's uniquely assigned to this request just as
+		 * if the request had reached the point of being processed.
+		 * A request error is reported as it's the only element we have
+		 * here and which justifies emitting such a log.
+		 */
+		be = fe;
+		txn = NULL;
+		fe_conn = objt_conn(sess->origin);
+		be_conn = NULL;
+		status = 0;
+		s_flags = SF_ERR_PRXCOND | SF_FINST_R;
+		uniq_id = _HA_ATOMIC_XADD(&global.req_count, 1);
+
+		/* prepare a valid log structure */
+		tmp_strm_log.tv_accept = sess->tv_accept;
+		tmp_strm_log.accept_date = sess->accept_date;
+		tmp_strm_log.t_handshake = sess->t_handshake;
+		tmp_strm_log.t_idle = (sess->t_idle >= 0 ? sess->t_idle : 0);
+		tv_zero(&tmp_strm_log.tv_request);
+		tmp_strm_log.t_queue = -1;
+		tmp_strm_log.t_connect = -1;
+		tmp_strm_log.t_data = -1;
+		tmp_strm_log.t_close = tv_ms_elapsed(&sess->tv_accept, &now);
+		tmp_strm_log.bytes_in = 0;
+		tmp_strm_log.bytes_out = 0;
+		tmp_strm_log.prx_queue_pos = 0;
+		tmp_strm_log.srv_queue_pos = 0;
+
+		logs = &tmp_strm_log;
+
+		if ((fe->mode == PR_MODE_HTTP) && fe_conn && fe_conn->mux && fe_conn->mux->ctl) {
+			enum mux_exit_status es = fe_conn->mux->ctl(fe_conn, MUX_EXIT_STATUS, NULL);
+
+			switch (es) {
+			case MUX_ES_SUCCESS:
+				break;
+			case MUX_ES_INVALID_ERR:
+				status = 400;
+				if ((fe_conn->flags & CO_FL_ERROR) || conn_xprt_read0_pending(fe_conn))
+					s_flags = SF_ERR_CLICL | SF_FINST_R;
+				else
+					s_flags = SF_ERR_PRXCOND | SF_FINST_R;
+				break;
+			case MUX_ES_TOUT_ERR:
+				status = 408;
+				s_flags = SF_ERR_CLITO | SF_FINST_R;
+				break;
+			case MUX_ES_INTERNAL_ERR:
+				status = 500;
+				s_flags = SF_ERR_INTERNAL | SF_FINST_R;
+				break;
+			default:
+				break;
+			}
+		}
+	}
+
 	t_request = -1;
-	if (tv_isge(&s->logs.tv_request, &s->logs.tv_accept))
-		t_request = tv_ms_elapsed(&s->logs.tv_accept, &s->logs.tv_request);
+	if (tv_isge(&logs->tv_request, &logs->tv_accept))
+		t_request = tv_ms_elapsed(&logs->tv_accept, &logs->tv_request);
 
 	tmplog = dst;
 
@@ -1365,7 +2192,7 @@ int build_logline(struct stream *s, char *dst, size_t maxsize, struct list *list
 		struct connection *conn;
 		const char *src = NULL;
 		struct sample *key;
-		const struct chunk empty = { NULL, 0, 0 };
+		const struct buffer empty = { };
 
 		switch (tmp->type) {
 			case LOG_FMT_SEPARATOR:
@@ -1394,7 +2221,11 @@ int build_logline(struct stream *s, char *dst, size_t maxsize, struct list *list
 					ret = lf_encode_chunk(tmplog, dst + maxsize,
 					                      '%', http_encode_map, key ? &key->data.u.str : &empty, tmp);
 				else
-					ret = lf_text_len(tmplog, key ? key->data.u.str.str : NULL, key ? key->data.u.str.len : 0, dst + maxsize - tmplog, tmp);
+					ret = lf_text_len(tmplog,
+							  key ? key->data.u.str.area : NULL,
+							  key ? key->data.u.str.data : 0,
+							  dst + maxsize - tmplog,
+							  tmp);
 				if (ret == 0)
 					goto out;
 				tmplog = ret;
@@ -1403,8 +2234,8 @@ int build_logline(struct stream *s, char *dst, size_t maxsize, struct list *list
 
 			case LOG_FMT_CLIENTIP:  // %ci
 				conn = objt_conn(sess->origin);
-				if (conn)
-					ret = lf_ip(tmplog, (struct sockaddr *)&conn->addr.from, dst + maxsize - tmplog, tmp);
+				if (conn && conn_get_src(conn))
+					ret = lf_ip(tmplog, (struct sockaddr *)conn->src, dst + maxsize - tmplog, tmp);
 				else
 					ret = lf_text_len(tmplog, NULL, 0, dst + maxsize - tmplog, tmp);
 				if (ret == NULL)
@@ -1415,11 +2246,11 @@ int build_logline(struct stream *s, char *dst, size_t maxsize, struct list *list
 
 			case LOG_FMT_CLIENTPORT:  // %cp
 				conn = objt_conn(sess->origin);
-				if (conn) {
-					if (conn->addr.from.ss_family == AF_UNIX) {
+				if (conn && conn_get_src(conn)) {
+					if (conn->src->ss_family == AF_UNIX) {
 						ret = ltoa_o(sess->listener->luid, tmplog, dst + maxsize - tmplog);
 					} else {
-						ret = lf_port(tmplog, (struct sockaddr *)&conn->addr.from,
+						ret = lf_port(tmplog, (struct sockaddr *)conn->src,
 						              dst + maxsize - tmplog, tmp);
 					}
 				}
@@ -1434,9 +2265,8 @@ int build_logline(struct stream *s, char *dst, size_t maxsize, struct list *list
 
 			case LOG_FMT_FRONTENDIP: // %fi
 				conn = objt_conn(sess->origin);
-				if (conn) {
-					conn_get_to_addr(conn);
-					ret = lf_ip(tmplog, (struct sockaddr *)&conn->addr.to, dst + maxsize - tmplog, tmp);
+				if (conn && conn_get_dst(conn)) {
+					ret = lf_ip(tmplog, (struct sockaddr *)conn->dst, dst + maxsize - tmplog, tmp);
 				}
 				else
 					ret = lf_text_len(tmplog, NULL, 0, dst + maxsize - tmplog, tmp);
@@ -1449,12 +2279,11 @@ int build_logline(struct stream *s, char *dst, size_t maxsize, struct list *list
 
 			case  LOG_FMT_FRONTENDPORT: // %fp
 				conn = objt_conn(sess->origin);
-				if (conn) {
-					conn_get_to_addr(conn);
-					if (conn->addr.to.ss_family == AF_UNIX)
+				if (conn && conn_get_dst(conn)) {
+					if (conn->dst->ss_family == AF_UNIX)
 						ret = ltoa_o(sess->listener->luid, tmplog, dst + maxsize - tmplog);
 					else
-						ret = lf_port(tmplog, (struct sockaddr *)&conn->addr.to, dst + maxsize - tmplog, tmp);
+						ret = lf_port(tmplog, (struct sockaddr *)conn->dst, dst + maxsize - tmplog, tmp);
 				}
 				else
 					ret = lf_text_len(tmplog, NULL, 0, dst + maxsize - tmplog, tmp);
@@ -1466,9 +2295,8 @@ int build_logline(struct stream *s, char *dst, size_t maxsize, struct list *list
 				break;
 
 			case LOG_FMT_BACKENDIP:  // %bi
-				conn = objt_conn(s->si[1].end);
-				if (conn)
-					ret = lf_ip(tmplog, (struct sockaddr *)&conn->addr.from, dst + maxsize - tmplog, tmp);
+				if (be_conn && conn_get_src(be_conn))
+					ret = lf_ip(tmplog, (const struct sockaddr *)be_conn->src, dst + maxsize - tmplog, tmp);
 				else
 					ret = lf_text_len(tmplog, NULL, 0, dst + maxsize - tmplog, tmp);
 
@@ -1479,9 +2307,8 @@ int build_logline(struct stream *s, char *dst, size_t maxsize, struct list *list
 				break;
 
 			case LOG_FMT_BACKENDPORT:  // %bp
-				conn = objt_conn(s->si[1].end);
-				if (conn)
-					ret = lf_port(tmplog, (struct sockaddr *)&conn->addr.from, dst + maxsize - tmplog, tmp);
+				if (be_conn && conn_get_src(be_conn))
+					ret = lf_port(tmplog, (struct sockaddr *)be_conn->src, dst + maxsize - tmplog, tmp);
 				else
 					ret = lf_text_len(tmplog, NULL, 0, dst + maxsize - tmplog, tmp);
 
@@ -1492,9 +2319,8 @@ int build_logline(struct stream *s, char *dst, size_t maxsize, struct list *list
 				break;
 
 			case LOG_FMT_SERVERIP: // %si
-				conn = objt_conn(s->si[1].end);
-				if (conn)
-					ret = lf_ip(tmplog, (struct sockaddr *)&conn->addr.to, dst + maxsize - tmplog, tmp);
+				if (be_conn && conn_get_dst(be_conn))
+					ret = lf_ip(tmplog, (struct sockaddr *)be_conn->dst, dst + maxsize - tmplog, tmp);
 				else
 					ret = lf_text_len(tmplog, NULL, 0, dst + maxsize - tmplog, tmp);
 
@@ -1505,9 +2331,8 @@ int build_logline(struct stream *s, char *dst, size_t maxsize, struct list *list
 				break;
 
 			case LOG_FMT_SERVERPORT: // %sp
-				conn = objt_conn(s->si[1].end);
-				if (conn)
-					ret = lf_port(tmplog, (struct sockaddr *)&conn->addr.to, dst + maxsize - tmplog, tmp);
+				if (be_conn && conn_get_dst(be_conn))
+					ret = lf_port(tmplog, (struct sockaddr *)be_conn->dst, dst + maxsize - tmplog, tmp);
 				else
 					ret = lf_text_len(tmplog, NULL, 0, dst + maxsize - tmplog, tmp);
 
@@ -1518,9 +2343,8 @@ int build_logline(struct stream *s, char *dst, size_t maxsize, struct list *list
 				break;
 
 			case LOG_FMT_DATE: // %t = accept date
-				get_localtime(s->logs.accept_date.tv_sec, &tm);
-				ret = date2str_log(tmplog, &tm, &(s->logs.accept_date),
-						   dst + maxsize - tmplog);
+				get_localtime(logs->accept_date.tv_sec, &tm);
+				ret = date2str_log(tmplog, &tm, &logs->accept_date, dst + maxsize - tmplog);
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
@@ -1529,7 +2353,7 @@ int build_logline(struct stream *s, char *dst, size_t maxsize, struct list *list
 
 			case LOG_FMT_tr: // %tr = start of request date
 				/* Note that the timers are valid if we get here */
-				tv_ms_add(&tv, &s->logs.accept_date, s->logs.t_idle >= 0 ? s->logs.t_idle + s->logs.t_handshake : 0);
+				tv_ms_add(&tv, &logs->accept_date, logs->t_idle >= 0 ? logs->t_idle + logs->t_handshake : 0);
 				get_localtime(tv.tv_sec, &tm);
 				ret = date2str_log(tmplog, &tm, &tv, dst + maxsize - tmplog);
 				if (ret == NULL)
@@ -1539,7 +2363,7 @@ int build_logline(struct stream *s, char *dst, size_t maxsize, struct list *list
 				break;
 
 			case LOG_FMT_DATEGMT: // %T = accept date, GMT
-				get_gmtime(s->logs.accept_date.tv_sec, &tm);
+				get_gmtime(logs->accept_date.tv_sec, &tm);
 				ret = gmt2str_log(tmplog, &tm, dst + maxsize - tmplog);
 				if (ret == NULL)
 					goto out;
@@ -1548,7 +2372,7 @@ int build_logline(struct stream *s, char *dst, size_t maxsize, struct list *list
 				break;
 
 			case LOG_FMT_trg: // %trg = start of request date, GMT
-				tv_ms_add(&tv, &s->logs.accept_date, s->logs.t_idle >= 0 ? s->logs.t_idle + s->logs.t_handshake : 0);
+				tv_ms_add(&tv, &logs->accept_date, logs->t_idle >= 0 ? logs->t_idle + logs->t_handshake : 0);
 				get_gmtime(tv.tv_sec, &tm);
 				ret = gmt2str_log(tmplog, &tm, dst + maxsize - tmplog);
 				if (ret == NULL)
@@ -1558,8 +2382,8 @@ int build_logline(struct stream *s, char *dst, size_t maxsize, struct list *list
 				break;
 
 			case LOG_FMT_DATELOCAL: // %Tl = accept date, local
-				get_localtime(s->logs.accept_date.tv_sec, &tm);
-				ret = localdate2str_log(tmplog, s->logs.accept_date.tv_sec, &tm, dst + maxsize - tmplog);
+				get_localtime(logs->accept_date.tv_sec, &tm);
+				ret = localdate2str_log(tmplog, logs->accept_date.tv_sec, &tm, dst + maxsize - tmplog);
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
@@ -1567,7 +2391,7 @@ int build_logline(struct stream *s, char *dst, size_t maxsize, struct list *list
 				break;
 
 			case LOG_FMT_trl: // %trl = start of request date, local
-				tv_ms_add(&tv, &s->logs.accept_date, s->logs.t_idle >= 0 ? s->logs.t_idle + s->logs.t_handshake : 0);
+				tv_ms_add(&tv, &logs->accept_date, logs->t_idle >= 0 ? logs->t_idle + logs->t_handshake : 0);
 				get_localtime(tv.tv_sec, &tm);
 				ret = localdate2str_log(tmplog, tv.tv_sec, &tm, dst + maxsize - tmplog);
 				if (ret == NULL)
@@ -1577,15 +2401,14 @@ int build_logline(struct stream *s, char *dst, size_t maxsize, struct list *list
 				break;
 
 			case LOG_FMT_TS: // %Ts
-				get_gmtime(s->logs.accept_date.tv_sec, &tm);
 				if (tmp->options & LOG_OPT_HEXA) {
-					iret = snprintf(tmplog, dst + maxsize - tmplog, "%04X", (unsigned int)s->logs.accept_date.tv_sec);
+					iret = snprintf(tmplog, dst + maxsize - tmplog, "%04X", (unsigned int)logs->accept_date.tv_sec);
 					if (iret < 0 || iret > dst + maxsize - tmplog)
 						goto out;
 					last_isspace = 0;
 					tmplog += iret;
 				} else {
-					ret = ltoa_o(s->logs.accept_date.tv_sec, tmplog, dst + maxsize - tmplog);
+					ret = ltoa_o(logs->accept_date.tv_sec, tmplog, dst + maxsize - tmplog);
 					if (ret == NULL)
 						goto out;
 					tmplog = ret;
@@ -1595,7 +2418,7 @@ int build_logline(struct stream *s, char *dst, size_t maxsize, struct list *list
 
 			case LOG_FMT_MS: // %ms
 			if (tmp->options & LOG_OPT_HEXA) {
-					iret = snprintf(tmplog, dst + maxsize - tmplog, "%02X",(unsigned int)s->logs.accept_date.tv_usec/1000);
+					iret = snprintf(tmplog, dst + maxsize - tmplog, "%02X",(unsigned int)logs->accept_date.tv_usec/1000);
 					if (iret < 0 || iret > dst + maxsize - tmplog)
 						goto out;
 					last_isspace = 0;
@@ -1603,7 +2426,7 @@ int build_logline(struct stream *s, char *dst, size_t maxsize, struct list *list
 			} else {
 				if ((dst + maxsize - tmplog) < 4)
 					goto out;
-				ret = utoa_pad((unsigned int)s->logs.accept_date.tv_usec/1000,
+				ret = utoa_pad((unsigned int)logs->accept_date.tv_usec/1000,
 				               tmplog, 4);
 				if (ret == NULL)
 					goto out;
@@ -1629,10 +2452,8 @@ int build_logline(struct stream *s, char *dst, size_t maxsize, struct list *list
 				if (iret == 0)
 					goto out;
 				tmplog += iret;
-#ifdef USE_OPENSSL
-				if (sess->listener->xprt == &ssl_sock)
+				if (sess->listener->bind_conf->xprt == xprt_get(XPRT_SSL))
 					LOGCHAR('~');
-#endif
 				if (tmp->options & LOG_OPT_QUOTE)
 					LOGCHAR('"');
 				last_isspace = 0;
@@ -1642,8 +2463,7 @@ int build_logline(struct stream *s, char *dst, size_t maxsize, struct list *list
 				src = NULL;
 				conn = objt_conn(sess->origin);
 				if (conn) {
-					if (sess->listener->xprt == &ssl_sock)
-						src = ssl_sock_get_cipher_name(conn);
+					src = ssl_sock_get_cipher_name(conn);
 				}
 				ret = lf_text(tmplog, src, dst + maxsize - tmplog, tmp);
 				if (ret == NULL)
@@ -1656,8 +2476,7 @@ int build_logline(struct stream *s, char *dst, size_t maxsize, struct list *list
 				src = NULL;
 				conn = objt_conn(sess->origin);
 				if (conn) {
-					if (sess->listener->xprt == &ssl_sock)
-						src = ssl_sock_get_proto_version(conn);
+					src = ssl_sock_get_proto_version(conn);
 				}
 				ret = lf_text(tmplog, src, dst + maxsize - tmplog, tmp);
 				if (ret == NULL)
@@ -1676,12 +2495,12 @@ int build_logline(struct stream *s, char *dst, size_t maxsize, struct list *list
 				break;
 
 			case LOG_FMT_SERVER: // %s
-				switch (obj_type(s->target)) {
+				switch (obj_type(s ? s->target : NULL)) {
 				case OBJ_TYPE_SERVER:
-					src = objt_server(s->target)->id;
+					src = __objt_server(s->target)->id;
 					break;
 				case OBJ_TYPE_APPLET:
-					src = objt_applet(s->target)->name;
+					src = __objt_applet(s->target)->name;
 					break;
 				default:
 					src = "<NOSRV>";
@@ -1695,7 +2514,7 @@ int build_logline(struct stream *s, char *dst, size_t maxsize, struct list *list
 				break;
 
 			case LOG_FMT_Th: // %Th = handshake time
-				ret = ltoa_o(s->logs.t_handshake, tmplog, dst + maxsize - tmplog);
+				ret = ltoa_o(logs->t_handshake, tmplog, dst + maxsize - tmplog);
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
@@ -1703,7 +2522,7 @@ int build_logline(struct stream *s, char *dst, size_t maxsize, struct list *list
 				break;
 
 			case LOG_FMT_Ti: // %Ti = HTTP idle time
-				ret = ltoa_o(s->logs.t_idle, tmplog, dst + maxsize - tmplog);
+				ret = ltoa_o(logs->t_idle, tmplog, dst + maxsize - tmplog);
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
@@ -1711,7 +2530,7 @@ int build_logline(struct stream *s, char *dst, size_t maxsize, struct list *list
 				break;
 
 			case LOG_FMT_TR: // %TR = HTTP request time
-				ret = ltoa_o((t_request >= 0) ? t_request - s->logs.t_idle - s->logs.t_handshake : -1,
+				ret = ltoa_o((t_request >= 0) ? t_request - logs->t_idle - logs->t_handshake : -1,
 				             tmplog, dst + maxsize - tmplog);
 				if (ret == NULL)
 					goto out;
@@ -1728,7 +2547,7 @@ int build_logline(struct stream *s, char *dst, size_t maxsize, struct list *list
 				break;
 
 			case LOG_FMT_TW: // %Tw
-				ret = ltoa_o((s->logs.t_queue >= 0) ? s->logs.t_queue - t_request : -1,
+				ret = ltoa_o((logs->t_queue >= 0) ? logs->t_queue - t_request : -1,
 						tmplog, dst + maxsize - tmplog);
 				if (ret == NULL)
 					goto out;
@@ -1737,7 +2556,7 @@ int build_logline(struct stream *s, char *dst, size_t maxsize, struct list *list
 				break;
 
 			case LOG_FMT_TC: // %Tc
-				ret = ltoa_o((s->logs.t_connect >= 0) ? s->logs.t_connect - s->logs.t_queue : -1,
+				ret = ltoa_o((logs->t_connect >= 0) ? logs->t_connect - logs->t_queue : -1,
 						tmplog, dst + maxsize - tmplog);
 				if (ret == NULL)
 					goto out;
@@ -1746,7 +2565,7 @@ int build_logline(struct stream *s, char *dst, size_t maxsize, struct list *list
 				break;
 
 			case LOG_FMT_Tr: // %Tr
-				ret = ltoa_o((s->logs.t_data >= 0) ? s->logs.t_data - s->logs.t_connect : -1,
+				ret = ltoa_o((logs->t_data >= 0) ? logs->t_data - logs->t_connect : -1,
 						tmplog, dst + maxsize - tmplog);
 				if (ret == NULL)
 					goto out;
@@ -1755,11 +2574,11 @@ int build_logline(struct stream *s, char *dst, size_t maxsize, struct list *list
 				break;
 
 			case LOG_FMT_TD: // %Td
-				if (s->be->mode == PR_MODE_HTTP)
-					ret = ltoa_o((s->logs.t_data >= 0) ? s->logs.t_close - s->logs.t_data : -1,
+				if (be->mode == PR_MODE_HTTP)
+					ret = ltoa_o((logs->t_data >= 0) ? logs->t_close - logs->t_data : -1,
 					             tmplog, dst + maxsize - tmplog);
 				else
-					ret = ltoa_o((s->logs.t_connect >= 0) ? s->logs.t_close - s->logs.t_connect : -1,
+					ret = ltoa_o((logs->t_connect >= 0) ? logs->t_close - logs->t_connect : -1,
 					             tmplog, dst + maxsize - tmplog);
 				if (ret == NULL)
 					goto out;
@@ -1770,7 +2589,7 @@ int build_logline(struct stream *s, char *dst, size_t maxsize, struct list *list
 			case LOG_FMT_Ta:  // %Ta = active time = Tt - Th - Ti
 				if (!(fe->to_log & LW_BYTES))
 					LOGCHAR('+');
-				ret = ltoa_o(s->logs.t_close - (s->logs.t_idle >= 0 ? s->logs.t_idle + s->logs.t_handshake : 0),
+				ret = ltoa_o(logs->t_close - (logs->t_idle >= 0 ? logs->t_idle + logs->t_handshake : 0),
 					     tmplog, dst + maxsize - tmplog);
 				if (ret == NULL)
 					goto out;
@@ -1781,7 +2600,18 @@ int build_logline(struct stream *s, char *dst, size_t maxsize, struct list *list
 			case LOG_FMT_TT:  // %Tt = total time
 				if (!(fe->to_log & LW_BYTES))
 					LOGCHAR('+');
-				ret = ltoa_o(s->logs.t_close, tmplog, dst + maxsize - tmplog);
+				ret = ltoa_o(logs->t_close, tmplog, dst + maxsize - tmplog);
+				if (ret == NULL)
+					goto out;
+				tmplog = ret;
+				last_isspace = 0;
+				break;
+
+			case LOG_FMT_TU:  // %Tu = total time seen by user = Tt - Ti
+				if (!(fe->to_log & LW_BYTES))
+					LOGCHAR('+');
+				ret = ltoa_o(logs->t_close - (logs->t_idle >= 0 ? logs->t_idle : 0),
+					     tmplog, dst + maxsize - tmplog);
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
@@ -1789,7 +2619,7 @@ int build_logline(struct stream *s, char *dst, size_t maxsize, struct list *list
 				break;
 
 			case LOG_FMT_STATUS: // %ST
-				ret = ltoa_o(txn ? txn->status : 0, tmplog, dst + maxsize - tmplog);
+				ret = ltoa_o(status, tmplog, dst + maxsize - tmplog);
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
@@ -1799,7 +2629,7 @@ int build_logline(struct stream *s, char *dst, size_t maxsize, struct list *list
 			case LOG_FMT_BYTES: // %B
 				if (!(fe->to_log & LW_BYTES))
 					LOGCHAR('+');
-				ret = lltoa(s->logs.bytes_out, tmplog, dst + maxsize - tmplog);
+				ret = lltoa(logs->bytes_out, tmplog, dst + maxsize - tmplog);
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
@@ -1807,7 +2637,7 @@ int build_logline(struct stream *s, char *dst, size_t maxsize, struct list *list
 				break;
 
 			case LOG_FMT_BYTES_UP: // %U
-				ret = lltoa(s->logs.bytes_in, tmplog, dst + maxsize - tmplog);
+				ret = lltoa(logs->bytes_in, tmplog, dst + maxsize - tmplog);
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
@@ -1833,15 +2663,15 @@ int build_logline(struct stream *s, char *dst, size_t maxsize, struct list *list
 				break;
 
 			case LOG_FMT_TERMSTATE: // %ts
-				LOGCHAR(sess_term_cond[(s->flags & SF_ERR_MASK) >> SF_ERR_SHIFT]);
-				LOGCHAR(sess_fin_state[(s->flags & SF_FINST_MASK) >> SF_FINST_SHIFT]);
+				LOGCHAR(sess_term_cond[(s_flags & SF_ERR_MASK) >> SF_ERR_SHIFT]);
+				LOGCHAR(sess_fin_state[(s_flags & SF_FINST_MASK) >> SF_FINST_SHIFT]);
 				*tmplog = '\0';
 				last_isspace = 0;
 				break;
 
 			case LOG_FMT_TERMSTATE_CK: // %tsc, same as TS with cookie state (for mode HTTP)
-				LOGCHAR(sess_term_cond[(s->flags & SF_ERR_MASK) >> SF_ERR_SHIFT]);
-				LOGCHAR(sess_fin_state[(s->flags & SF_FINST_MASK) >> SF_FINST_SHIFT]);
+				LOGCHAR(sess_term_cond[(s_flags & SF_ERR_MASK) >> SF_ERR_SHIFT]);
+				LOGCHAR(sess_fin_state[(s_flags & SF_FINST_MASK) >> SF_FINST_SHIFT]);
 				LOGCHAR((txn && (be->ck_opts & PR_CK_ANY)) ? sess_cookie[(txn->flags & TX_CK_MASK) >> TX_CK_SHIFT] : '-');
 				LOGCHAR((txn && (be->ck_opts & PR_CK_ANY)) ? sess_set_cookie[(txn->flags & TX_SCK_MASK) >> TX_SCK_SHIFT] : '-');
 				last_isspace = 0;
@@ -1872,7 +2702,7 @@ int build_logline(struct stream *s, char *dst, size_t maxsize, struct list *list
 				break;
 
 			case LOG_FMT_SRVCONN:  // %sc
-				ret = ultoa_o(objt_server(s->target) ?
+				ret = ultoa_o(objt_server(s ? s->target : NULL) ?
 				                 objt_server(s->target)->cur_sess :
 				                 0, tmplog, dst + maxsize - tmplog);
 				if (ret == NULL)
@@ -1882,9 +2712,9 @@ int build_logline(struct stream *s, char *dst, size_t maxsize, struct list *list
 				break;
 
 			case LOG_FMT_RETRIES:  // %rq
-				if (s->flags & SF_REDISP)
+				if (s_flags & SF_REDISP)
 					LOGCHAR('+');
-				ret = ltoa_o((s->si[1].conn_retries>0) ?
+				ret = ltoa_o((s && s->si[1].conn_retries > 0) ?
 				                (be->conn_retries - s->si[1].conn_retries) :
 				                be->conn_retries, tmplog, dst + maxsize - tmplog);
 				if (ret == NULL)
@@ -1894,7 +2724,7 @@ int build_logline(struct stream *s, char *dst, size_t maxsize, struct list *list
 				break;
 
 			case LOG_FMT_SRVQUEUE: // %sq
-				ret = ltoa_o(s->logs.srv_queue_size, tmplog, dst + maxsize - tmplog);
+				ret = ltoa_o(logs->srv_queue_pos, tmplog, dst + maxsize - tmplog);
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
@@ -1902,7 +2732,7 @@ int build_logline(struct stream *s, char *dst, size_t maxsize, struct list *list
 				break;
 
 			case LOG_FMT_BCKQUEUE:  // %bq
-				ret = ltoa_o(s->logs.prx_queue_size, tmplog, dst + maxsize - tmplog);
+				ret = ltoa_o(logs->prx_queue_pos, tmplog, dst + maxsize - tmplog);
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
@@ -1911,7 +2741,7 @@ int build_logline(struct stream *s, char *dst, size_t maxsize, struct list *list
 
 			case LOG_FMT_HDRREQUEST: // %hr
 				/* request header */
-				if (fe->nb_req_cap && s->req_cap) {
+				if (fe->nb_req_cap && s && s->req_cap) {
 					if (tmp->options & LOG_OPT_QUOTE)
 						LOGCHAR('"');
 					LOGCHAR('{');
@@ -1935,7 +2765,7 @@ int build_logline(struct stream *s, char *dst, size_t maxsize, struct list *list
 
 			case LOG_FMT_HDRREQUESTLIST: // %hrl
 				/* request header list */
-				if (fe->nb_req_cap && s->req_cap) {
+				if (fe->nb_req_cap && s && s->req_cap) {
 					for (hdr = 0; hdr < fe->nb_req_cap; hdr++) {
 						if (hdr > 0)
 							LOGCHAR(' ');
@@ -1959,7 +2789,7 @@ int build_logline(struct stream *s, char *dst, size_t maxsize, struct list *list
 
 			case LOG_FMT_HDRRESPONS: // %hs
 				/* response header */
-				if (fe->nb_rsp_cap && s->res_cap) {
+				if (fe->nb_rsp_cap && s && s->res_cap) {
 					if (tmp->options & LOG_OPT_QUOTE)
 						LOGCHAR('"');
 					LOGCHAR('{');
@@ -1983,7 +2813,7 @@ int build_logline(struct stream *s, char *dst, size_t maxsize, struct list *list
 
 			case LOG_FMT_HDRRESPONSLIST: // %hsl
 				/* response header list */
-				if (fe->nb_rsp_cap && s->res_cap) {
+				if (fe->nb_rsp_cap && s && s->res_cap) {
 					for (hdr = 0; hdr < fe->nb_rsp_cap; hdr++) {
 						if (hdr > 0)
 							LOGCHAR(' ');
@@ -2041,11 +2871,57 @@ int build_logline(struct stream *s, char *dst, size_t maxsize, struct list *list
 					spc++;
 
 				if (!txn || !txn->uri || nspaces == 0) {
-					chunk.str = "<BADREQ>";
-					chunk.len = strlen("<BADREQ>");
+					chunk.area = "<BADREQ>";
+					chunk.data = strlen("<BADREQ>");
 				} else {
-					chunk.str = uri;
-					chunk.len = spc - uri;
+					chunk.area = uri;
+					chunk.data = spc - uri;
+				}
+
+				ret = lf_encode_chunk(tmplog, dst + maxsize, '#', url_encode_map, &chunk, tmp);
+				if (ret == NULL || *ret != '\0')
+					goto out;
+
+				tmplog = ret;
+				if (tmp->options & LOG_OPT_QUOTE)
+					LOGCHAR('"');
+
+				last_isspace = 0;
+				break;
+
+			case LOG_FMT_HTTP_PATH_ONLY: // %HPO
+				uri = txn && txn->uri ? txn->uri : "<BADREQ>";
+
+				if (tmp->options & LOG_OPT_QUOTE)
+					LOGCHAR('"');
+
+				end = uri + strlen(uri);
+
+				// look for the first whitespace character
+				while (uri < end && !HTTP_IS_SPHT(*uri))
+					uri++;
+
+				// keep advancing past multiple spaces
+				while (uri < end && HTTP_IS_SPHT(*uri)) {
+					uri++; nspaces++;
+				}
+
+				// look for first space after url
+				spc = uri;
+				while (spc < end && !HTTP_IS_SPHT(*spc))
+					spc++;
+
+				path.ptr = uri;
+				path.len = spc - uri;
+
+				// extract relative path without query params from url
+				path = iststop(http_get_path(path), '?');
+				if (!txn || !txn->uri || nspaces == 0) {
+					chunk.area = "<BADREQ>";
+					chunk.data = strlen("<BADREQ>");
+				} else {
+					chunk.area = path.ptr;
+					chunk.data = path.len;
 				}
 
 				ret = lf_encode_chunk(tmplog, dst + maxsize, '#', url_encode_map, &chunk, tmp);
@@ -2064,8 +2940,8 @@ int build_logline(struct stream *s, char *dst, size_t maxsize, struct list *list
 					LOGCHAR('"');
 
 				if (!txn || !txn->uri) {
-					chunk.str = "<BADREQ>";
-					chunk.len = strlen("<BADREQ>");
+					chunk.area = "<BADREQ>";
+					chunk.data = strlen("<BADREQ>");
 				} else {
 					uri = txn->uri;
 					end = uri + strlen(uri);
@@ -2078,8 +2954,8 @@ int build_logline(struct stream *s, char *dst, size_t maxsize, struct list *list
 					while (uri < end && !HTTP_IS_SPHT(*uri))
 						uri++;
 
-					chunk.str = qmark;
-					chunk.len = uri - qmark;
+					chunk.area = qmark;
+					chunk.data = uri - qmark;
 				}
 
 				ret = lf_encode_chunk(tmplog, dst + maxsize, '#', url_encode_map, &chunk, tmp);
@@ -2115,11 +2991,11 @@ int build_logline(struct stream *s, char *dst, size_t maxsize, struct list *list
 					spc++;
 
 				if (!txn || !txn->uri || nspaces == 0) {
-					chunk.str = "<BADREQ>";
-					chunk.len = strlen("<BADREQ>");
+					chunk.area = "<BADREQ>";
+					chunk.data = strlen("<BADREQ>");
 				} else {
-					chunk.str = uri;
-					chunk.len = spc - uri;
+					chunk.area = uri;
+					chunk.data = spc - uri;
 				}
 
 				ret = lf_encode_chunk(tmplog, dst + maxsize, '#', url_encode_map, &chunk, tmp);
@@ -2145,11 +3021,11 @@ int build_logline(struct stream *s, char *dst, size_t maxsize, struct list *list
 					spc++;
 
 				if (spc == end) { // odd case, we have txn->uri, but we only got a verb
-					chunk.str = "<BADREQ>";
-					chunk.len = strlen("<BADREQ>");
+					chunk.area = "<BADREQ>";
+					chunk.data = strlen("<BADREQ>");
 				} else {
-					chunk.str = uri;
-					chunk.len = spc - uri;
+					chunk.area = uri;
+					chunk.data = spc - uri;
 				}
 
 				ret = lf_encode_chunk(tmplog, dst + maxsize, '#', url_encode_map, &chunk, tmp);
@@ -2187,14 +3063,14 @@ int build_logline(struct stream *s, char *dst, size_t maxsize, struct list *list
 					uri++;
 
 				if (!txn || !txn->uri || nspaces == 0) {
-					chunk.str = "<BADREQ>";
-					chunk.len = strlen("<BADREQ>");
+					chunk.area = "<BADREQ>";
+					chunk.data = strlen("<BADREQ>");
 				} else if (uri == end) {
-					chunk.str = "HTTP/0.9";
-					chunk.len = strlen("HTTP/0.9");
+					chunk.area = "HTTP/0.9";
+					chunk.data = strlen("HTTP/0.9");
 				} else {
-					chunk.str = uri;
-					chunk.len = end - uri;
+					chunk.area = uri;
+					chunk.data = end - uri;
 				}
 
 				ret = lf_encode_chunk(tmplog, dst + maxsize, '#', url_encode_map, &chunk, tmp);
@@ -2210,13 +3086,13 @@ int build_logline(struct stream *s, char *dst, size_t maxsize, struct list *list
 
 			case LOG_FMT_COUNTER: // %rt
 				if (tmp->options & LOG_OPT_HEXA) {
-					iret = snprintf(tmplog, dst + maxsize - tmplog, "%04X", s->uniq_id);
+					iret = snprintf(tmplog, dst + maxsize - tmplog, "%04X", uniq_id);
 					if (iret < 0 || iret > dst + maxsize - tmplog)
 						goto out;
 					last_isspace = 0;
 					tmplog += iret;
 				} else {
-					ret = ltoa_o(s->uniq_id, tmplog, dst + maxsize - tmplog);
+					ret = ltoa_o(uniq_id, tmplog, dst + maxsize - tmplog);
 					if (ret == NULL)
 						goto out;
 					tmplog = ret;
@@ -2267,8 +3143,10 @@ int build_logline(struct stream *s, char *dst, size_t maxsize, struct list *list
 
 			case LOG_FMT_UNIQUEID: // %ID
 				ret = NULL;
-				src = s->unique_id;
-				ret = lf_text(tmplog, src, maxsize - (tmplog - dst), tmp);
+				if (s)
+					ret = lf_text_len(tmplog, s->unique_id.ptr, s->unique_id.len, maxsize - (tmplog - dst), tmp);
+				else
+					ret = lf_text_len(tmplog, NULL, 0, maxsize - (tmplog - dst), tmp);
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
@@ -2322,9 +3200,8 @@ void strm_log(struct stream *s)
 	}
 
 	/* if unique-id was not generated */
-	if (!s->unique_id && !LIST_ISEMPTY(&sess->fe->format_unique_id)) {
-		if ((s->unique_id = pool_alloc2(pool2_uniqueid)) != NULL)
-			build_logline(s, s->unique_id, UNIQUEID_LEN, &sess->fe->format_unique_id);
+	if (!isttest(s->unique_id) && !LIST_ISEMPTY(&sess->fe->format_unique_id)) {
+		stream_generate_unique_id(s, &sess->fe->format_unique_id);
 	}
 
 	if (!LIST_ISEMPTY(&sess->fe->logformat_sd)) {
@@ -2334,11 +3211,899 @@ void strm_log(struct stream *s)
 
 	size = build_logline(s, logline, global.max_syslog_len, &sess->fe->logformat);
 	if (size > 0) {
-		sess->fe->log_count++;
-		__send_log(sess->fe, level, logline, size + 1, logline_rfc5424, sd_size);
+		_HA_ATOMIC_ADD(&sess->fe->log_count, 1);
+		__send_log(&sess->fe->logsrvs, &sess->fe->log_tag, level,
+			   logline, size + 1, logline_rfc5424, sd_size);
 		s->logs.logwait = 0;
 	}
 }
+
+/*
+ * send a minimalist log for the session. Will not log if the frontend has no
+ * log defined. It is assumed that this is only used to report anomalies that
+ * cannot lead to the creation of a regular stream. Because of this the log
+ * level is LOG_INFO or LOG_ERR depending on the "log-separate-error" setting
+ * in the frontend. The caller must simply know that it should not call this
+ * function to report unimportant events. It is safe to call this function with
+ * sess==NULL (will not do anything).
+ */
+void sess_log(struct session *sess)
+{
+	int size, level;
+	int sd_size = 0;
+
+	if (!sess)
+		return;
+
+	if (LIST_ISEMPTY(&sess->fe->logsrvs))
+		return;
+
+	level = LOG_INFO;
+	if (sess->fe->options2 & PR_O2_LOGERRORS)
+		level = LOG_ERR;
+
+	if (!LIST_ISEMPTY(&sess->fe->logformat_sd)) {
+		sd_size = sess_build_logline(sess, NULL,
+		                             logline_rfc5424, global.max_syslog_len,
+		                             &sess->fe->logformat_sd);
+	}
+
+	size = sess_build_logline(sess, NULL, logline, global.max_syslog_len, &sess->fe->logformat);
+	if (size > 0) {
+		_HA_ATOMIC_ADD(&sess->fe->log_count, 1);
+		__send_log(&sess->fe->logsrvs, &sess->fe->log_tag, level,
+			   logline, size + 1, logline_rfc5424, sd_size);
+	}
+}
+
+void app_log(struct list *logsrvs, struct buffer *tag, int level, const char *format, ...)
+{
+	va_list argp;
+	int  data_len;
+
+	if (level < 0 || format == NULL || logline == NULL)
+		return;
+
+	va_start(argp, format);
+	data_len = vsnprintf(logline, global.max_syslog_len, format, argp);
+	if (data_len < 0 || data_len > global.max_syslog_len)
+		data_len = global.max_syslog_len;
+	va_end(argp);
+
+	__send_log(logsrvs, tag, level, logline, data_len, default_rfc5424_sd_log_format, 2);
+}
+/*
+ * This function parse a received log message <buf>, of size <buflen>
+ * it fills <level>, <facility> and <metadata> depending of the detected
+ * header format and message will point on remaining payload of <size>
+ *
+ * <metadata> must point on a preallocated array of LOG_META_FIELDS*sizeof(struct ist)
+ * struct ist len will be set to 0 if field is not found
+ * <level> and <facility> will be set to -1 if not found.
+ */
+void parse_log_message(char *buf, size_t buflen, int *level, int *facility,
+                       struct ist *metadata, char **message, size_t *size)
+{
+
+	char *p;
+	int fac_level = 0;
+
+	*level = *facility = -1;
+
+	*message = buf;
+	*size = buflen;
+
+	memset(metadata, 0, LOG_META_FIELDS*sizeof(struct ist));
+
+	p = buf;
+	if (*size < 2 || *p != '<')
+		return;
+
+	p++;
+	while (*p != '>') {
+		if (*p > '9' || *p < '0')
+			return;
+		fac_level = 10*fac_level + (*p - '0');
+		p++;
+		if ((p - buf) > buflen)
+			return;
+	}
+
+	*facility = fac_level >> 3;
+	*level = fac_level & 0x7;
+	p++;
+
+	metadata[LOG_META_PRIO] = ist2(buf, p - buf);
+
+	buflen -= p - buf;
+	buf = p;
+
+	*size = buflen;
+	*message = buf;
+
+	/* for rfc5424, prio is always followed by '1' and ' ' */
+	if ((*size > 2) && (p[0] == '1') && (p[1] == ' ')) {
+		/* format is always '1 TIMESTAMP HOSTNAME TAG PID MSGID STDATA '
+		 * followed by message.
+		 * Each header field can present NILVALUE: '-'
+		 */
+
+		p += 2;
+		/* timestamp is NILVALUE '-' */
+		if (*size > 2 && (p[0] == '-') && p[1] == ' ') {
+			metadata[LOG_META_TIME] = ist2(p, 1);
+			p++;
+		}
+		else if (*size > LOG_ISOTIME_MINLEN) {
+			metadata[LOG_META_TIME].ptr = p;
+
+			/* check if optional secfrac is present
+			 * in timestamp.
+			 * possible format are:
+			 * ex: '1970-01-01T00:00:00.000000Z'
+			 *     '1970-01-01T00:00:00.000000+00:00'
+			 *     '1970-01-01T00:00:00.000000-00:00'
+			 *     '1970-01-01T00:00:00Z'
+			 *     '1970-01-01T00:00:00+00:00'
+			 *     '1970-01-01T00:00:00-00:00'
+			 */
+			p += 19;
+			if (*p == '.') {
+				p++;
+				if ((p - buf) >= buflen)
+					goto bad_format;
+				while (*p != 'Z' && *p != '+' && *p != '-') {
+					if ((unsigned char)(*p - '0') > 9)
+						goto bad_format;
+
+					p++;
+					if ((p - buf) >= buflen)
+						goto bad_format;
+				}
+			}
+
+			if (*p == 'Z')
+				p++;
+			else
+				p += 6; /* case of '+00:00 or '-00:00' */
+
+			if ((p - buf) >= buflen || *p != ' ')
+				goto bad_format;
+			metadata[LOG_META_TIME].len = p - metadata[LOG_META_TIME].ptr;
+		}
+		else
+			goto bad_format;
+
+
+		p++;
+		if ((p - buf) >= buflen || *p == ' ')
+			goto bad_format;
+
+		metadata[LOG_META_HOST].ptr = p;
+		while (*p != ' ') {
+			p++;
+			if ((p - buf) >= buflen)
+				goto bad_format;
+		}
+		metadata[LOG_META_HOST].len = p - metadata[LOG_META_HOST].ptr;
+		if (metadata[LOG_META_HOST].len == 1 && metadata[LOG_META_HOST].ptr[0] == '-')
+			metadata[LOG_META_HOST].len = 0;
+
+		p++;
+		if ((p - buf) >= buflen || *p == ' ')
+			goto bad_format;
+
+		metadata[LOG_META_TAG].ptr = p;
+		while (*p != ' ') {
+			p++;
+			if ((p - buf) >= buflen)
+				goto bad_format;
+		}
+		metadata[LOG_META_TAG].len = p - metadata[LOG_META_TAG].ptr;
+		if (metadata[LOG_META_TAG].len == 1 && metadata[LOG_META_TAG].ptr[0] == '-')
+			metadata[LOG_META_TAG].len = 0;
+
+		p++;
+		if ((p - buf) >= buflen || *p == ' ')
+			goto bad_format;
+
+		metadata[LOG_META_PID].ptr = p;
+		while (*p != ' ') {
+			p++;
+			if ((p - buf) >= buflen)
+				goto bad_format;
+		}
+		metadata[LOG_META_PID].len = p - metadata[LOG_META_PID].ptr;
+		if (metadata[LOG_META_PID].len == 1 && metadata[LOG_META_PID].ptr[0] == '-')
+			metadata[LOG_META_PID].len = 0;
+
+		p++;
+		if ((p - buf) >= buflen || *p == ' ')
+			goto bad_format;
+
+		metadata[LOG_META_MSGID].ptr = p;
+		while (*p != ' ') {
+			p++;
+			if ((p - buf) >= buflen)
+				goto bad_format;
+		}
+		metadata[LOG_META_MSGID].len = p - metadata[LOG_META_MSGID].ptr;
+		if (metadata[LOG_META_MSGID].len == 1 && metadata[LOG_META_MSGID].ptr[0] == '-')
+			metadata[LOG_META_MSGID].len = 0;
+
+		p++;
+		if ((p - buf) >= buflen || *p == ' ')
+			goto bad_format;
+
+		/* structured data format is:
+		 * ex:
+		 *    '[key1=value1 key2=value2][key3=value3]'
+		 *
+		 * space is invalid outside [] because
+		 * considered as the end of structured data field
+		 */
+		metadata[LOG_META_STDATA].ptr = p;
+		if (*p == '[') {
+			int elem = 0;
+
+			while (1) {
+				if (elem) {
+					/* according to rfc this char is escaped in param values */
+					if (*p == ']' && *(p-1) != '\\')
+						elem = 0;
+				}
+				else {
+					if (*p == '[')
+						elem = 1;
+					else if (*p == ' ')
+						break;
+					else
+						goto bad_format;
+				}
+				p++;
+				if ((p - buf) >= buflen)
+					goto bad_format;
+			}
+		}
+		else if (*p == '-') {
+			/* case of NILVALUE */
+			p++;
+			if ((p - buf) >= buflen || *p != ' ')
+				goto bad_format;
+		}
+		else
+			goto bad_format;
+
+		metadata[LOG_META_STDATA].len = p - metadata[LOG_META_STDATA].ptr;
+		if (metadata[LOG_META_STDATA].len == 1 && metadata[LOG_META_STDATA].ptr[0] == '-')
+			metadata[LOG_META_STDATA].len = 0;
+
+		p++;
+
+		buflen -= p - buf;
+		buf = p;
+
+		*size = buflen;
+		*message = p;
+	}
+	else if (*size > LOG_LEGACYTIME_LEN) {
+		int m;
+
+		/* supported header format according to rfc3164.
+		 * ex:
+		 *  'Jan  1 00:00:00 HOSTNAME TAG[PID]: '
+		 *  or 'Jan  1 00:00:00 HOSTNAME TAG: '
+		 *  or 'Jan  1 00:00:00 HOSTNAME '
+		 * Note: HOSTNAME is mandatory, and day
+		 * of month uses a single space prefix if
+		 * less than 10 to ensure hour offset is
+		 * always the same.
+		 */
+
+		/* Check month to see if it correspond to a rfc3164
+		 * header ex 'Jan  1 00:00:00' */
+		for (m = 0; m < 12; m++)
+			if (!memcmp(monthname[m], p, 3))
+				break;
+		/* Month not found */
+		if (m == 12)
+			goto bad_format;
+
+		metadata[LOG_META_TIME] = ist2(p, LOG_LEGACYTIME_LEN);
+
+		p += LOG_LEGACYTIME_LEN;
+		if ((p - buf) >= buflen || *p != ' ')
+			goto bad_format;
+
+		p++;
+		if ((p - buf) >= buflen || *p == ' ')
+			goto bad_format;
+
+		metadata[LOG_META_HOST].ptr = p;
+		while (*p != ' ') {
+			p++;
+			if ((p - buf) >= buflen)
+				goto bad_format;
+		}
+		metadata[LOG_META_HOST].len = p - metadata[LOG_META_HOST].ptr;
+
+		/* TAG seems to no be mandatory */
+		p++;
+
+		buflen -= p - buf;
+		buf = p;
+
+		*size = buflen;
+		*message = buf;
+
+		if (!buflen)
+			return;
+
+		while (((p  - buf) < buflen) && *p != ' ' && *p != ':')
+			p++;
+
+		/* a tag must present a trailing ':' */
+		if (((p - buf) >= buflen) || *p != ':')
+			return;
+		p++;
+		/* followed by a space */
+		if (((p - buf) >= buflen) || *p != ' ')
+			return;
+
+		/* rewind to parse tag and pid */
+		p = buf;
+		metadata[LOG_META_TAG].ptr = p;
+		/* we have the guarantee that ':' will be reach before size limit */
+		while (*p != ':') {
+			if (*p == '[') {
+				metadata[LOG_META_TAG].len = p - metadata[LOG_META_TAG].ptr;
+				metadata[LOG_META_PID].ptr = p + 1;
+			}
+			else if (*p == ']' && metadata[LOG_META_PID].ptr) {
+				if (p[1] != ':')
+					return;
+				metadata[LOG_META_PID].len = p - metadata[LOG_META_PID].ptr;
+			}
+			p++;
+		}
+		if (!metadata[LOG_META_TAG].len)
+			metadata[LOG_META_TAG].len = p - metadata[LOG_META_TAG].ptr;
+
+		/* let pass ':' and ' ', we still have warranty size is large enough */
+		p += 2;
+
+		buflen -= p - buf;
+		buf = p;
+
+		*size = buflen;
+		*message = buf;
+	}
+
+	return;
+
+bad_format:
+	/* bad syslog format, we reset all parsed syslog fields
+	 * but priority is kept because we are able to re-build
+	 * this message using LOF_FORMAT_PRIO.
+	 */
+	metadata[LOG_META_TIME].len = 0;
+	metadata[LOG_META_HOST].len = 0;
+	metadata[LOG_META_TAG].len = 0;
+	metadata[LOG_META_PID].len = 0;
+	metadata[LOG_META_MSGID].len = 0;
+	metadata[LOG_META_STDATA].len = 0;
+
+	return;
+}
+
+/*
+ * UDP syslog fd handler
+ */
+void syslog_fd_handler(int fd)
+{
+	static THREAD_LOCAL struct ist metadata[LOG_META_FIELDS];
+	ssize_t ret = 0;
+	struct buffer *buf = get_trash_chunk();
+	size_t size;
+	char *message;
+	int level;
+	int facility;
+	struct listener *l = objt_listener(fdtab[fd].owner);
+	int max_accept;
+
+	if(!l)
+		ABORT_NOW();
+
+	if (fdtab[fd].ev & FD_POLL_IN) {
+
+		if (!fd_recv_ready(fd))
+			return;
+
+		max_accept = l->maxaccept ? l->maxaccept : 1;
+
+		do {
+			/* Source address */
+			struct sockaddr_storage saddr = {0};
+			socklen_t saddrlen;
+
+			saddrlen = sizeof(saddr);
+
+			ret = recvfrom(fd, buf->area, buf->size, 0, (struct sockaddr *)&saddr, &saddrlen);
+			if (ret < 0) {
+				if (errno == EINTR)
+					continue;
+				if (errno == EAGAIN)
+					fd_cant_recv(fd);
+				goto out;
+			}
+			buf->data = ret;
+
+			/* update counters */
+			_HA_ATOMIC_ADD(&cum_log_messages, 1);
+			proxy_inc_fe_req_ctr(l, l->bind_conf->frontend);
+
+			parse_log_message(buf->area, buf->data, &level, &facility, metadata, &message, &size);
+
+			process_send_log(&l->bind_conf->frontend->logsrvs, level, facility, metadata, message, size);
+
+		} while (--max_accept);
+	}
+
+out:
+	return;
+}
+
+/*
+ * IO Handler to handle message exchange with a syslog tcp client
+ */
+static void syslog_io_handler(struct appctx *appctx)
+{
+	static THREAD_LOCAL struct ist metadata[LOG_META_FIELDS];
+	struct stream_interface *si = appctx->owner;
+	struct stream *s = si_strm(si);
+	struct proxy *frontend = strm_fe(s);
+	struct listener *l = strm_li(s);
+	struct buffer *buf = get_trash_chunk();
+	int max_accept;
+	int to_skip;
+	int facility;
+	int level;
+	char *message;
+	size_t size;
+
+	max_accept = l->maxaccept ? l->maxaccept : 1;
+	while (co_data(si_oc(si))) {
+		char c;
+
+		if (max_accept <= 0)
+			goto missing_budget;
+		max_accept--;
+
+		to_skip = co_getchar(si_oc(si), &c);
+		if (!to_skip)
+			goto missing_data;
+		else if (to_skip < 0)
+			goto cli_abort;
+
+		if (c == '<') {
+			/* rfc-6587, Non-Transparent-Framing: messages separated by
+			 * a trailing LF or CR LF
+			 */
+			to_skip = co_getline(si_oc(si), buf->area, buf->size);
+			if (!to_skip)
+				goto missing_data;
+			else if (to_skip < 0)
+				goto cli_abort;
+
+			if (buf->area[to_skip - 1] != '\n')
+				goto parse_error;
+
+			buf->data = to_skip - 1;
+
+			/* according to rfc-6587, some devices adds CR before LF */
+			if (buf->data && buf->area[buf->data - 1] == '\r')
+				buf->data--;
+
+		}
+		else if ((unsigned char)(c - '1') <= 8) {
+			/* rfc-6587, Octet-Counting: message length in ASCII
+			 * (first digit can not be ZERO), followed by a space
+			 * and message length
+			 */
+			char *p = NULL;
+			int msglen;
+
+			to_skip = co_getword(si_oc(si), buf->area, buf->size, ' ');
+			if (!to_skip)
+				goto missing_data;
+			else if (to_skip < 0)
+				goto cli_abort;
+
+			if (buf->area[to_skip - 1] != ' ')
+				goto parse_error;
+
+			msglen = strtol(trash.area, &p, 10);
+			if (!msglen || p != &buf->area[to_skip - 1])
+				goto parse_error;
+
+			/* message seems too large */
+			if (msglen > buf->size)
+				goto parse_error;
+
+			msglen = co_getblk(si_oc(si), buf->area, msglen, to_skip);
+			if (!msglen)
+				goto missing_data;
+			else if (msglen < 0)
+				goto cli_abort;
+
+
+			buf->data = msglen;
+			to_skip += msglen;
+		}
+		else
+			goto parse_error;
+
+		co_skip(si_oc(si), to_skip);
+
+		/* update counters */
+		_HA_ATOMIC_ADD(&cum_log_messages, 1);
+		proxy_inc_fe_req_ctr(l, frontend);
+
+		parse_log_message(buf->area, buf->data, &level, &facility, metadata, &message, &size);
+
+		process_send_log(&frontend->logsrvs, level, facility, metadata, message, size);
+
+	}
+
+missing_data:
+	/* we need more data to read */
+	si_oc(si)->flags |= CF_READ_DONTWAIT;
+
+	return;
+
+missing_budget:
+	/* it may remain some stuff to do, let's retry later */
+	appctx_wakeup(appctx);
+
+	return;
+
+parse_error:
+	if (l->counters)
+		_HA_ATOMIC_ADD(&l->counters->failed_req, 1);
+	_HA_ATOMIC_ADD(&frontend->fe_counters.failed_req, 1);
+
+	goto close;
+
+cli_abort:
+	if (l->counters)
+		_HA_ATOMIC_ADD(&l->counters->cli_aborts, 1);
+	_HA_ATOMIC_ADD(&frontend->fe_counters.cli_aborts, 1);
+
+close:
+	si_shutw(si);
+	si_shutr(si);
+
+	si_ic(si)->flags |= CF_READ_NULL;
+
+	return;
+}
+
+static struct applet syslog_applet = {
+	.obj_type = OBJ_TYPE_APPLET,
+	.name = "<SYSLOG>", /* used for logging */
+	.fct = syslog_io_handler,
+	.release = NULL,
+};
+
+/*
+ * Parse "log-forward" section and create corresponding sink buffer.
+ *
+ * The function returns 0 in success case, otherwise, it returns error
+ * flags.
+ */
+int cfg_parse_log_forward(const char *file, int linenum, char **args, int kwm)
+{
+	int err_code = 0;
+	struct proxy *px;
+	char *errmsg = NULL;
+	const char *err = NULL;
+
+	if (strcmp(args[0], "log-forward") == 0) {
+		if (!*args[1]) {
+			ha_alert("parsing [%s:%d] : missing name for ip-forward section.\n", file, linenum);
+			err_code |= ERR_ALERT | ERR_ABORT;
+			goto out;
+		}
+
+		if (alertif_too_many_args(1, file, linenum, args, &err_code))
+			goto out;
+
+		err = invalid_char(args[1]);
+		if (err) {
+			ha_alert("parsing [%s:%d] : character '%c' is not permitted in '%s' name '%s'.\n",
+			         file, linenum, *err, args[0], args[1]);
+			err_code |= ERR_ALERT | ERR_ABORT;
+			goto out;
+		}
+
+		px = log_forward_by_name(args[1]);
+		if (px) {
+			ha_alert("Parsing [%s:%d]: log-forward section '%s' has the same name as another log-forward section declared at %s:%d.\n",
+				 file, linenum, args[1], px->conf.file, px->conf.line);
+			err_code |= ERR_ALERT | ERR_FATAL;
+		}
+
+		px = proxy_find_by_name(args[1], 0, 0);
+		if (px) {
+			ha_alert("Parsing [%s:%d]: log forward section '%s' has the same name as %s '%s' declared at %s:%d.\n",
+			         file, linenum, args[1], proxy_type_str(px),
+			         px->id, px->conf.file, px->conf.line);
+			err_code |= ERR_ALERT | ERR_FATAL;
+		}
+
+		px = calloc(1, sizeof *px);
+		if (!px) {
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+
+		px->next = cfg_log_forward;
+		cfg_log_forward = px;
+
+		init_new_proxy(px);
+		px->conf.file = strdup(file);
+		px->conf.line = linenum;
+		px->mode = PR_MODE_SYSLOG;
+		px->last_change = now.tv_sec;
+		px->cap = PR_CAP_FE;
+		px->maxconn = 10;
+		px->timeout.client = TICK_ETERNITY;
+		px->accept = frontend_accept;
+		px->default_target = &syslog_applet.obj_type;
+		px->id = strdup(args[1]);
+
+	}
+	else if (strcmp(args[0], "maxconn") == 0) {  /* maxconn */
+		if (warnifnotcap(cfg_log_forward, PR_CAP_FE, file, linenum, args[0], " Maybe you want 'fullconn' instead ?"))
+			err_code |= ERR_WARN;
+
+		if (*(args[1]) == 0) {
+			ha_alert("parsing [%s:%d] : '%s' expects an integer argument.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+		cfg_log_forward->maxconn = atol(args[1]);
+		if (alertif_too_many_args(1, file, linenum, args, &err_code))
+			goto out;
+	}
+	else if (strcmp(args[0], "backlog") == 0) {  /* backlog */
+		if (warnifnotcap(cfg_log_forward, PR_CAP_FE, file, linenum, args[0], NULL))
+			err_code |= ERR_WARN;
+
+		if (*(args[1]) == 0) {
+			ha_alert("parsing [%s:%d] : '%s' expects an integer argument.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+		cfg_log_forward->backlog = atol(args[1]);
+		if (alertif_too_many_args(1, file, linenum, args, &err_code))
+			goto out;
+	}
+	else if (strcmp(args[0], "bind") == 0) {
+		int cur_arg;
+		static int kws_dumped;
+		struct bind_conf *bind_conf;
+		struct bind_kw *kw;
+		struct listener *l;
+
+		cur_arg = 1;
+
+		bind_conf = bind_conf_alloc(cfg_log_forward, file, linenum,
+					    NULL, xprt_get(XPRT_RAW));
+		if (!bind_conf) {
+			ha_alert("parsing [%s:%d] : out of memory error.", file, linenum);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+
+		if (!str2listener(args[1], cfg_log_forward, bind_conf, file, linenum, &errmsg)) {
+			if (errmsg && *errmsg) {
+				indent_msg(&errmsg, 2);
+				ha_alert("parsing [%s:%d] : '%s %s' : %s\n", file, linenum, args[0], args[1], errmsg);
+			}
+			else {
+				ha_alert("parsing [%s:%d] : '%s %s' : error encountered while parsing listening address %s.\n",
+				         file, linenum, args[0], args[1], args[2]);
+				err_code |= ERR_ALERT | ERR_FATAL;
+				goto out;
+			}
+		}
+		list_for_each_entry(l, &bind_conf->listeners, by_bind) {
+			l->maxaccept = global.tune.maxaccept ? global.tune.maxaccept : 64;
+			l->accept = session_accept_fd;
+			l->analysers |=  cfg_log_forward->fe_req_ana;
+			l->default_target = cfg_log_forward->default_target;
+			global.maxsock++;
+		}
+		cur_arg++;
+
+		while (*args[cur_arg] && (kw = bind_find_kw(args[cur_arg]))) {
+			int ret;
+
+			ret = kw->parse(args, cur_arg, cfg_log_forward, bind_conf, &errmsg);
+			err_code |= ret;
+			if (ret) {
+				if (errmsg && *errmsg) {
+					indent_msg(&errmsg, 2);
+					ha_alert("parsing [%s:%d] : %s\n", file, linenum, errmsg);
+				}
+				else
+					ha_alert("parsing [%s:%d]: error encountered while processing '%s'\n",
+					         file, linenum, args[cur_arg]);
+				if (ret & ERR_FATAL)
+					goto out;
+			}
+			cur_arg += 1 + kw->skip;
+		}
+		if (*args[cur_arg] != 0) {
+			char *kws = NULL;
+
+			if (!kws_dumped) {
+				kws_dumped = 1;
+				bind_dump_kws(&kws);
+				indent_msg(&kws, 4);
+			}
+			ha_alert("parsing [%s:%d] : unknown keyword '%s' in '%s' section.%s%s\n",
+			         file, linenum, args[cur_arg], cursection,
+			         kws ? " Registered keywords :" : "", kws ? kws: "");
+			free(kws);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+	}
+	else if (strcmp(args[0], "dgram-bind") == 0) {
+		int cur_arg;
+		static int kws_dumped;
+		struct bind_conf *bind_conf;
+		struct bind_kw *kw;
+		struct listener *l;
+
+		cur_arg = 1;
+
+		bind_conf = bind_conf_alloc(cfg_log_forward, file, linenum,
+		                            NULL, xprt_get(XPRT_RAW));
+
+		if (!str2receiver(args[1], cfg_log_forward, bind_conf, file, linenum, &errmsg)) {
+			if (errmsg && *errmsg) {
+				indent_msg(&errmsg, 2);
+				ha_alert("parsing [%s:%d] : '%s %s' : %s\n", file, linenum, args[0], args[1], errmsg);
+			}
+			else {
+				ha_alert("parsing [%s:%d] : '%s %s' : error encountered while parsing listening address %s.\n",
+				         file, linenum, args[0], args[1], args[2]);
+			}
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+		list_for_each_entry(l, &bind_conf->listeners, by_bind) {
+			/* the fact that the sockets are of type dgram is guaranteed by str2receiver() */
+			l->maxaccept = global.tune.maxaccept ? global.tune.maxaccept : 64;
+			l->rx.iocb   = syslog_fd_handler;
+			global.maxsock++;
+		}
+		cur_arg++;
+
+		while (*args[cur_arg] && (kw = bind_find_kw(args[cur_arg]))) {
+			int ret;
+
+			ret = kw->parse(args, cur_arg, cfg_log_forward, bind_conf, &errmsg);
+			err_code |= ret;
+			if (ret) {
+				if (errmsg && *errmsg) {
+					indent_msg(&errmsg, 2);
+					ha_alert("parsing [%s:%d] : %s\n", file, linenum, errmsg);
+				}
+				else
+					ha_alert("parsing [%s:%d]: error encountered while processing '%s'\n",
+					         file, linenum, args[cur_arg]);
+				if (ret & ERR_FATAL)
+					goto out;
+			}
+			cur_arg += 1 + kw->skip;
+		}
+		if (*args[cur_arg] != 0) {
+			char *kws = NULL;
+
+			if (!kws_dumped) {
+				kws_dumped = 1;
+				bind_dump_kws(&kws);
+				indent_msg(&kws, 4);
+			}
+			ha_alert("parsing [%s:%d] : unknown keyword '%s' in '%s' section.%s%s\n",
+			         file, linenum, args[cur_arg], cursection,
+				 kws ? " Registered keywords :" : "", kws ? kws: "");
+			free(kws);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+	}
+	else if (strcmp(args[0], "log") == 0) {
+		if (!parse_logsrv(args, &cfg_log_forward->logsrvs, (kwm == KWM_NO), &errmsg)) {
+			ha_alert("parsing [%s:%d] : %s : %s\n", file, linenum, args[0], errmsg);
+			         err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+	}
+	else if (strcmp(args[0], "timeout") == 0) {
+		const char *res;
+		unsigned timeout;
+
+		if (strcmp(args[1], "client") != 0) {
+			ha_alert("parsing [%s:%d] : unknown keyword '%s %s' in log-forward section.\n", file, linenum, args[0], args[1]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+
+		if (*args[2] == 0) {
+			ha_alert("parsing [%s:%d] : missing timeout client value.\n", file, linenum);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+		res = parse_time_err(args[2], &timeout, TIME_UNIT_MS);
+		if (res == PARSE_TIME_OVER) {
+			memprintf(&errmsg, "timer overflow in argument '%s' to 'timeout client' (maximum value is 2147483647 ms or ~24.8 days)", args[2]);
+		}
+		else if (res == PARSE_TIME_UNDER) {
+			memprintf(&errmsg, "timer underflow in argument '%s' to 'timeout client' (minimum non-null value is 1 ms)", args[2]);
+		}
+		else if (res) {
+			memprintf(&errmsg, "unexpected character '%c' in 'timeout client'", *res);
+			return -1;
+		}
+
+		if (res) {
+			ha_alert("parsing [%s:%d] : %s : %s\n", file, linenum, args[0], errmsg);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+		cfg_log_forward->timeout.client = MS_TO_TICKS(timeout);
+	}
+	else {
+		ha_alert("parsing [%s:%d] : unknown keyword '%s' in log-forward section.\n", file, linenum, args[0]);
+		err_code |= ERR_ALERT | ERR_ABORT;
+		goto out;
+	}
+out:
+	return err_code;
+}
+
+
+/* parse the "show startup-logs" command, returns 1 if a message is returned, otherwise zero */
+static int cli_parse_show_startup_logs(char **args, char *payload, struct appctx *appctx, void *private)
+{
+	if (!cli_has_level(appctx, ACCESS_LVL_OPER))
+		return 1;
+
+	if (!startup_logs)
+		return cli_msg(appctx, LOG_INFO, "\n"); // nothing to print
+
+	return ring_attach_cli(startup_logs, appctx);
+}
+
+/* register cli keywords */
+static struct cli_kw_list cli_kws = {{ },{
+	{ { "show", "startup-logs",  NULL },
+	  "show startup-logs : report logs emitted during HAProxy startup", cli_parse_show_startup_logs, NULL, NULL },
+	{{},}
+}};
+
+INITCALL1(STG_REGISTER, cli_register_kw, &cli_kws);
+
+/* config parsers for this section */
+REGISTER_CONFIG_SECTION("log-forward", cfg_parse_log_forward, NULL);
+
+REGISTER_PER_THREAD_ALLOC(init_log_buffers);
+REGISTER_PER_THREAD_FREE(deinit_log_buffers);
 
 /*
  * Local variables:

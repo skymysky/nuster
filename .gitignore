@@ -2,11 +2,17 @@
 # than blocking about 500 different test files and bug report outputs.
 /.*
 /*
+!/.cirrus.yml
+!/.gitattributes
+!/.github
 !/.gitignore
+!/.travis.yml
 !/CHANGELOG
 !/LICENSE
+!/BRANCHES
 !/Makefile
 !/README
+!/INSTALL
 !/CONTRIBUTING
 !/MAINTAINERS
 !/ROADMAP
@@ -22,11 +28,10 @@
 !/tests
 !/debian
 !/scripts
-# nuster
-!/*.md
-!/.github
+!/reg-tests
 # Reject some generic files
 *.o
+*.a
 *~
 *.rej
 *.orig
@@ -38,5 +43,11 @@
 /contrib/iprange/iprange
 /contrib/systemd/haproxy.service
 /contrib/spoa_example/spoa
+contrib/debug/flags
+contrib/mod_defender/defender
+contrib/modsecurity/modsecurity
+contrib/hpack/decode
+contrib/hpack/gen-rht
+contrib/tcploop/tcploop
 /src/dlmalloc.c
 /tests/test_hashes

@@ -24,15 +24,15 @@ Files: src/hlua.c, include/*/hlua.h
 
 Maps and pattern matching
 Maintainer: Thierry Fournier <tfournier@arpalert.org>
-Files: src/maps.c, src/pattern.c, include/*/maps.h, include/*/pattern.h
+Files: src/map.c, src/pattern.c, include/*/map.h, include/*/pattern.h
 
 DNS
 Maintainer: Baptiste Assmann <bedis9@gmail.com>
 Files: src/dns.c, include/*/dns.h
 
 SSL
-Maintainer: Emeric Brun <ebrun@haproxy.com>
-Files: src/ssl_sock.c, include/*/ssl_sock.h
+Maintainer: Emeric Brun <ebrun@haproxy.com>, William Lallemand <wlallemand@haproxy.com>
+Files: src/cfgparse-ssl.c, src/ssl_*.c, include/*/ssl_*.h
 
 Peers
 Maintainer: Emeric Brun <ebrun@haproxy.com>
@@ -55,9 +55,34 @@ Maintainer: Simon Horman <horms@verge.net.au>
 Files: src/mailers.c, include/*/mailers.h
 
 DeviceAtlas device identification
-Maintainer: David Carlier <dcarlier@afilias.info>
+Maintainer: David Carlier <dcarlier@deviceatlas.com>
 Files: src/da.c, include/*/da.h
 
 51Degrees device identification
 Maintainer: Ben Shillito <ben@51degrees.com>
 Files: src/51d.c
+
+Cache
+Maintainer: William Lallemand <wlallemand@haproxy.com>
+Files: src/cache.c, include/*/cache.h
+
+Master-worker
+Maintainer: William Lallemand <wlallemand@haproxy.com>
+Note: Please CC William when touching src/haproxy.c and contrib/systemd
+
+SPOE
+Maintainer: Christopher Faulet <cfaulet@haproxy.com>
+Files: src/flt_spoe.c, include/*/spoe.h, contrib/spoa_example, doc/SPOE.txt
+
+Multi-threading
+Maintainer: Christopher Faulet <cfaulet@haproxy.com>
+Maintainer: Emeric Brun <ebrun@haproxy.com>
+Files: src/thread.c, include/*/thread.h
+Note: every change around the locking or synchronization point will require
+      approval from one of these maintainers. Problems which only appear when
+      nbthread is greater than 1 and which disappear otherwise are also
+      relevant.
+
+ScientiaMobile WURFL Device Detection
+Maintainer: Paul Borile, Massimiliano Bellomi <wurfl-haproxy-support@scientiamobile.com>
+Files: src/wurfl.c
